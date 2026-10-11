@@ -513,6 +513,17 @@ capacity-n channel) and is now a two-list FIFO with an explicit size, O(1) amort
 took the row from the **9.4–14.3 µs** ours against **246–304 ns** stock it replaced to the figures above. The
 construction, field by field, is §3.1.
 
+Both sides of that row are a trade, and the trade is what the ratio prices. `Std.Sync.Channel`'s `send` is a
+blocking wait: `Channel.Sync.send` is `IO.wait (← Channel.send ch v)`, and the bounded send path underneath
+parks the sender on a bare `IO.Promise` — it creates one, enqueues it as a producer and `BaseIO.bindTask`s its
+`result?` (`Std/Sync/Channel.lean`) — so the stock channel's per-operation cheapness is bought by occupying a
+pool worker for the whole wait, and Lean's pool grows around that (a `Task.get` from a pooled task raises the
+pool cap by one, the mechanism `docs/lean-scheduler.md` records). Ours parks the *computation* and leaves the
+carrier free, and the step machinery this row prices is exactly what buys that. So we are **1.3–2.3× slower per
+message because we do not block the carrier** — the same trade seen from the other side in §4.1, where a
+blocking call that does not take the pool stops everything — and the row reads as the price of that choice
+rather than a plain deficit.
+
 ## 5. ⚪ Rows that are about a pool, not about us
 
 These appear in the same diagnostics — Lean's pool's starvation shape, W4's blocking pool beside it, and the
