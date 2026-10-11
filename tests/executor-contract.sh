@@ -1402,6 +1402,142 @@ check_sc7() {
     "$connections" "$server_threads" "$client_among" "$echoes" "$held_before" "$in_flight_after"
 }
 
+# The SC19 detectors, each on its own clause, and then the three as one function so the near-miss control below
+# exercises the same detector the check asserts through rather than three lookalikes.
+#
+# http_bytes_ok <record> <expected> — SC19-O1: the bytes the client read are the pinned response byte for byte,
+# and the request was parsed as the pinned method and URI with the pinned status.
+http_bytes_ok() {
+  local rec="$1" want="$2" m u s got
+  m="$(field method "$rec")" || return 1
+  u="$(field uri "$rec")" || return 1
+  s="$(field status "$rec")" || return 1
+  got="$(field got "$rec")" || return 1
+  [ "$m" = "GET" ] || return 1
+  [ "$u" = "/" ] || return 1
+  [ "$s" = "200" ] || return 1
+  [ "$got" = "$want" ]
+}
+
+# http_carrier_ok <record> — SC19-O2: the server side ran on one thread, and that thread is not the client's.
+http_carrier_ok() {
+  local rec="$1" ct cam
+  ct="$(field carrierThreads "$rec")" || return 1
+  cam="$(field clientAmongServer "$rec")" || return 1
+  [ "$ct" = "1" ] || return 1
+  [ "$cam" = "false" ]
+}
+
+# http_idle_ok <record> — SC19-O3: nothing is held or outstanding afterwards, and the observer that says so
+# could see work before the run (heldBefore ≠ 0).
+http_idle_ok() {
+  local rec="$1" hb ifa ph
+  hb="$(field heldBefore "$rec")" || return 1
+  ifa="$(field inFlightAfter "$rec")" || return 1
+  ph="$(field pendingHooks "$rec")" || return 1
+  [ "$hb" != "0" ] || return 1
+  [ "$ifa" = "0" ] || return 1
+  [ "$ph" = "0" ]
+}
+
+# http_ok <record> <expected> — the three clauses as one detector.
+http_ok() {
+  http_bytes_ok "$1" "$2" && http_carrier_ok "$1" && http_idle_ok "$1"
+}
+
+# --- SC19 — one HTTP request over a real loopback socket: a byte-exact response, on our carrier ————————————
+check_sc19() {
+  local out status line ctl got method uri st carrier_threads client_among held_before in_flight_after pending_hooks
+  local ctl_threads_two ctl_threads_repeat
+  local base near
+  local -a records=()
+
+  # The pinned response: a fresh `H1.Machine .receiving` driven in memory with this request and this response
+  # head (`200`, `Content-Length: 5`, body `hello`), escaped the way the executable escapes `got` —
+  # `\`→`\\`, CR→`\r`, LF→`\n`. Derived from the machine, not typed by hand; the literal changes only if the
+  # protocol's own encoding does.
+  SC19_EXPECTED='HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello'
+
+  out="$(bounded lake exe controls --runtime-http)"
+  status=$?
+  check_status SC19 "$status" "lake exe controls --runtime-http"
+  require_header "$out"
+
+  mapfile -t records < <(grep '^http|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC19 Then: one HTTP request over the loopback socket not observed exactly once" \
+      "expected exactly one http| record, saw ${#records[@]}"
+  line="${records[0]}"
+
+  record_is "${line#http|}" method uri status got carrierThreads clientAmongServer heldBefore inFlightAfter pendingHooks ||
+    fail "SC19 Then: one HTTP request over the loopback socket not observed exactly once" \
+      "the record is not exactly method/uri/status/got/carrierThreads/clientAmongServer/heldBefore/inFlightAfter/pendingHooks with nonempty values: [$line]"
+
+  # The detector's own control, from the record syntax and the expectation alone: it must accept a well-formed
+  # record, and reject the five near misses a runtime that appended a byte, lost a CR, answered another status,
+  # ran the handler on the client's thread or left a task in flight would produce.
+  base="method=GET|uri=/|status=200|got=$SC19_EXPECTED|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0"
+  http_ok "$base" "$SC19_EXPECTED" ||
+    setup_error "SC19: the HTTP-observation detector rejected a well-formed record" \
+      "the detector's own control, not the SC19 Then"
+  for near in \
+    "method=GET|uri=/|status=200|got=${SC19_EXPECTED}x|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "method=GET|uri=/|status=200|got=${SC19_EXPECTED//\\r/}|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "method=GET|uri=/|status=404|got=$SC19_EXPECTED|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "method=GET|uri=/|status=200|got=$SC19_EXPECTED|carrierThreads=1|clientAmongServer=true|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "method=GET|uri=/|status=200|got=$SC19_EXPECTED|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=1|pendingHooks=0"; do
+    if http_ok "$near" "$SC19_EXPECTED"; then
+      setup_error "SC19: the HTTP-observation detector accepted a near miss" \
+        "record: [$near]" \
+        "the detector's own control, not the SC19 Then"
+    fi
+  done
+  printf 'SC19 control: rejected a response with a byte appended, a CRLF rewritten to LF, a 404, a client on the server thread and a task left in flight\n'
+
+  ctl="$(grep '^httpctl|' <<<"$out" | head -1)"
+  [ -n "$ctl" ] ||
+    setup_error "SC19: the detector controls are missing" "no httpctl record in the invocation"
+  record_is "${ctl#httpctl|}" threadsOnTwo threadsOnRepeat ||
+    setup_error "SC19: the detector-control record is not the expected shape" "control: [$ctl]"
+  bound_field ctl_threads_two threadsOnTwo "$ctl" "SC19 control"
+  bound_field ctl_threads_repeat threadsOnRepeat "$ctl" "SC19 control"
+  [ "$ctl_threads_two" = "2" ] ||
+    setup_error "SC19: the distinct-thread detector did not count two on a two-distinct sample" \
+      "threadsOnTwo=$ctl_threads_two"
+  [ "$ctl_threads_repeat" = "1" ] ||
+    setup_error "SC19: the distinct-thread detector did not collapse a repeat" \
+      "threadsOnRepeat=$ctl_threads_repeat"
+
+  bound_field method method "$line" "SC19 Then"
+  bound_field uri uri "$line" "SC19 Then"
+  bound_field st status "$line" "SC19 Then"
+  bound_field got got "$line" "SC19 Then"
+  bound_field carrier_threads carrierThreads "$line" "SC19 Then"
+  bound_field client_among clientAmongServer "$line" "SC19 Then"
+  bound_field held_before heldBefore "$line" "SC19 Then"
+  bound_field in_flight_after inFlightAfter "$line" "SC19 Then"
+  bound_field pending_hooks pendingHooks "$line" "SC19 Then"
+
+  # Every clause is evaluated on its own named fields, in clause order, so the failing clause is named rather
+  # than described: the byte-exactness clause alone, the carrier clause alone, and the held-work clause alone.
+  if ! http_ok "${line#http|}" "$SC19_EXPECTED"; then
+    local clause
+    local -a then_lines=()
+    http_bytes_ok "${line#http|}" "$SC19_EXPECTED" || then_lines+=("SC19 Then: the bytes the client read are not the pinned response
+  observed: method=$method uri=$uri status=$st got=$got
+  expected: method=GET uri=/ status=200 got=$SC19_EXPECTED")
+    http_carrier_ok "${line#http|}" || then_lines+=("SC19 Then: the server side did not run on exactly one thread that is not the client's
+  observed: carrierThreads=$carrier_threads clientAmongServer=$client_among")
+    http_idle_ok "${line#http|}" || then_lines+=("SC19 Then: the executor was not left empty after the connection
+  observed: heldBefore=$held_before inFlightAfter=$in_flight_after pendingHooks=$pending_hooks")
+    for clause in "${then_lines[@]}"; do printf '%s\n' "$clause" >&2; done
+    exit 1
+  fi
+
+  printf 'SC19 ok: method=%s uri=%s status=%s got=%s carrierThreads=%s clientAmongServer=%s heldBefore=%s inFlightAfter=%s pendingHooks=%s\n' \
+    "$method" "$uri" "$st" "$got" "$carrier_threads" "$client_among" "$held_before" "$in_flight_after" "$pending_hooks"
+}
+
 # time_ok <record> — W3's observations as a detector, so its own control can reuse it rather than a lookalike:
 # every sleeper started before the first one woke, so the sleeps parked on the timer instead of occupying the
 # carrier; the task spawned while all of them slept ran between those two; each sleeper woke exactly once; each
@@ -3329,8 +3465,9 @@ SC15) check_sc15 ;;
 SC16) check_sc16 ;;
 SC17) check_sc17 ;;
 SC18) check_sc18 ;;
+SC19) check_sc19 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19\n' >&2
   exit 2
   ;;
 esac

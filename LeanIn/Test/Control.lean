@@ -1,7 +1,9 @@
 import Std
+import Std.Http
 import LeanIn.Sched.Basic
 import LeanIn.Sched.Executor
 import LeanIn.Runtime.Basic
+import LeanIn.Runtime.Http
 import LeanIn.Runtime.Leaf
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Time
@@ -931,6 +933,15 @@ own control below can call the same function rather than a lookalike. -/
 private def distinctOf (xs : List UInt64) : List UInt64 :=
   xs.foldl (fun acc t => if acc.contains t then acc else acc ++ [t]) []
 
+/-- The bytes a client read back, as one record field: `\`→`\\`, CR→`\r`, LF→`\n`, every other byte verbatim.
+Named so the scenario's own literal can be written in exactly the escaping this prints. -/
+private def escBytes (b : ByteArray) : String :=
+  String.ofList <| b.toList.flatMap (fun c =>
+    if c == 0x5C then ['\\', '\\']
+    else if c == 0x0D then ['\\', 'r']
+    else if c == 0x0A then ['\\', 'n']
+    else [Char.ofNat c.toNat])
+
 /-- **W2's evidence: sockets driven from our carriers.**
 
 The server half is ours — bind, an accept loop of ours, one task per connection, all as `Task.Async` steps on
@@ -1008,6 +1019,91 @@ def runtimeNet : IO UInt32 := do
   | .ok (.ok ()) =>
     IO.println s!"net|connections={n}|serverThreads={distinct.length}|clientAmongServer={distinct.contains clientTid}|echoes={exact}|heldBefore={heldBefore}|inFlightAfter={inFlightAfter}|wallUs={(t1 - t0) / 1000}"
     IO.println s!"netctl|threadsOnTwo={(distinctOf [0, 1]).length}|threadsOnRepeat={(distinctOf [7, 7]).length}|perturbed={perturbed}"
+    return 0
+
+
+
+/-- **W9's evidence: one HTTP request over a real loopback socket, byte-exactly, on our carrier.**
+
+The listener is bound by this run (`Runtime.loopback 0`) and the connection is real; the client that sends the
+one request line is `Std.Async`'s TCP client, driven by `Async.block` on this thread — a client that is not ours
+is what makes the thread identities mean anything. The response bytes the client reads back are the observable,
+printed escaped so the field stays one token (`\`→`\\`, CR→`\r`, LF→`\n`).
+
+The per-connection half is `Runtime.Http.serveConn`, driven by `Runtime.serveNJoin` — the accept loop of ours —
+so the socket bytes are carried through `Std.Http.Protocol.H1`'s own machine and the handler is dispatched
+inline on the carrier the connection runs on. `Std.Http.Server`'s loop would have spawned it with `.asTask`
+(`Std/Http/Server/Connection.lean:319`), putting it back on the stock pool — the observation SC19's carrier
+clause reports.
+
+One record line, in the shape the scenario fixture reads, plus the tid detector's own control, because an
+absence detector that cannot report a difference proves nothing: it is shown counting two on a two-distinct
+sample and collapsing a repeat. `heldBefore` is the same `e.observe` reader as `inFlightAfter`, read while
+three items are deliberately queued and nothing is draining.
+
+Diagnostic: `lake exe controls --runtime-http`. -/
+def runtimeHttp : IO UInt32 := do
+  let hooks ← Runtime.Hooks.new
+  let l ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep ← IO.mkRef l
+  let addr ← Runtime.Listener.sockName l
+  let e ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids ← IO.mkRef ([] : List UInt64)
+  let methodRef ← IO.mkRef ""
+  let uriRef ← IO.mkRef ""
+  let statusRef ← IO.mkRef (0 : Nat)
+  let request : ByteArray := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".toUTF8
+  let pinnedBody : ByteArray := "hello".toUTF8
+  -- The machine's own configuration: no `Server` agent, and no clock is ever read into the machine, so the
+  -- response the client reads is a function of the request and the pinned head alone.
+  let cfg : Std.Http.Protocol.H1.Config := {}
+  let respHead : Std.Http.Response.Head :=
+    { status := .ok, version := .v11,
+      headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
+        (Std.Http.Header.Value.ofString! "5") }
+  statusRef.set respHead.status.toCode.toNat
+  -- Our handler: it records the thread it ran on and answers with the pinned head and body. `serveConn` awaits
+  -- it inline, so the thread it reads is the carrier the connection runs on.
+  let handler : Runtime.Http.Handler := fun head => do
+    let tid ← monadLift (IO.getTID : IO UInt64)
+    monadLift (srvTids.modify (· ++ [tid]) : IO Unit)
+    monadLift (methodRef.set (toString head.method) : IO Unit)
+    monadLift (uriRef.set (toString head.uri) : IO Unit)
+    return (respHead, pinnedBody)
+  -- the control: the pool holds work only until a carrier takes it, so the reader is shown a queue nothing is
+  -- draining. These three no-op items are taken first when the driver starts, and they change nothing else.
+  for _ in List.range 3 do e.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore, _) ← e.observe
+  let serverProg : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    Runtime.serveNJoin hooks l 1 (Runtime.Http.serveConn hooks cfg · handler)
+  let server ← IO.asTask (Runtime.run e serverProg) _root_.Task.Priority.dedicated
+  let clientTid ← IO.getTID
+  let got ← Std.Async.Async.block do
+    let c ← Std.Async.TCP.Socket.Client.mk
+    c.connect addr
+    c.send request
+    let mut acc : ByteArray := ByteArray.empty
+    let mut more := true
+    while more do
+      match ← c.recv? 65536 with
+      | none => more := false
+      | some bs => acc := acc ++ bs
+    c.shutdown
+    return acc
+  let outcome ← IO.wait server
+  -- a use after the run, so the listener outlives every operation on it (the rule `--runtime-connect` found).
+  let _ ← Runtime.Listener.sockName (← keep.get)
+  let tids ← srvTids.get
+  let distinct := distinctOf tids
+  let (inFlightAfter, _) ← e.observe
+  let pendingAfter ← Runtime.pending hooks
+  match outcome with
+  | .error err => IO.println s!"http|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"http|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"http|method={← methodRef.get}|uri={← uriRef.get}|status={← statusRef.get}|got={escBytes got}|carrierThreads={distinct.length}|clientAmongServer={distinct.contains clientTid}|heldBefore={heldBefore}|inFlightAfter={inFlightAfter}|pendingHooks={pendingAfter}"
+    IO.println s!"httpctl|threadsOnTwo={(distinctOf [0, 1]).length}|threadsOnRepeat={(distinctOf [7, 7]).length}"
     return 0
 
 
@@ -4258,6 +4354,7 @@ def main (args : List String) : IO UInt32 := do
   | "--runtime-unit" :: _ => return ← runtimeUnit
   | "--runtime-chan" :: _ => return ← runtimeChan
   | "--runtime-net" :: _ => return ← runtimeNet
+  | "--runtime-http" :: _ => return ← runtimeHttp
   | "--runtime-time" :: _ => return ← runtimeTime
   | "--runtime-connect" :: _ => return ← runtimeConnect
   | "--runtime-drain" :: _ => return ← runtimeDrain

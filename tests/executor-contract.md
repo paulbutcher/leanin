@@ -1364,6 +1364,62 @@ than by the `Then`.
 
 ______________________________________________________________________
 
+### SC19 — one HTTP request over a real loopback socket: a byte-exact response, on our carrier
+
+**Actor.** A client that connects to a loopback listener this invocation binds itself, and sends one request
+line `GET / HTTP/1.1` with `Host` and `Connection: close`. The client is deliberately **not** ours: `Std.Async`'s
+TCP client, driven by `Async.block` on the calling thread.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC19`, which invokes
+`lake exe controls --runtime-http`. The listener is bound by the invocation itself (`Runtime.loopback 0`), so the
+socket is inside the boundary rather than an external network service; nothing in the check reaches into a queue,
+a slot, a thread table or a byte buffer of the executor.
+
+**Given.** A fresh executor, a listener bound to `127.0.0.1:0` — the OS chooses the port and the client is told
+what it chose — one accepted connection, and the request above, whose body is empty. The server answers with a
+pinned response: status `200`, `Content-Length: 5`, and the five-byte body `hello`.
+
+**When.** In one invocation the server accepts the connection and runs its per-connection loop, and the client
+connects, sends its one request and reads until the peer closes. The bytes the client read, the thread ids the
+server-side work ran on and the executor's holdings are reported in one `http|` record; the executor's observer is
+read twice: before the driver starts, with three no-op items deliberately queued, and again after the driver
+returns.
+
+**Then.** There is exactly one `http|` record, and its fields are exactly `method`, `uri`, `status`, `got`,
+`carrierThreads`, `clientAmongServer`, `heldBefore`, `inFlightAfter` and `pendingHooks` in that order with
+nonempty values.
+
+`got` is the bytes the client actually read, escaped so the field stays one token — `\`→`\\`, CR→`\r`, LF→`\n` —
+and it equals the fixture-owned literal `SC19_EXPECTED`, which was derived by driving a fresh
+`H1.Machine .receiving` with the same request and response and escaping the bytes it produced, rather than typed
+by hand. `method` is `GET`, `uri` is `/` and `status` is `200`, so the record's own parse of the exchange is
+pinned too.
+
+`carrierThreads` is `1`: the server-side work ran on one thread — the single-carrier claim, measured where the
+work happened rather than inferred from the configuration. `clientAmongServer` is `false`: that thread is not the
+client's, so what is asserted is where *our* work ran rather than that only one thread existed. `inFlightAfter`
+is `0` and `pendingHooks` is `0`: nothing is held, and no leaf registration is outstanding, once the connection
+has been served. `heldBefore` is non-zero — the affirmative control for that last reading, since the observer is
+the same one on both sides and a reader that cannot see work would report zero either way.
+
+The detector reading those conditions is exercised inside the same invocation. It accepts a well-formed record
+and rejects five near misses — `got` with one byte appended, `got` with its `\r\n` rewritten to `\n`, `status=404`,
+`clientAmongServer=true`, and `inFlightAfter=1` — each built from the record syntax and the expectation, never
+from the executable's output, with a control that does not hold reported as a fixture defect rather than as this
+`Then`. The executable's own tid-detector control is read from its `httpctl|` record and required to hold: the
+distinct-thread detector counts two on a two-distinct sample and collapses a repeat, so it is not stuck at the
+value the `Then` wants.
+
+**Why.** A server that has to run on our carriers owns its loop, and that loop is the deliverable: a driver of
+ours over `Std.Http.Protocol.H1`'s machine, whose accept loop is reused from `Net.lean`. The two things checkable
+from outside are the bytes the peer read and *where* the work ran, and a thread identity is the only way to check
+the second. The byte comparison is what keeps the first honest — a runtime that answered from another protocol
+version, another framing or another body could still report a plausible status line. The limits are this
+milestone's: one request per connection, no request or response body beyond the `Content-Length`-framed literal,
+no TLS, no routing, and keep-alive only as `H1.Config` gives it.
+
+______________________________________________________________________
+
 ### SC7 — sockets on our carriers: one server thread, and a client that is not on it
 
 **Actor.** A Lean executable server that binds a loopback socket, accepts `16` connections through an accept

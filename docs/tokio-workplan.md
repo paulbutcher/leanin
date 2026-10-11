@@ -643,6 +643,24 @@ loop's `background`/`asTask` calls put the accept loop and every handler on the 
 **Acceptance.** An end-to-end scenario: a request over a real socket, a byte-exact response, and the framework's
 behaviour contracts with their controls.
 
+**Milestone 1, landed: the connection loop.** `LeanIn/Runtime/Http.lean` is the per-connection driver —
+`Handler` and `serveConn` — driving `Std.Http.Protocol.H1`'s pure `Machine` through its own
+`feed`/`step`/`send`/`sendData`/`halted`/`closeReader`/`noMoreInput` over `Net.lean`'s socket seam, with no
+parser or framer of its own and no `Std.Http.Transport` instance (`Transport` is `Async`-typed, so an instance
+would hand the driver a stock-typed socket and put the work back on the pool — W2's finding). The accept loop
+is not reimplemented: `Runtime.serveNJoin` is it, and `serveConn` is its per-connection body. The machine is
+built from `H1.Config` alone, so `agentName` and `instant` keep their `none` defaults and neither a `Server`
+nor a `Date` header can enter the encoder.
+
+**Evidence.** `nix develop -c bash tests/executor-contract.sh SC19` — `check_sc19` binds the client's bytes to
+the pinned literal `HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello`, requires
+`carrierThreads=1` with `clientAmongServer=false`, and `inFlightAfter=0`/`pendingHooks=0` with `heldBefore≠0`,
+against the detector's own near-miss controls in the same invocation; SC7 and SC14 remain green.
+
+**Still out of scope (this milestone does not close W9).** Streaming request bodies (so `pullBody` is not yet
+exercised by the driver); streaming or chunked response bodies; keep-alive reuse across requests beyond what
+`H1.Config` gives free; TLS; routing; and W16's benchmark.
+
 ### W14 — The service's own refinement statement
 
 **Deliverable.** The obligations a *server* has, stated in the model and checked against the executor: every
