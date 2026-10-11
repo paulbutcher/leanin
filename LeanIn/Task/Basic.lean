@@ -67,15 +67,24 @@ def isSet (c : Cancel) : BaseIO Bool := c.flag.get
 end Cancel
 
 /-- **One unit of scheduled work**: a step of some computation, ready to run. Named rather than a bare
-`IO Unit` so that the executor's item type has an `Inhabited` instance, which the pool's ghost view needs. -/
+`IO Unit` so that the executor's item type has an `Inhabited` instance, which the pool's ghost view needs.
+
+A step's re-enqueue route is captured in the `Ctx` its closure holds, built where the computation is started
+and inherited by `Async.spawn`'s children. At P carriers the *worker that fires a step* supplies its own
+route, so a computation's children follow the worker that ran the parent. The route travels as an **index**
+rather than as a function: `act : (Item → BaseIO Unit) → IO Unit` is a non-positive occurrence of `Item`,
+which Lean's kernel refuses, and no wrapper helps because the checker unfolds definitions — but `Nat → IO
+Unit` is positive, so the action takes the firing worker's index and reads the route from it. A root site
+builds `Item.ofIndexed`, whose action supplies the firing worker's own route; `Item.ofAction`'s action
+ignores the index, so a step that is not re-scheduled by the worker that fires it keeps its captured `Ctx`. -/
 structure Item where
   /-- The token of the computation this step belongs to, or `none` for a step no cancellation reaches — the
   driver's, or one submitted straight to an executor. -/
   cancel : Option Cancel
-  /-- The action this step runs, when it is not cancelled. -/
-  act : IO Unit
+  /-- One firing of this step, with the index of the worker that fires it. -/
+  act : Nat → IO Unit
 
-instance : Inhabited Item := ⟨⟨none, pure ()⟩⟩
+instance : Inhabited Item := ⟨⟨none, fun _ => pure ()⟩⟩
 
 /-- **This step, stamped with a token if it does not have one.**
 
@@ -87,8 +96,13 @@ def Item.stamp (it : Item) (c : Cancel) : Item :=
   | some _ => it
   | none   => { it with cancel := some c }
 
-/-- **A step before its computation stamps it.** -/
-def Item.ofAction (act : IO Unit) : Item := ⟨none, act⟩
+/-- **A step before its computation stamps it**, whose action ignores the firing worker's index: a step that
+carries its own `Ctx` (every continuation) is not re-routed by the worker that fires it. -/
+def Item.ofAction (act : IO Unit) : Item := ⟨none, fun _ => act⟩
+
+/-- **A step whose action receives the firing worker's index** — the shape a root builds, so the computation
+it starts reads the firing worker's route and its children follow the worker that ran the parent. -/
+def Item.ofIndexed (cancel : Option Cancel) (f : Nat → IO Unit) : Item := ⟨cancel, f⟩
 
 /-- **Whether this step is cancelled.** -/
 def Item.cancelled (it : Item) : IO Bool :=
@@ -96,12 +110,16 @@ def Item.cancelled (it : Item) : IO Bool :=
   | some c => c.isSet
   | none   => return false
 
-/-- **Run a step.** The check is here, at the one place every carrier runs a step through, so a cancelled
-computation's steps are skipped whether they were enqueued before the cancellation or after it — the difference
-between this and a flag the computation itself has to poll. Skipping is not running a no-op: nothing of the
-computation executes. -/
-def Item.fire (it : Item) : IO Unit := do
-  unless ← it.cancelled do it.act
+/-- **Run a step on a carrier with index `i`.** The check is here, at the one place every carrier runs a
+step through, so a cancelled computation's steps are skipped whether they were enqueued before the
+cancellation or after it — the difference between this and a flag the computation itself has to poll.
+Skipping is not running a no-op: nothing of the computation executes. The index is the firing worker's, and
+it is what an `ofIndexed` root reads its route from. -/
+def Item.fireWith (it : Item) (i : Nat) : IO Unit := do
+  unless ← it.cancelled do it.act i
+
+/-- **Run a step on the driver's worker.** The index is worker `0`'s, the calling thread the driver runs on. -/
+def Item.fire (it : Item) : IO Unit := it.fireWith 0
 
 /-- **The join cell**: what a handle is. The value once there is one, and the continuations left by whoever
 awaited it before then.
@@ -187,8 +205,15 @@ states it and the inheritance rule is a reviewed line rather than a silent omiss
 structure Ctx where
   /-- The token of the computation this step belongs to. -/
   cancel : Cancel
-  /-- Schedule an item — the local route, so a chain stays on the core its parent ran on. -/
+  /-- Schedule an item — the local route, so a chain stays on the core its parent ran on. **Owner-only**:
+  only the carrier that owns the target queue may call it, which is why a step running on its own worker is
+  the only place it is used. -/
   resume : Item → BaseIO Unit
+  /-- Schedule an item on the **shared** route — the inject, whose push unparks a waiter. Every push made
+  from a thread that is not the owning carrier takes this route, which is the two seam completions
+  (`Runtime/Leaf.lean`'s leaf continuations and `Runtime/Blocking.lean`'s blocking completion), each of
+  which runs on whichever thread completed the leaf or job. -/
+  resumeShared : Item → BaseIO Unit
   /-- The ambient context, inherited by a spawned child from its parent. -/
   «local» : Local
 
@@ -202,7 +227,8 @@ bare `Job`, which is a value that must be re-run.
 The scheduling half of `ctx` is `BaseIO` rather than `IO`, and that is the O3 seam showing through: the one place a
 schedule call has to happen is *inside a waker* — a continuation registered on a stock `Task`, running on a pool
 worker — and a waker cannot call `IO`. Enqueuing takes a lock and notifies a condvar, so `BaseIO` is all it needs,
-and the runtime's `resumeOf` is that function. -/
+and the runtime's `Ctx.resume`/`Ctx.resumeShared` are those two functions — the local route for an owner-made
+push, the shared route for a push from a thread that is not the owning carrier. -/
 structure Async (α : Type) where
   step : (α → IO Unit) → Ctx → IO Unit
 
@@ -264,7 +290,8 @@ that wants its children to stop with it has to cancel them. -/
 def Async.spawn (a : Async α) : Async (Task α) := ⟨fun k ctx => do
   let cell ← Join.new
   let cancel ← Cancel.new
-  let child : Ctx := { cancel := cancel, resume := fun it => ctx.resume (it.stamp cancel), «local» := ctx.«local» }
+  let child : Ctx := { cancel := cancel, resume := fun it => ctx.resume (it.stamp cancel),
+                       resumeShared := fun it => ctx.resumeShared (it.stamp cancel), «local» := ctx.«local» }
   child.resume (Item.ofAction (a.step (fun v => Join.resolve cell v) child))
   k ⟨cell, cancel⟩⟩
 

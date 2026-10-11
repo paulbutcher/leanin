@@ -430,6 +430,17 @@ across threads, the steal protocol with batch size **one** (D4).
 **Exit criteria** — work stealing beats or matches the stock pool on the async benchmark while
 preserving every M2 invariant.
 
+**Met (SC18), with one condition recorded.** The carriers, the batch-one steal and the cross-thread wake are
+green (`SC18`, with `SC1`–`SC6` and the rest of `SC1`–`SC17` unchanged through the model port), the M2
+invariants are preserved through the unchanged `blockOn` path, and the scheduler's three obligations are
+re-discharged for P carriers in `LeanIn/Model/Multi.lean` (`docs/decisions.md` D19, `docs/proof-strategy.md`
+§3). The two measurement conditions are the rows of `docs/PERFORMANCE.md` §3.5: the batch-shape gap is a row
+swept over `p` with its endpoints asserted by reading the printed bands, and the chain-shape advantage
+**fails** against the base revision's own same-session ratio and is recorded as a regression with its
+decomposition rather than re-baselined — the item-level take path was repaired (the spent allowance now
+refreshes inside the take's own transaction, and the hot path is inlined) and the residual is the split's own
+per-operation overhead.
+
 ______________________________________________________________________
 
 ### Later, and only on evidence
@@ -465,6 +476,13 @@ None. All of D0–D10 are closed in [`docs/decisions.md`](decisions.md).
 **D9 is the one to revisit** — a marker type stands in for `Send`, which is sound only if users
 respect it. The better end state is a *proved* non-interference property for a restricted subset of
 the API, and that is worth reconsidering once the interface has seen real use.
+
+**D19 is D9's successor** ([`docs/decisions.md`](docs/decisions.md)): the marker lands as
+`Task.Sendable`, checked at both ends of a carrier boundary, and what it enforces is stated against what
+remains a convention — a caller's captured environment is not reachable by any private constructor, so
+the interface's promise is narrowed to what is enforced rather than implied to close O2 fully. The
+restricted-subset theorem D9 wanted is kept as the target of that convention and is gated on the
+serializability lemma [`primitive-theory.md`](primitive-theory.md) §4 states as unproved.
 
 ## 8. What "done" looks like
 

@@ -139,6 +139,13 @@ editorial choices:
 - **P9 (fairness)** is not attainable from these primitives at all. It can only be a property of our
   own discipline under that hypothesis.
 
+**What the lemma would also have to reach, for O2's convention half.** The marker that bounds what crosses a
+carrier boundary (`LeanIn/Task/Send.lean`, D19) narrows a *type*, not a closure's captured environment: a
+caller can still hand a task a value it shares with a thread, and no private constructor reaches that. Closing
+that half — a *proved* non-interference property for a restricted subset of the API — needs this lemma
+extended to reason about a task's captured environment against the transactions that touch it, which is why
+D19 records the capture as a documented convention rather than a promise.
+
 ______________________________________________________________________
 
 ## 5. Discharge
@@ -184,6 +191,16 @@ The list used to carry `IO.Promise`. It no longer does: the blocking pool's live
 (`LeanIn/Runtime/Blocking.lean:163-176`), so they are D7's second row, controlled by `controlWitness` —
 what Mutex+Condvar covers is the *queue*, which is not what the witness needed. Anything not on D7's list
 is not used.
+
+**No change from the multi-carrier work (W8, D19).** The queue discipline at P carriers and its park
+protocol add no direct external operation: one `Std.Mutex` per worker's pool, one for the shared cell —
+`Std.Mutex.new`/`atomically`, which is **A1** — and `Std.Condvar`'s `notifyOne`/`notifyAll`
+(**A4/A5**), over pure list and `Array` code (the inject's growable deque is pure Lean over `Array`,
+already `Ring`'s container). `IO.asTask … Task.Priority.dedicated` (**A6**) is called by
+`Runtime.startCarriers` in library code and is already controlled by `controlDedicated`. No atomics (the
+absence above still holds), no new syscall, and no `IO.Promise` construction, so `Blocking.lean`'s direct
+promise reach stays the only one and D7's register is unchanged. `#print axioms` for the new model theorems
+names nothing beyond `propext`/`Quot.sound`, and the finding is again D13's.
 
 **No change from the sync primitives (W6, D14).** `LeanIn/Task/Sync.lean` adds no primitive above and no
 citation. Its whole mechanism is one `Std.Mutex` critical section per operation — `Std.Mutex.new` and

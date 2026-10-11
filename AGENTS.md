@@ -79,7 +79,21 @@
   by another task on the carrier (or cooperative yield) uses
   queue push / `Pool.submit` (FIFO), not the LIFO slot; external
   completion uses inject. All producers go through one internal
-  scheduling-destination decision. Check `#print axioms` for each new
+  scheduling-destination decision. At P carriers the same rule has
+  a per-obligation **witness idiom**, so a non-vacuity check is
+  written through a real transition rather than the state
+  hand-filled: `pushShared` (an external wake) before the shared
+  half's live obligation, `pushLocal` (the owner is not parked)
+  before `ZeroParked`, `flushLocal` (a spent allowance that
+  re-queues) before `InjectWatched`, and `stealInto` (the thief
+  takes one) before the conservation law. The implementation's own
+  wake rules are the other half: a push into the owner's own queue
+  owes no wake when the owner makes it, but a `Join`-cell
+  continuation (`Async.await`/`select`) runs on whichever carrier
+  resolved the cell, so the per-worker `poked` flag with the
+  broadcast is the standing mechanism for that third off-owner
+  site, and the two seam completions take `Ctx.resumeShared`.
+  Check `#print axioms` for each new
   theorem, and know what it does not see: an assumption stated as
   an `opaque` predicate has a hidden value and is not an axiom, so
   `#print axioms` never names it. The list it

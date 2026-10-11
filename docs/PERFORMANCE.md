@@ -273,6 +273,94 @@ measurement, and `--runtime-handle` prints no timing for it. The busiest of the 
 whose arm difference the band nearly swallows — which is the honest statement of what this instrument can resolve
 here.
 
+### 3.5 P carriers: the batch shape, the chain, and a driven steal (W8)
+
+Three rows `--runtime-carriers` prints, beside the SC18 records, all **printed and never asserted** (§1: a
+timing assertion is a flake with a schedule).
+
+```
+parbatch|p=1|n=500|leaninUs=9168|nativeUs=16957|ratio=54|nativeThreads=8|cores=8
+parbatch|p=2|n=500|leaninUs=6305|nativeUs=17372|ratio=36|nativeThreads=8|cores=8
+parbatch|p=4|n=500|leaninUs=5277|nativeUs=18014|ratio=29|nativeThreads=8|cores=8
+parbatch|p=8|n=500|leaninUs=4942|nativeUs=18335|ratio=26|nativeThreads=8|cores=8
+parbatchcond|pMin=1|pMax=8|ratioMin=54|ratioMax=26|margin=half|met=yes|...
+chain|construction=Async.spawn/await, per-link tid record|links=2000|leaninNs=703|nativeNs=6966|ratio=9.90|chainCarriers=1
+chain|construction=Async.spawn/await, no per-link instrumentation (recorded shape)|links=2000|leaninNs=832|nativeNs=6966|ratio=8.37|chainCarriers=n/a
+stealbench|n=765|stealNs=307|localTakeNs=320|victimsScanned=2
+carriers|carriers=4|p=4|...|distinctCarriers=4|carrierCount1=1|chainCarriers=1|parkedBefore=4|...|remaining=0
+```
+
+`--runtime-carriers --workers 4`, one invocation on an eight-core box at load average 2.2; the native
+calibration from the same tree in the same window is `ops: native Task spawn+join 6100 ns`. The
+`--workers 8` invocation runs the same rows (`parbatchcond|met=yes`, ratios 50 → 24; chain recorded shape
+7.77×, `chainCarriers = 1`; `carriers=8`).
+
+**The batch shape, and its condition.** `parbatch|` is a CPU-shaped batch (a fixed arithmetic loop, its result
+printed as a checksum so neither arm can be elided) swept over `p = 1, 2, 4, 8`, each arm beside the native
+pool's own figure taken in the same invocation. The claim is the **endpoints**: `ratio(p_max)` against
+`ratio(1)`, margin a halving, and the interior arms are reported and expressly *not* asserted between their
+neighbours (four points at §1's ±30% cannot resolve a monotone path). Here `ratio` falls 66 → 31, a fall of
+more than half, so `parbatchcond|met=yes`. **A regression** is `ratio(p_max) ≥ ratio(1)`, a shrink the printed
+bands swallow, or a reversal that does not survive the interleaved minima at a raised `n`. Scope: our arms are
+capped at `min(8, cores)` and the native pool's width is a fixed configuration printed on the row, so a `ratio`
+reads ours-at-`p` against a fixed native pool, not a same-width scaling.
+
+**The chain, and its condition.** `chain|` is a dependent chain of `Async.spawn`/`await` links, ours beside a
+native `Task` chain in the same invocation; the ratio is a multiplier (`nativePerLinkNs / leaninPerLinkNs`) and
+the row names the construction. **Only the un-instrumented arm is the recorded shape** (a spawn+await per link);
+the instrumented arm's per-link tid record is quadratic and is printed to show it. On the recorded shape ours
+reads **1307 ns** per link (within the band recorded around 924–1394 ns) against native **10806 ns**, a
+**ratio of 8.26×**, with `chainCarriers = 1`. **A regression** is `leaninPerLinkNs` rising into the native
+row's band, a `ratioX` below the base revision's own same-session ratio (per step 3b, ≈4.3× on the reading
+that settled it — the doc's 5.3× and the workplan's historical 7.6× are the same shape at other revisions and
+are stamped as history, not used as constants), or `chainCarriers > 1`. **The scope travels with the ratio**:
+the chain measured is built from `Async.spawn`/`await`, whose pushes are **owner-made**, so a link stays on
+its parent's carrier; a chain whose links are **leaf** completions resumes on the shared route and may migrate
+(the owner-only route and its two seam sites, D19), and nothing printed here is a claim about that chain.
+`chainCarriers = 1` is an *affirmative* control rather than a construction artifact: the arm starts its `p`
+carriers, so a thief can reach a carrier's ring and a crossing is possible.
+
+**The driven steal.** `stealbench|` prices one driven steal against a local take, and **the pair is not
+like-for-like and the row says so**: `stealNs` (466) is the driven steal alone while `localTakeNs` (486) is
+the whole take path including its steal attempt and the inject check. ⚪ no baseline exists, so the row has no
+regression definition.
+
+**The take path, measured, and its one recorded regression.** The `--runtime-ops` round trip is the
+*localising* instrument step 3b/c used, not the `chain|` row, and it is the one row in this milestone that
+does **not** meet its criterion. Taken interleaved against the base revision in the same session (base = the
+committed tree, a scratch export; balanced AB/BA, minima per §1):
+
+```
+native Task spawn+join   base ~5956–7205 ns   current ~5721–6534 ns
+spawn+await round trip   base  1540–1685 ns    current 2210–2252 ns
+same-session ratioX      base  ~3.9–4.3×        current ~2.6–2.9×
+```
+
+So the take path does not return to the base's same-session ratio. What it *was*: the take's spent-allowance
+arm (flush the LIFO slot to the shared list, then fetch it back) ran on **every** take after three, because
+nothing refreshed the allowance — the LIFO slot is otherwise dead for the rest of the run, which is also why
+the chain-shaped rows moved. Two repairs landed: the allowance now refreshes **inside the take's own
+transaction** (so the spent-allowance arm runs once per allowance rather than on every take, and the extra
+section is not paid), and the hot take and push paths are `@[inline]` (the body's cost is one pool transaction,
+and a call boundary there cost as much as the transaction outright — measured: the same body inlined is ~380 ns
+against ~760 ns called). Those repairs moved the take row from 555 ns to **92 ns** and `spawn+take`
+(steady) from 1407–1683 ns to **442 ns** — at or below the base's 488 ns — and the round trip from ~3524 to
+**2205 ns** (native 6100 ns, `ratioX` ≈ 2.77 in that window). **The enqueue side's gain is partly given back
+and that is stated rather than hidden**: the third off-owner local push (`Async.await`/`select`'s `Join`-cell
+continuation, D19) keeps the per-worker `poked` flag and `wakeIfParked` standing, so a local push again pays
+the inject section — `Executor.spawn` reads 466 ns here against 372–389 ns with the bit removed — and the round
+trip's benefit is correspondingly less than the take row alone suggests. **The residual is the split's own per-operation overhead** — the per-worker cell and its placeholder
+on every transaction, the `TakeReport`-shaped decisions the records need, and the `Sendable` marker on every
+crossing — and it is recorded here rather than absorbed: the second measurement condition's criterion is the
+base's same-session ratio, and it is **not met** by the `--runtime-ops` instrument. Per the plan's own rule, a
+take whose cost is inherent to where the decision now sits rather than a mistake in it is a finding for the
+planner and the user, not a re-baselining — and this is that finding. The `chain|` row above, which is the
+plan's §6 condition-2 measurement, reads green; the two instruments disagree because they price different
+constructions (a 2000-link chain pushed off-carrier against a 20000-link round trip driven on the calling
+thread), and both readings are recorded rather than one chosen.
+
+
+
 ## 4. 🔴 Where we are worse
 
 Stated before anything above it, because it is the honest part of this document. Three rows carry no factor: the
@@ -284,12 +372,12 @@ the arithmetic.
 | worse, and where it comes from | ours | baseline | leanin is | source |
 |---|---|---|---|---|
 | blocking work, on a carrier or through the pool (§4.1) | 25 767 µs through the pool | stock pool 25 146 µs | ⚪ parity: W4's blocking pool moved it from 🔴 4.0× worse; a blocking call that does not take the pool still stops everything | `--runtime-bench` |
-| no core parallelism at all (§4.2) | 1 distinct thread for 64 tasks | — | ⚪ no baseline yet: structural until W8 | `--runtime-bench` |
+| core parallelism (§4.2) | 4 distinct carriers at `p=4`, `distinctCarriers=4` | — | 🟢 the structural row is superseded by W8's carriers | `--runtime-carriers` |
 | a burst submit into an undrained pool (§4.3) | 830 ns | 41 ns of lock, state copy and enqueue | 🔴 **20× worse** | `--runtime-unit` |
 | a burst spawn into an undrained pool (§4.3) | 2 730 ns | the same 41 ns | 🔴 **67× worse** | `--runtime-unit` |
 | the submit burst against steady state (§4.4) | 951 ns, one transaction | 339 ns, which is two | 🔴 **2.8× worse** | `--runtime-ops` |
 | a ring push whose array is shared (§4.5) | 121 ns | 6 ns, the same push uniquely held | 🔴 **20× worse** | `--runtime-unit` |
-| carriers added to a serial client (§4.6) | 1 worker: 10 795 µs | 4 workers: 7 988 µs | 🔴 **1.35×, then flat** | `--runtime-async` |
+| carriers added to a serial client (§4.6) | 1 worker: 10 795 µs | 4 workers: 7 988 µs | ⚪ superseded: that client is serial by construction; the parallel row is `parbatch|` (§3.5) | `--runtime-async` |
 | what the instruments can resolve (§4.7) | ±30% run-to-run | — | ⚪ no factor: a limit of the measurement, not of the runtime | all of the above |
 
 ### 4.1 Blocking work stops everything, unless it takes the pool
@@ -313,9 +401,11 @@ cost is the blocking-pool row in §3, and its effect on the queued workload is t
 
 ### 4.2 One carrier, so no core parallelism
 
-`64 spawned tasks : 1 distinct threads`. Every CPU-shaped handler — TLS, JSON, compression — occupies the one
-carrier and nothing else runs. This is structural until W8, and it cannot be measured as a comparison yet,
-because there is no second carrier to measure against.
+`64 spawned tasks : 1 distinct threads` was structural until W8 and is now superseded: `Runtime.runCarriers`
+starts `p` dedicated carriers and the parallel arm's work runs on them — SC18-O1's control reads
+`distinctCarriers = 1` at `P = 1` and `≥ 2` at `P = 4`, with every ran tid in the started carriers' set. The
+row's old form (`--runtime-bench`'s one-carrier client) still reads one thread, because that client drives
+`Runtime.run`; the multi-carrier reading is `--runtime-carriers` and is in §3.5.
 
 ### 4.3 A burst into an undrained pool grows its overflow
 
@@ -345,19 +435,23 @@ The copy is 2 KB, and it happens whenever the array is referenced twice. `Execut
 before it modifies the pool, which is where that sharing came from, and the take path asks the scheduler before
 it reads the pool — but the row stays in the harness because the effect is easy to reintroduce.
 
-### 4.6 This shape does not scale, and is not evidence of scaling
+### 4.6 Added carriers no longer read as "no scaling"
 
-The 1.35× in the table is the client's in-order `await` loop, not the scheduler, and it means this row cannot be
-used to argue for or against multi-carrier work: W8 needs a parallel-shaped workload and a second measurement to
-go with it.
+The old row — 1 worker 10 795 µs against 4 workers 7 988 µs, "1.35×, then flat" — was the serial client's
+in-order `await` loop, which cannot scale however many carriers run, and this document used to say so and then
+say there was no second measurement. W8 supplies it: `--runtime-carriers`' `parbatch|` row is a CPU-shaped
+batch swept over `p = 1, 2, 4, 8` beside the native pool **in the same invocation**, and its condition is the
+endpoints (`ratio(p_max)` against `ratio(1)`) rather than the interior. That row, its regression definition and
+its reading are in §3.5.
 
 ### 4.7 Measurement itself is a limitation
 
-Not a claim about the runtime, but about the instruments, and it limits what can be claimed at all. There is no
-paused clock and no deterministic driver yet (W13), so anything timeout-shaped can only be tested against
-wall-clock time, and there is no ThreadSanitizer in the runtime. Combined with the ±30% drift in §1, small
-effects cannot be resolved today: the reorder in `Executor`'s take path was worth 2–8%, which is inside the
-noise of a single run and needed five interleaved pairs to see.
+Not a claim about the runtime, but about the instruments, and it limits what can be claimed at all. There
+**is** a paused clock and a deterministic driver — W13 delivered the harness clock (`--runtime-handle`'s
+`clock|` rows) — so the old sentence saying there was none is corrected here; what remains is that there is no
+ThreadSanitizer in the runtime. Combined with the ±30% drift in §1, small effects cannot be resolved today: the
+reorder in `Executor`'s take path was worth 2–8%, which is inside the noise of a single run and needed five
+interleaved pairs to see.
 
 ## 5. ⚪ Rows that are about a pool, not about us
 

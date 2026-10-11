@@ -1,4 +1,5 @@
 import Std
+import LeanIn.Data.Slots
 
 -- `toList` is the only declaration that needs `Inhabited`; the laws about `WF` and the operations do
 -- not, so the section variable is unused in those. Kept as a section variable for readability.
@@ -13,18 +14,22 @@ downstream of here is about a list and never about an index.
 
 ## Shape
 
-A **fixed-size `Array`** of slots, the index of the oldest live element, and a live count. `push` writes
-at `(head + size) % cap` and `pop` clears `head % cap` and advances, so neither moves any other element.
+A **bounded** store — `LeanIn.Data.Slots`'s fields, with `cap` a type parameter — an index of the oldest
+live element, and a live count. `push` writes at `(head + size) % cap` and `pop` clears `head % cap` and
+advances, so neither moves any other element. The store is an `Array` and not a `List` because that is the
+whole point: `Array.set` modifies in place when the array is uniquely referenced, whereas `List.set` copies
+a prefix. The `List` in this file appears **only** in the ghost view, where its algebraic lemmas make the
+proofs short — the split Lean's own containers use, e.g. `Std.DHashMap` (Array implementation, `List` model,
+laws in a separate file).
 
-The store is an `Array` and not a `List` because that is the whole point of a ring: `Array.set`
-modifies in place when the array is uniquely referenced, whereas `List.set` copies a prefix. The `List`
-in this file appears **only** in `Ring.toList`, the ghost view, where its algebraic lemmas make the
-proofs short — the split Lean's own containers use, e.g. `Std.DHashMap` (Array implementation, `List`
-model, laws in a separate file).
+The view is `Slots.toList` at the ring's own index function, `fun i => (head + i) % cap`: the store and its
+index arithmetic are shared with `LeanIn.Data.Deque`, which indexes absolutely because it has no capacity to
+wrap around. What is the ring's alone is the capacity: `cap` is a **type parameter**, `WF` ties the store's
+length to it, and `Bounded` is the law that its live range never exceeds it.
 
-`push` and `pop` use `Array.setIfInBounds` rather than `Array.set`: the latter demands a bound proof,
-and the operations should be total and independent of `WF`. The bounds are available wherever a law
-needs them, which is where the `_of_lt` lemmas below come in.
+`push` and `pop` use `Array.setIfInBounds` rather than `Array.set`: the latter demands a bound proof, and
+the operations should be total and independent of `WF`. The bounds are available wherever a law needs them,
+which is where the `_of_lt` lemmas below come in.
 
 `Ring.WF` carries three conjuncts, and the third is the interesting one: the live range is **dense**, so
 `toList` reads real elements rather than falling back to a default. `pop_isSome` is what makes that
@@ -32,28 +37,15 @@ conjunct load-bearing — without it, a `pop` on a non-empty ring could return `
 
 ## Where the arithmetic lives
 
-In `slot_ne`, and nowhere else. It says distinct live indices occupy distinct slots, so the ghost view
-reads distinct elements and a write at the free position cannot disturb a live one. Nothing below the
+In `LeanIn.slot_ne`, and nowhere else. It says distinct live indices occupy distinct slots, so the ghost
+view reads distinct elements and a write at the free position cannot disturb a live one. Nothing below the
 ghost view ever sees `%`.
-
-**How the arithmetic is done.** `omega` handles `%` only after it is eliminated, so `slot_ne` normalises
-first (`Nat.mod_add_mod`) and then splits on whether each argument is below or above `cap`. The one
-non-obvious step: the `≥ cap` branch must carry its **side condition** out of the split. A bare
-`m % cap = m - cap` is useless to `omega`, because `Nat` subtraction saturates — `m - cap` is `0` when
-`m < cap`, so the equation alone admits `m = cap = 0`... not a contradiction. Carrying `cap ≤ m`
-alongside is what makes it refutable.
 -/
 
 namespace LeanIn
 
 /-- A bounded FIFO ring buffer. -/
-structure Ring (α : Type) (cap : Nat) where
-  /-- Backing store, in physical order. Slots outside the live range are `none`. -/
-  slots : Array (Option α) := #[]
-  /-- Physical index of the oldest live element. -/
-  head  : Nat := 0
-  /-- Number of live elements. -/
-  size  : Nat := 0
+structure Ring (α : Type) (cap : Nat) extends Slots α
 deriving Inhabited, Repr
 
 /-- The all-empty ring: a store of `cap` empty slots. Written out so examples reduce — and note that
@@ -63,15 +55,16 @@ def emptyRing (α : Type) (cap : Nat) : Ring α cap :=
 
 variable {α : Type} [Inhabited α]
 
-/-- **The ghost view.** The live elements, oldest first. All reasoning happens here. -/
+/-- **The ghost view.** The live elements, oldest first. All reasoning happens here: the shared store's
+view at the ring's index function, which wraps at `cap` and is the only place a modulus appears. -/
 def Ring.toList (r : Ring α cap) : List α :=
-  (List.range r.size).map fun i => ((r.slots[(r.head + i) % cap]?).join).getD default
+  r.toSlots.toList (fun i => (r.head + i) % cap)
 
 /-- Well-formedness.
 
-`dense` says the live slots hold **elements**, not merely that the slots exist — note the `join`,
-without which a slot containing `none` would satisfy the conjunct while `toList` quietly fell back to
-a default. -/
+`slots_size` says the store is exactly `cap` slots and `size_le` that the live range fits; `dense` says the
+live slots hold **elements**, not merely that the slots exist — note the `join`, without which a slot
+containing `none` would satisfy the conjunct while `toList` quietly fell back to a default. -/
 def Ring.WF (r : Ring α cap) : Prop :=
   r.slots.size = cap ∧ r.size ≤ cap ∧
   ∀ i, i < r.size → ((r.slots[(r.head + i) % cap]?).join).isSome
@@ -91,36 +84,6 @@ def Ring.pop (r : Ring α cap) : Option α × Ring α cap :=
     | _ => (none, r)
   else (none, r)
 
-/-! ### The one modular lemma -/
-
-/-- **Distinct live indices occupy distinct slots.**
-
-Everything modular is here. `j < cap` rather than `j < size` because `push` compares the *free*
-position `size` against the live indices. -/
-theorem slot_ne {cap head i j : Nat} (hcap : 0 < cap) (hij : i < j) (hj : j < cap) :
-    (head + i) % cap ≠ (head + j) % cap := by
-  intro h
-  have h0 : head % cap < cap := Nat.mod_lt _ hcap
-  have h' : (head % cap + i) % cap = (head % cap + j) % cap := by
-    rw [Nat.mod_add_mod, Nat.mod_add_mod]; exact h
-  have key : ∀ m, m < 2 * cap → m % cap = m ∨ (cap ≤ m ∧ m % cap = m - cap) := by
-    intro m hm
-    by_cases hc : m < cap
-    · exact Or.inl (Nat.mod_eq_of_lt hc)
-    · refine Or.inr ⟨Nat.not_lt.mp hc, ?_⟩
-      have hsplit : m = (m - cap) + 1 * cap := by omega
-      rw [hsplit, Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt (by omega)]
-      omega
-  have hi2 : head % cap + i < 2 * cap := by omega
-  have hj2 : head % cap + j < 2 * cap := by omega
-  rcases key _ hi2 with h1 | ⟨h1ge, h1⟩
-  · rcases key _ hj2 with h2 | ⟨h2ge, h2⟩
-    · rw [h1, h2] at h'; omega
-    · rw [h1, h2] at h'; omega
-  · rcases key _ hj2 with h2 | ⟨h2ge, h2⟩
-    · rw [h1, h2] at h'; omega
-    · rw [h1, h2] at h'; omega
-
 /-! ### The laws tying the container to the spec -/
 
 /-- A fresh ring is well-formed: `cap` empty slots and nothing live. -/
@@ -132,7 +95,7 @@ theorem emptyRing_wf (cap : Nat) : (emptyRing α cap).WF := by
 theorem push_toList (r : Ring α cap) (x : α) (hw : r.WF) (hroom : r.size < cap) :
     (r.push x).toList = r.toList ++ [x] := by
   have hcap : 0 < cap := Nat.lt_of_le_of_lt (Nat.zero_le _) hroom
-  unfold Ring.push Ring.toList
+  unfold Ring.push Ring.toList Slots.toList
   rw [List.range_succ, List.map_append, List.map_cons, List.map_nil]
   congr 1
   · apply List.map_congr_left
@@ -148,7 +111,8 @@ theorem push_toList (r : Ring α cap) (x : α) (hw : r.WF) (hroom : r.size < cap
 over `List.range r.size`, so a slot holding `none` contributes its `default` rather than disappearing —
 which is why `dense` is needed for *element* reasoning and is not needed here. -/
 theorem toList_length (r : Ring α cap) : r.toList.length = r.size := by
-  simp [Ring.toList]
+  unfold Ring.toList
+  exact Slots.toList_length _ _
 
 /-- **Density does work.** A non-empty ring can always be popped — exactly the `dense` conjunct of
 `WF`, and false without it: a slot holding `none` would satisfy the weaker form. -/
@@ -182,7 +146,7 @@ theorem pop_toList (r : Ring α cap) (hw : r.WF) (hpos : 0 < r.size) :
     | none => rw [hm] at hden; simp at hden
     | some x =>
       refine ⟨x, rfl, ?_⟩
-      unfold Ring.toList
+      unfold Ring.toList Slots.toList
       simp only [hm, hk, Option.join, Option.getD_some, Nat.add_assoc]
       rw [List.range_succ_eq_map, List.map_cons, List.map_map]
       congr 1
@@ -293,7 +257,7 @@ theorem map_take {β : Type} (f : Nat → β) : ∀ (l : List Nat) (n : Nat),
 old view — the split the specification states as `take`. -/
 theorem keepFirst_toList (r : Ring α cap) (k : Nat) :
     (r.keepFirst k).toList = r.toList.take (min k r.size) := by
-  unfold Ring.keepFirst Ring.toList
+  unfold Ring.keepFirst Ring.toList Slots.toList
   simp only [map_take, List.take_range, Nat.min_assoc, Nat.min_self]
 
 /-- Shedding keeps well-formedness: the live range is a prefix of what it was. -/
@@ -321,7 +285,7 @@ is not a `simp` target, which is what defeated three earlier attempts. -/
 example : (emptyRing Nat 4).WF := emptyRing_wf 4
 
 /-- …and a ring whose live count exceeds its capacity is **not**, so `WF` is not true of everything. -/
-example : ¬ (Ring.WF (α := Nat) (cap := 4) ⟨Array.replicate 4 none, 0, 5⟩) := by
+example : ¬ (Ring.WF (α := Nat) (cap := 4) { slots := Array.replicate 4 none, head := 0, size := 5 }) := by
   intro h
   have hle := h.2.1
   have h5 : (5 : Nat) ≤ 4 := hle

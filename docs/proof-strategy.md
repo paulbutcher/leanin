@@ -143,6 +143,14 @@ in the plan rather than in a footnote. The alternative is to accept exactly the 
 (Isabelle/HOL) and CertiKOS (Coq) accept for their verified schedulers and say so — noting that those
 projects verify the actual C kernel, which Lean cannot do for its C++ task runtime.
 
+**The multi-carrier work does not add a row to this table.** The queue and park protocol at P carriers
+reach `Std.Mutex` (A1), `Std.Condvar` (A4/A5) and `IO.asTask … Task.Priority.dedicated` (A6, `startCarriers`
+only, already controlled by `controlDedicated`) — all already on the list — and the inject's store is pure
+Lean over `Array`, which is already `Ring`'s container. No new `#[extern]`, no extern call, and no
+`IO.Promise` construction in library code (the blocking pool's direct reach stays the only one). The new
+model theorems add `#print axioms` lines that name nothing beyond `propext`/`Quot.sound`; D19 records the
+non-change.
+
 ______________________________________________________________________
 
 ## 3. The property ladder
@@ -161,6 +169,29 @@ Stated so that each rung is independently meaningful and independently provable.
 | **P7** | Cancellation correctness | a cancelled task never observes a post-cancellation step; cancellation is idempotent; a cancelled child cannot outlive its context | async layer | `iris-lean` + model |
 | **P8** | Refinement | the running implementation is a refinement of the pure model of P3–P5 | the bridge | layered refinement; the service-level fallback was taken at W14 (`LeanIn/Model/Service.lean`, `docs/decisions.md` D15) and the refinement theorem remains open |
 | **P9** | Fairness (optional) | no ready task starves | scheduler loop | liveness logics |
+
+The ladder is deliberately ordered so that **P3/P4/P5 are provable first and independently** — they
+need no concurrency logic, no Iris, no runtime, and no semantics of Lean. They are pure mathematics
+about DAGs and schedules.
+
+**P1, P2 and P6 are restated for P carriers and discharged in the pure model.** `Model.Multi` carries the
+composition (one `Pool` per carrier, the shared `Inject`, the parked set) and re-discharges the three
+obligations over it: **P6** (no lost wakeup) is `reachable_live`, riding on the two invariants `ZeroParked`
+and `InjectWatched`; **P1/steal safety** and the accounting are `reachable_consistent`, with `stealInto`
+moving one element, `held` −1 and `taken` +1; and the allowance is `reachable_bound`, with
+`tick_other_untouched`. Each has a breaking control with its load-bearing half named
+(`pushSharedWithoutWaking_breaks_live`, `parkHoldingOwnWork_breaks_ZeroParked`,
+`stealDropping_breaks_consistent`, `fourthPoll_breaks_bound`), and the single-carrier statement is a
+corollary through the projection `Multi.toSched`. `Model.Scheduler`'s own proof is untouched. Their
+`#print axioms` lines name nothing beyond `propext`/`Quot.sound`. **P2 (completion) and P9 (fairness) stay
+conditional on A6's fairness hypothesis and are not discharged**, exactly as before — `Multi.Live` is a
+safety obligation, and no theorem claims progress.
+
+**P8's refinement status is unchanged in kind.** The queue's refinement is now stated *at the pair* — the
+pool and the shared list together — by `Sched.Pool`'s `toModel_toRing`/`toModel_submit`/`toModel_spawn`
+(`docs/interface.md` §6), which close the queue half of the table at P carriers; the per-operation
+refinement `Impl.op ⊑ Model.op` over the composition is still argued, not proved, and is still gated on the
+serializability lemma `docs/primitive-theory.md` §4 states as unproved.
 
 The ladder is deliberately ordered so that **P3/P4/P5 are provable first and independently** — they
 need no concurrency logic, no Iris, no runtime, and no semantics of Lean. They are pure mathematics

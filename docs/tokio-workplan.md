@@ -578,7 +578,52 @@ such as TLS, compression or JSON.
 
 **Acceptance.** The plan's M5 exit criteria, the scheduler's three model obligations re-discharged for P
 carriers, and two measurement conditions: the batch-shape gap to the native pool must shrink with P, and the
-chain-shape advantage (7.6×) must not regress.
+chain-shape advantage must not regress. The second condition's criterion is the base revision's own
+same-session ratio, not the historical 7.6× (`docs/PERFORMANCE.md` §3.5).
+
+**Met, and what its record reads.** SC18 is green and SC1–SC17 (the subset `SC1 SC2 SC3 SC5 SC6 SC8 SC10 SC11
+SC14 SC15 SC16 SC17`) are green on the fixed tree. **One finding the run produced, stated rather than hidden:
+Rule 2 covers two of three off-owner sites.** The two seam completions take `resumeShared`, and the third is on
+the task layer — `Async.await`/`select`'s `Join`-cell continuation runs on whichever carrier resolved the cell,
+so a shared-list child can land in another parked worker's queue; the per-worker `poked` flag and the broadcast
+are therefore the standing mechanism at this boundary, and the bit's removal belongs to a following item that
+rebinds each item's route at fire time (D19). The gate caught it as a hang in `runCarriers` (`exit 124` at a
+30–60s bound for a spawn-and-await program), and SC2/SC3's earlier timeout was the same lost wake.
+`Runtime.runCarriers` starts `p` dedicated carriers
+(`IO.asTask … Task.Priority.dedicated`) and the caller only waits; SC18-O1 reads `carriers = 4`,
+`distinctCarriers ≥ 2` with `ranTids ⊆ carrierTids`, and the `P = 1` control reads `carrierCount1 = 1`. O2 is
+closed by `Task.Sendable`, checked at both ends, with its elaboration control in `LeanIn/Test/Send.lean` and
+`sendctl|unmarkedPushes = 0`; the half it cannot reach — a caller's captured environment — is a documented
+convention (D19). The three model obligations are re-discharged in `Model/Multi.lean`
+(`reachable_live`/`reachable_consistent`/`reachable_bound`, each with a breaking control, the single-carrier
+statement a corollary through `toSched`), and their `#print axioms` lines name nothing beyond
+`propext`/`Quot.sound`. The queue's refinement is stated at the pair (`toModel_toRing`/`toModel_submit`/
+`toModel_spawn`). The rows and their reading are in `docs/PERFORMANCE.md` §3.5; **the second measurement
+condition fails against the criterion** — the chain-shaped round trip is ~1.4× the base's same-session figure
+where the criterion is parity or better — and the take path's repair and the residual are recorded there and in
+D19 rather than absorbed.
+
+### W17 — A bound on work admitted from outside the runtime
+
+**Deliverable.** An admission bound with a refusal path on the external spawn entry, in W6's
+`Channel.send`/`trySend` shape: a caller can be refused rather than queueing without bound.
+
+**Why it is its own item and not part of W8.** Bounding the *queue* is unsound: the inject is also the
+*resume* path, so a full inject makes a producer either refuse a resume — a lost wakeup, exactly what
+`Multi.Live` proves against — or block, which a libuv callback may not do. The sound route is a bound on
+*admission*, a public-contract change with its own observable, its own clause and its own rows, so W8 lands
+the inject's cell and its container and this item lands the bound.
+
+**Dependencies.** W8 (the inject's cell and its admission point) and W6 (the semaphore shape a refusal
+policy would take).
+
+**Two costs it inherits, recorded so it does not rediscover them.** (i) **The release point.** Releasing an
+admission on *take* is wrong: a unit's body may never return, and a Lean panic is not catchable, so the
+admission is held forever and later admissions are refused for a reason nobody can see — so the item either
+states that leak or needs a completion hook the item path does not have. (ii) It **re-activates a deferred
+obligation**: it re-uses `Task.Sync.Semaphore` (W6), whose invariant D14 states and defers, and whose
+release is the same question. It gates nothing on the critical path, which is why it sits beside W8 rather
+than at the end.
 
 ### W9 — The HTTP surface
 
@@ -719,7 +764,7 @@ CPS indirection, which is P1.
 | 10 | **W12** task-locals, connection registry | met (SC15) | log context, drainable shutdown |
 | 11 | **W7** selection, racing, priority | met (SC16) | racing a request against its deadline |
 | 12 | **W13** handle, metrics, deterministic time | met (SC17) | operating it, capacity, timeout tests |
-| 13 | **W8** multi-carrier and stealing (O2 first) | | more than one core |
+| 13 | **W8** multi-carrier and stealing (O2 first) | met (SC18) | more than one core |
 | 14 | **W17** a bound on work admitted from outside the runtime | | operability: a caller can be refused rather than queueing without bound |
 | 15 | **W15** parameterise the async surface upstream (parallel, gates nothing) | | W9's shape |
 | 16 | **W9** the HTTP surface | | a web server |

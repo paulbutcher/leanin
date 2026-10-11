@@ -100,33 +100,45 @@ ______________________________________________________________________
 ## 3. Scheduler
 
 ```lean
-structure Scheduler where
-  workers : Array WorkerQueue        -- one ring per worker, each behind its own Mutex
-  inject  : WorkerQueue              -- shared, receives overflow and external wakes
-  idle    : IdleSet                  -- which workers are parked
+structure Multi (α : Type) (cap : Nat) where
+  workers  : List (Pool α cap)   -- one per carrier; the inject is not a pool field
+  inject   : Inject α            -- the shared list: external wakes and every worker's overflow
+  parked   : List Bool           -- one per carrier, the parked set a wake is about
   stopping : Bool
 ```
+
+A worker's queue is its own (`ring`, LIFO slot, allowance, counters) and the inject is shared, so `Pool` has
+no `inject` field: the placement rule *returns* what overflows and the layer that owns the shared lock
+appends it. The shared list, the parked set and the stopping flag are one cell in the implementation, which
+is what makes a push that must unpark and a park that must re-check the inject the same critical section.
 
 Protocol, stated as the obligations it must meet rather than the calls it makes:
 
 | Operation | Obligation |
 |---|---|
-| `spawn s f` | enqueue on the current worker's queue (or inject if called from outside), then wake |
-| `wake s w` | if `w ∈ idle`, remove it and unpark it; the state change and the notification happen under the same lock |
-| `inject s f` | enqueue into `inject`; used for external events (D3) and overflow |
-| `park s` | park only if the local ring, the LIFO slot and `inject` are all empty and `stopping` is false |
-| `shutdown s` | set `stopping`, notify all, drain |
+| `pushLocal i x` | worker `i` is not parked; the item joins `i`'s own queue (slot, ring, or overflow to the inject) |
+| `pushShared x` | the inject gains one **and** one parked worker is unparked, in one step; every off-owner push takes this route |
+| `flushLocal i` | worker `i` is not parked; the spent allowance's slot item moves into the inject — a re-queue, so `held`, `pushed` and `taken` do not move |
+| `stealInto i j` | `i ≠ j` and `j`'s ring holds something; the thief takes **one** element, so `held` −1 and `taken` +1 |
+| `takeLocal i` | slot while the allowance lasts, else the ring; the inject fallback belongs to the inject-owning layer |
+| `takeShared` | the inject holds something; it holds one fewer |
+| `park i` | only from `i`'s own empty queue *and* an empty inject, and only when `stopping` is false |
+| `stop` | set `stopping`, notify all, drain |
 
-Three obligations, each traceable to an axiom:
+Three obligations, each traceable to an axiom, and each re-discharged over this shape:
 
 - **No lost wakeup** — forced by A5 (notifications are not queued): a worker must not be able to
-  observe "no work" and park between another thread's push and its notify. Solved the same way Tokio
-  does, by doing both under one lock.
-- **No lost work at shutdown** — forced by invariant 1 above. `shutdown` drains both `inject` and every
-  ring before returning.
+  observe "no work" and park between another thread's push and its notify. In the implementation the
+  parked count, the inject's contents and the stopping flag are one cell under one lock, and every push
+  that can wake anyone tests the count and notifies *inside* that section while a park re-checks the
+  inject there too. The model states it as `Live` riding on **two** invariants — `ZeroParked` (a parked
+  worker holds nothing of its own) and `InjectWatched` (a non-empty inject implies some worker is not
+  parked), the second because a flush and a local overflow write the inject without unparking anyone.
+- **No lost work at shutdown** — forced by invariant 1 above. `stop` drains the inject and every ring
+  before returning; `stealInto` moves an item without losing it from the count.
 - **Bounded work per tick** — the coop budget, so one task cannot monopolise a worker. Not a
   correctness property; it is a *policy* with a stated bound, and the LIFO cap is the same kind of
-  thing.
+  thing. The allowance is per worker, and a spent allowance's slot item is flushed rather than stranded.
 
 Two details that are policy, not mechanism, and are separately testable: the LIFO cap of 3, and the
 inject check interval.
@@ -346,13 +358,29 @@ Each of these is a decision, not an oversight:
   It is honoured by the implementation and promised by no document; "high" is not a total order, and two
   `.high` spawns displace each other through the slot's ordinary overflow rule.
 - **No atomics.** Not exposed (D4, D7).
-- **No `Send`/`Sync`.** Lean has none; O2 in [`decisions.md`](decisions.md) is unresolved. Until it
-  closes, the interface cannot be frozen — this is the one thing that blocks it. The task-local
-  context is gated on the same item: it is per-computation and tested on one carrier, and the
-  cross-carrier half of its inheritance law is W8's (D16). The `Handle` of §4 is not an exception: it
-  is a narrowed capability fixing one object by audit, argued rather than proved, and it neither checks
-  nor restricts what a caller shares with a thread — so it does not close O2 and must not read as if it
-  did.
+- **`Send`/`Sync`, narrowed to what the marker enforces.** There is no `Send`/`Sync` in Lean, so the
+  boundary is a marker, and its enforcement splits in two. **Compiler-enforced**: `Task.Sendable`'s
+  constructor is private to `LeanIn.Task`, so only this library mints one; the library's own marker-requiring
+  routes take one (`Executor.pushInject`/`spawnLocal`/`submitLocal`); and the capability boundary is narrowed
+  the way `Handle` is — `Sched.Executor`'s constructor and fields are private, verified cross-module by
+  `LeanIn/Test/ExecutorNarrowing.lean`. **Audit-enforced, and stated rather than implied**: the raw
+  transactions (`pushInjectRaw`/`submitLocalRaw`/`spawnLocalRaw`) are public, because `Sendable` sits above
+  `Sched.Executor` in the import DAG (`Executor` ← `Task.Basic` ← `Task.Send`) and no module the executor can
+  see can both mint a `Sendable` and consume it; "the runtime never calls a raw push" is therefore a fact about
+  this library's call sites, not a compiler one. What the
+  mechanism **cannot** reach, and what the interface therefore states as a **convention** rather than a
+  promise, is a caller's captured environment: a private constructor narrows a *type*, and a closure's
+  environment is not a type this library names. `Runtime.spawn`'s docstring states the obligation (share
+  only what is guarded by a `Std.Mutex`, or a value the runtime copied), and the end state that closes
+  it — a *proved* non-interference property for a restricted subset — needs the serializability lemma
+  [`primitive-theory.md`](primitive-theory.md) §4 states as unproved. D19 records the enforced/convention
+  line; D9's trigger is met by it, and the interface freeze this bullet was blocking is no longer
+  blocked *on this item*: it is blocked on the convention half being a documented convention rather than
+  a claim. The control for the marker is an elaboration check, run as the `#check`/`#check_failure` pair
+  (`LeanIn/Test/Send.lean`, compiled into the gate by `Controls.lean`) rather than the `#guard_msgs` form
+  first considered — the toolchain's expected-message format did not have to be pinned, and the pair fails the
+  build when the marker stops blocking. The `Handle` of §4 is not an exception, and the cross-carrier half of the task-local context's
+  inheritance law is now stated for P carriers (D16).
 - **No consistent counter snapshot, and no pacing guarantee for an external signal.** A `Metrics` read
   takes two short critical sections — `Executor.observe` for `ready`/`parked`, the counters lock for the
   per-carrier list — and copies scalars, so it is not a single-instant image of the whole executor, only
@@ -383,6 +411,24 @@ Impl.spawn ⊑ Model.spawn       Impl.await ⊑ Model.await
 and the scheduler's three obligations (no lost wakeup, no lost work, bounded work per tick) are
 theorems about the model, discharged in `Impl` by the serializability argument of
 [`primitive-theory.md`](primitive-theory.md) §4.
+
+At P carriers the composition is `Model.Multi` and the same three obligations are re-discharged there, with
+the single-carrier statement a corollary through the projection `Multi.toSched`. The queue's refinement is
+stated **at the pair** — a pool and the shared list together — because one pool no longer owns the inject:
+
+| Model | Executor | What is argued |
+|---|---|---|
+| `Model.Pool.toRing inj x` | `Sched.Pool.toRing x`, its overflow appended to the inject by the caller | `toModel_toRing`: the placement, projected and threaded through the shared list, is the specification's placement — `keepFirst_toList` (the eviction is the model's `take`) and `push_toList` (the append) carry it, with `toList_length` making the two `if`s split on the same condition |
+| `Model.Pool.submit inj x` | `Sched.Pool.submit x` | `toModel_submit` — the pair theorem above plus `pushed` |
+| `Model.Pool.spawn inj x` | `Sched.Pool.spawn x` | `toModel_spawn` — a free slot holds the new task and leaves the inject alone; an occupied slot displaces through `toRing` on both sides |
+| `Multi.pushLocal` / `pushShared` / `flushLocal` | `Executor.spawnLocalRaw` / `pushItems` / the take's flush arm | argued per operation; `pushLocal` is owner-only by construction (a worker writes only its own pool and parks only after finding it empty — `ZeroParked`); every off-owner push takes `pushShared`, whose unpark is inside the push's own section |
+| `Multi.stealInto i j` | `Executor.stealInto i j` | one element, ring only, `held` −1 and `taken` +1 — the thief's own queue is untouched, which is why the take holds one pool lock |
+| `Multi.reachable_live` / `reachable_consistent` / `reachable_bound` | the park/unpark protocol's one cell, the drain, the per-worker allowance | the model theorems' `#print axioms` lines name nothing beyond `propext`/`Quot.sound`; `reachable_live` rides on `ZeroParked` and `InjectWatched`, and its breaking control is the shared push without its unpark |
+
+`SC18` is the executable correspondence test for the composition (the carriers, the thief, a wake from a
+thread that is not a carrier); `SC5` is the behavioural guard for the pool/inject split's ordering. The
+per-operation refinement is argued, not proved, in the same standing position as above — gated on the
+missing serializability lemma.
 
 The model is **executable**, so the first tests are against it — small queues, small schedules,
 enumerated interleavings — before any thread exists. That is the fastest available feedback, and it is

@@ -118,13 +118,14 @@ def pending (hooks : Hooks) : IO Nat := do
 /-- **The step that does the work**, factored out so `awaitTask` and `awaitAsync` share one path: register a
 continuation that enqueues, and return.
 
-`ctx.resume` is the runtime's scheduling function, so the completion is delivered as fresh work on the carrier
-rather than run on whatever thread completed the leaf. -/
+`ctx.resumeShared` is the runtime's **shared** scheduling route, so the completion is delivered as fresh work
+on the shared list rather than run on whatever thread completed the leaf: the completing thread is not the
+owning carrier in general, so a local push there could land in a parked owner's queue with nothing to wake it. -/
 def awaitTaskStep {α : Type} (hooks : Hooks) (t : _root_.Task (Except IO.Error α))
     (k : α → IO Unit) (ctx : Task.Ctx) : IO Unit := do
   let hooked ← BaseIO.bindTask t (fun r => do
     match r with
-    | Except.ok v    => ctx.resume (Task.Item.ofAction (k v))
+    | Except.ok v    => ctx.resumeShared (Task.Item.ofAction (k v))
     | Except.error e => panic! s!"awaitTask: the awaited task failed: {e}"
     return _root_.Task.pure ())
   hooks.add ctx.cancel hooked
@@ -155,7 +156,7 @@ socket needs, because a client that goes away mid-request is an ordinary event r
 The registry and the one-continuation shape are the same; only the reading of the result differs. -/
 def awaitTaskE {α : Type} (hooks : Hooks) (t : _root_.Task (Except IO.Error α)) : Task.EAsync IO.Error α :=
   ⟨fun k ctx => do
-    let hooked ← BaseIO.bindTask t (fun r => do ctx.resume (Task.Item.ofAction (k r)); return _root_.Task.pure ())
+    let hooked ← BaseIO.bindTask t (fun r => do ctx.resumeShared (Task.Item.ofAction (k r)); return _root_.Task.pure ())
     hooks.add ctx.cancel hooked⟩
 
 /-- **Wait for a promise's result, carrying its failure.** -/

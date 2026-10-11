@@ -678,6 +678,210 @@ virtual instant and compared against the instants the mode stated, so no scenari
 
 ______________________________________________________________________
 
+### SC18 — the carriers, the thief, and a wake from a thread that is not a carrier
+
+**Actor.** The public `controls` executable in a new mode, `lake exe controls --runtime-carriers
+[--workers P] [--bound N]` (defaults `P = 4`, `N = 20000`), playing three actors over one run: for
+clause one, the multi-carrier entry `Runtime.runCarriers e p program`, whose fixed shape starts `P`
+dedicated `IO.asTask (Executor.workerLoop e i) Task.Priority.dedicated` threads through
+`Runtime.startCarriers` while the mode's own thread **is not** a carrier and only waits; for clause two,
+the mode's thread driving one steal through the public `Executor.stealInto` against a worker it staged
+itself; for clause three, the mode's thread pushing through `Handle.spawn` while all `P` carriers are
+parked. Nothing here calls a private function: every compared value is a named field of a record the
+executable printed on stdout.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC18`, which invokes the executable
+synchronously and parses its records. The invocation's watchdog is raised for this check to a stated
+value (1200 s), because the scale arm's cost is the shared cell's contention and not a throughput figure
+a 300 s bound covers; a bound the requirement itself exceeds is a setup error waiting to happen. An
+invocation that does not run, prints no record, prints a malformed record, exits non-zero without the
+check's printed clause lines, or is bounded by the watchdog is a **setup error**, never the `Then`.
+
+**Given.** A fresh `Sched.Executor.new LeanIn.Task.Item 256 P` (`P = 4` for the parallel arm, `1` for the
+single-carrier control arm), metered so the per-carrier counters are readable. A `Std.Mutex`-guarded
+`List UInt64` of the tids the started carriers recorded, and the mode's own completion cells. Clause
+two's staging: a `Runtime.run e (spawnburst 200)` prelude leaves worker `0`'s ring holding 200 and its
+slot empty, a clean worker as the empty victim, and a `spawnInto` that puts one item in a third worker's
+**slot** with an empty ring. Clause three's stage: all `P` carriers started and observed parked, and one
+task-layer `Join` cell the pushed computation resolves.
+
+**When.** One invocation, three clauses, every ordering enforced by the mode's own steps and never by
+which carrier wins:
+
+1. **The parallel arm.** The mode calls **`Runtime.runCarriers e p program`** — the multi-carrier entry,
+   which starts the `p` carriers and submits the program's root to the shared inject — and waits for the
+   program's completion; the mode's own thread is **not** a carrier and cannot `Async.await`, so the wait
+   is the entry's, and the mode's own completion reads are the bounded round polls below. **This is the
+   one shape**: the drafted `Runtime.run e root` followed by `Runtime.startCarriers e workers` is
+   superseded, because `run` keeps worker 0 on the calling thread by design (§3.3), so every body fires on
+   the caller and `startCarriers` runs against an already-drained inject — `distinctCarriers` then reads
+   the same on the staged tree and on the fixed one, which makes the cut inert and the clause unable to
+   yield its fixed reading. Under the entry shape the staged cut (the entry starts **no** carriers and
+   drives the program on the caller, so `carriers = 0`, `carrierTids = []` and `ranTids = [<main>]`) is read
+   by the clause's `ranTids ⊆ carrierTids` binding, and the fixed entry is read by the same binding holding
+   with `carriers = p`. The **control arm** is the same program at `P = 1`, read by the same detector.
+2. **The steal.** The mode calls the public steal from worker `1` against worker `0` once, recording the
+   victim's ring before and after and its slot either side, and the thief's own ring and slot after. Then
+   the same call against the empty worker, and the same call against the worker whose **slot** holds one
+   and whose ring is empty — that victim's slot is read **before and after** the third call, and
+   `slotStolen` is computed from the two occupancy readings (`no` exactly when the slot was occupied and
+   is still occupied after), so an empty slot cannot produce a `no`.
+3. **The wake.** With the `P` carriers started and observed parked (`Handle.metrics`' `parked = P`,
+   `ready = 0`, polled in the bounded round loop), the mode pushes one computation through
+   `Handle.spawn`; it waits on that cell by the same bounded poll; then pushes a second; then reads
+   `parked`/`ready` again, then `stop`s and `join`s, and reads `Executor.observe` and `Runtime.pending`
+   after the drain. The **scale arm** is one more `P = 4` run with `n = 100000` tasks, reading only
+   `remaining`.
+
+Every wait the mode makes itself is a **round count** bounded by `--bound`, never a clock: an expiry yields
+`wokeRounds = bound` and the clause's reading fails; it is not a hang, and the shell's watchdog remains only
+a hang bound. (The parallel entry's own wait is the entry's, and the staged cut drives the caller inside it;
+the mode's own reads of `Join.value?` are the round-bounded ones, and the wake detector compares `wokeRounds`
+against the same `--bound`.) The
+run durations (`runUs`) and the measurement rows are printed and never asserted: the `parbatch` sweep at
+`p = 1, 2, 4, 8` with the box's core count and a `parbatchcond` line stating the condition to its endpoints
+(`ratio(pMax)` against `ratio(1)`, a halving margin, the interior arms reported and not asserted between
+their neighbours), a `chain` row per construction measured — the recorded `Async.spawn`/`await` chain
+without per-link instrumentation, and the same construction with it — each naming its construction with the
+ratio as a multiplier, and the driven-steal `stealbench` pair, which is not like-for-like and says so.
+A timing assertion is a flake with a schedule, so every row is a reading and none is a gate.
+
+**Then.** There is exactly one `carriers|` and one `steal|` record per invocation, shaped exactly with
+nonempty values, as `carriers|carriers|p|carrierTids|ranTids|distinctCarriers|carrierCount1|chainCarriers|
+parkedBefore|readyBefore|ranTid|spawnTid|inWorkerTids|wokeRounds|ran1|ran2|parkedAfter|readyAfter|
+inFlightAfter|pendingHooks|scaleN|remaining|runUs` and `steal|victimRingBefore|victimSlotBefore|stolen|
+victimRingAfter|victimSlotAfter|stolenFromEmpty|emptyVictimRingBefore|slotStolen|slotVictimSlotBefore|
+thiefRingAfter|thiefSlotAfter|thiefTid|victimTid`, plus the mode's `sendctl|marked|unmarkedPushes`,
+`carriersctl|accepted|rejected|variants` and `carrierscfg|bound|workers` lines. The clauses are read from
+their own named fields:
+
+- **SC18-O1 — P carriers ran the work.** `p = 4`, `distinctCarriers ≥ 2`, and every tid in `ranTids` is
+  one of the carriers' own (`ranTids ⊆ carrierTids`, so the work ran on the *started* carriers and not on
+  the thread that called the entry). The affirmative control, in the same run, is `carrierCount1 = 1`:
+  the same detector on the `P = 1` arm reads exactly one distinct carrier tid, so `≥ 2` at `P = 4` is a
+  reading about a detector that can also read one. `chainCarriers = 1` binds the second measurement
+  condition's structural half — a chain did not cross carriers — to the same record. The record's
+  `carriers` field — how many carriers the entry actually started, `Carriers.count`, read before the
+  carriers are stopped — is shape-checked but deliberately **not** one of O1's bindings: the red is the
+  relation `ranTids ⊆ carrierTids`, not this count (under the staged entry `carriers` reads `0` and the
+  caller's tid is in `ranTids` while `carrierTids` is empty).
+- **SC18-O2 — a thief takes exactly one, from the ring and never from the LIFO slot.** `stolen = 1`,
+  `victimRingBefore ≥ 1`, `victimRingAfter + 1 = victimRingBefore`, and `victimSlotAfter =
+  victimSlotBefore` with `slotStolen = no`. **The slot half is bound to an occupancy reading, not
+  assumed**: the record carries `slotVictimSlotBefore` (the slot-only victim's slot as the call read it)
+  and the clause asserts it is `some`, so `slotStolen = no` cannot pass on an empty slot — under a
+  ring-only steal an empty slot yields the same `no`, which is exactly the gap this closes — and
+  `slotStolen` is computed as "the victim's slot was occupied and is still occupied after", not from the
+  call's return. The thief's own side is read too, and it is what makes the batch observable rather than
+  inferred: `thiefRingAfter = 0` and `thiefSlotAfter = -`, where a steal that also staged an element in
+  the thief's own slot would read `some`. The controls, in the same run: `stolenFromEmpty = 0` with
+  `emptyVictimRingBefore = 0` — the same call that reads 1 also reads 0 — and the slot-only victim's
+  `slotStolen = no` with `slotVictimSlotBefore = some`, which is the affirmative control that the LIFO
+  slot is genuinely out of a thief's reach.
+- **SC18-O3 — a push from a thread that is not a carrier wakes a parked carrier, and the drain leaves
+  nothing held.** `parkedBefore = p`, `readyBefore = 0` (all parked, nothing ready, so the protocol was
+  exercised rather than a push into an idle pool); `ranTid ≠ spawnTid` and `inWorkerTids = yes` (the work
+  ran on a carrier, not on the thread that spawned it); `wokeRounds < bound`; `ran1 = yes` and
+  `ran2 = yes` (the same protocol woke twice, so one wake is not a single-shot accident); then
+  `inFlightAfter = 0` and `pendingHooks = 0`. `wokeRounds < bound` is read against the bound the mode
+  printed (`carrierscfg|bound`), not a literal, so a mode run at another bound cannot silently pass; a
+  bound that expires is read as `wokeRounds = bound` with this clause's own assertion failing, never as a
+  setup error. **And the chain arm starts its carriers too**, so `chainCarriers = 1` is an *affirmative*
+  control rather than a construction artifact: with `p` carriers running, a thief can reach a ring item of
+  the carrier running the chain, so a crossing is possible and its absence is a reading, which is what the
+  vacuity rule requires and what a chain measured with no carriers started could never show. The **scale
+  arm**'s `remaining = 0` at `scaleN = 100000` is the affirmative control for "a carrier that parks
+  mid-run is woken again" at a size that forces many parks and wakes.
+
+**The staged and fixed readings, field by field.** Every clause field is written for **both** trees,
+because a fixed-tree reading read as the staged one is how the earlier draft's F2 arose. The assertion is
+the clause's on the **fixed** tree; the staged value is recorded beside it, and a field whose staged value
+is the clause's own subject is both.
+
+| field | staged | fixed |
+|---|---|---|
+| `carriers` | `0` — the staged entry starts no carriers | `p` — started equals requested |
+| `carrierTids` | `[]` | the `p` dedicated tids |
+| `distinctCarriers` (`p = 4`) | `1` — the caller alone | `4`, all from `carrierTids` |
+| `ranTids ⊆ carrierTids` | **no** — the caller's tid is in `ranTids` and `carrierTids` is empty | yes |
+| `carrierCount1` | `1` | `1` |
+| `chainCarriers` | **greater than 1 as measured** — the staged route is captured as worker 0 while the seam sits on the shared route, so a link resumed from the inject lands on another carrier and the chain genuinely crosses; the assertion is about the fixed tree | `1` — the index route plus the owner-only local route keep every link owner-made |
+| `parkedBefore` (O3) | `p` | `p` — **no cut here**, so clause three is green on both trees and its red is unavailable |
+| O2's fields | as recorded (the batch-two cut: `victimRingAfter + 2 = victimRingBefore`, `thiefSlotAfter = some`) | as recorded (batch one: `victimRingAfter + 1 = victimRingBefore`, `thiefSlotAfter = -`); `slotVictimSlotBefore = some` in both |
+
+So **`chainCarriers = 1` is a fixed-tree assertion**, and that is said here where the clause is stated
+rather than only in the record: the chain arm keeps starting its carriers, because with none started a
+crossing could not have been observed and the assertion would be vacuous.
+
+**The detectors' own control, in the same run.** `carriers_ok`, `steal_ok` and `wake_ok` are the
+record-string detectors the assertions are built from. They must accept a well-formed record written from
+the record syntax and the expectation, and reject each near miss, one per clause plus the chain half:
+the work ran on the thread that spawned it (`ranTid = spawnTid`), a thief took two from the ring
+(`victimRingAfter = victimRingBefore - 2`, the shape this tree's clause-two cut produces), a chain
+crossed carriers (`chainCarriers = 2`), and the slot-cleared record a slot-taking thief would produce
+(`slotStolen = yes`). The delivered near-miss count is four; a near miss a detector accepts is a fixture
+defect reported as a **setup error**, separately from the `Then`. The mode's own `carriersctl|` readings
+must hold too: `accepted` for the well-formed pair, `rejected` for each of the four near misses, and
+`variants = 4`; and its `sendctl|unmarkedPushes` must read `0`. **The authority for those readings is the
+shell fixture's own exercises, not the mode's line**: the mode prints `carriersctl|` and `sendctl|` as
+fixed strings describing what the fixture runs — so they are *descriptions* of the exercises rather than
+readings of the system, and the near-miss rejections are proved by the fixture's own `setup_error` paths,
+which build each near miss from the record syntax and the expectation rather than from the executable's
+receipt. A printed constant must not be mistaken for evidence.
+
+**Assertion order.** `check_sc18` evaluates the three clauses on their own named fields, in order O1, O2,
+O3, and evaluates all three so the ones that hold are observed to hold. On a tree where more than one
+fails it prints each failing clause's own assertion, in clause order, before it exits; the first line a
+run reports is therefore always SC18-O1's.
+
+**The failure this scenario records on the staged tree.** The multi-carrier operations are new, and the
+staged surface carries one plausible first cut per clause. **Clause one's staged entry starts no carriers
+and drives the program on the calling thread**, so the caller runs every item and the carriers' detector
+counts none of them: `carriers = 0`, `carrierTids = []`, `distinctCarriers = 1` for the caller alone, and
+`ranTids = [<main>]` with `ranTids ⊄ carrierTids` — the red is the **relation**, so it does not depend on
+which carrier wins. (The earlier `p−1`-carrier form of this cut was a race — the caller ran none of the 2048
+bodies in 2 of 23 runs — and a clause's red cannot be a race.) The `P = 1` control still reads
+`carrierCount1 = 1`, and the chain arm's carriers make `chainCarriers` read greater than `1` on the staged
+tree where the clause binds `1`. Clause two's staged steal takes a **batch of two** from the victim's ring
+and gives the second to the thief's own slot, so the ring loses two where the design loses one and the
+thief's slot reads `some`. **Clause three has no staged red**: the parked-accounting cut is withdrawn
+(record §7), so `parkedBefore` reads `p` on the staged tree too and its wake readings pass — the run
+completes and the drain empties the queued work. The check prints the failing clauses it finds, in clause
+order — the first failing clause is SC18-O1:
+
+```
+SC18 Then: the work did not run on more than one carrier
+  observed: p=4 carriers=0 carrierCount1=1 distinctCarriers=1 spawnTid=<main> ranTids=[<main>] carrierTids=[]
+SC18 Then: a thief took more than one element from the victim's ring
+  observed: victimRingBefore=200 victimRingAfter=198 victimSlotBefore=- victimSlotAfter=- slotStolen=no slotVictimSlotBefore=some stolen=1 thiefSlotAfter=some stolenFromEmpty=0
+```
+
+and **no O3 `Then` is printed**: clause three is green on the staged tree, so it contributes no line.
+
+The same fields on the fixed tree read `carriers = 4`, `carrierTids` = the four carriers, then
+`distinctCarriers = 4` with `ranTids ⊆ carrierTids`, `chainCarriers = 1` and `parkedBefore = 4`, and clause
+two reads `victimRingAfter = 199` with `thiefSlotAfter = -`. A red is only a red if it is a clause's own
+assertion: a missing or malformed record, a non-zero exit without the check's printed lines, or a watchdog
+expiry is a setup error, not the `Then`. Clause three's evidence is SC17-O1 at `P = 1` (a foreign push
+against a parked carrier, green on every run since W13), the model's `Model.Multi.reachable_live` with
+`ZeroParked` and `InjectWatched`, and this clause's own readings on the fixed tree, the scale arm included —
+a green O3 must **not** be read as the wake having been measured by a staged red, because there is none. The
+`sendctl|` readings are not reds: the marker's enforcement is a compile-level fact.
+
+**Why, and what it rests on.** Clause one is the deliverable: work is spread over `P` carriers rather
+than run on the caller. Clause two is D4's inversion made observable — one element, from the ring, never
+the slot, so batching and slot-stealing would both fail it. Clause three is the model obligation a
+scenario can observe: a waker on another thread, all carriers parked, the work still runs exactly once,
+and the drain leaves nothing behind. Clause one is **not vacuous** only because its control arm reads
+one; clause two is not vacuous only because the same operation reads zero on an empty victim and cannot
+see the slot; clause three is not vacuous only because `parkedBefore = p` and `readyBefore = 0` make the
+push the waking event, and because SC17 already owns the single-carrier version of the same claim. Every
+ordering is enforced by the mode's own awaits — the `P = 1` arm, the `Join` cells, and the round-bounded
+polls — never by which thread wins, and no assertion reads a clock: the run durations and the four rows
+are printed and never asserted, because a timing assertion is a flake with a schedule.
+
+______________________________________________________________________
+
 ### SC14 — the service's own obligations: no drop, a live bound, and resolution within a deadline
 
 **Actor.** A Lean executable server (`lake exe controls --runtime-service`): an accept loop of ours

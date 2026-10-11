@@ -1,4 +1,8 @@
 import LeanIn.Theory.World
+import LeanIn.Model.Multi
+
+open LeanIn LeanIn.Model
+
 
 /-!
 # Reachability of the model's states
@@ -117,6 +121,54 @@ def parkResumeCycle (s : List Act) (ws : List World) : Bool :=
          | none => false)
      | _, _ => false)
 
+/-- **The P-carrier composition's obligations, one arm each, staged through real transitions.**
+
+The obligations themselves are theorems in `LeanIn.Model.Multi` — `reachable_live`, `reachable_consistent`,
+`reachable_bound` and the projection's `reachable_toSched_live` — so what an executable probe can add is
+their *staging*: that the state each hypothesis and each control is about is produced by running the
+transition, and that the reading each claim turns on has the value the claim needs. So each arm below runs
+one transition on a state built by the earlier ones and prints the quantity in question:
+
+* a `pushShared` that unparks a parked worker, and the `toSched.Live` the wake obligation is about;
+* a `stealInto` that leaves the conserved sum alone while `held` falls and `taken` rises — which is where
+  `stealDropping_breaks_consistent`'s removal-without-counting gets its teeth;
+* the per-worker allowance, with `tick` on one worker and the other worker's allowance untouched.
+
+The readings are computed by the model's own definitions, not written out as an expected text, so this is a
+probe of the staging rather than a second copy of the theorems; each is printed with the transition that
+produced it, so a reader can follow the state the theorem speaks about. -/
+def carriersObligations : IO Unit := do
+  let n := 3
+  let base : Multi Nat 256 := Multi.initial Nat 256 n
+  IO.println s!"  the composition at {n} carriers: workspace, inject, and one park flag each"
+  IO.println s!"  a fresh composition holds nothing and none of its carriers is parked   {base.held == 0 && base.parkedCount == 0}"
+  -- a parked worker, produced by the transition and not hand-filled
+  let parked ← match base.park 1 with
+    | some m => pure m
+    | none   => IO.println "  NOT STAGED: park was refused on a fresh composition"; pure base
+  IO.println s!"  park 1 leaves carrier 1 parked and the composition with no work   {parked.parkedCount == 1}"
+  -- the shared half: the push and the unpark are one step, which is what `reachable_live` rests on
+  let shared := parked.pushShared 7
+  IO.println s!"  pushShared 7 holds one item and unparks a carrier   {shared.held == 1 && shared.parkedCount == 0}"
+  IO.println s!"    and the composition is live, which the lost-wakeup obligation is about   {shared.held == 0 || shared.parkedCount < shared.workers.length}"
+  -- the local half: only the owner's own queue, and only while it is not parked
+  let local? := parked.pushLocal 1 7
+  IO.println s!"  pushLocal 1 while carrier 1 is parked is refused, so no parked carrier holds work   {local?.isNone}"
+  -- the steal: the move leaves the conserved sum alone while the item is counted as taken
+  let ring : Multi Nat 256 := base.pushLocal 0 4 |>.getD base
+  let ring2 : Multi Nat 256 := ring.pushLocal 0 5 |>.getD ring
+  let before := ring2.held + ring2.taken
+  match ring2.stealInto 1 0 with
+  | some stolen =>
+    IO.println s!"  stealInto 1 0: held falls to {stolen.held}, taken rises to {stolen.taken}, and held + taken is unchanged   {stolen.held + stolen.taken == before}"
+  | none => IO.println "  NOT STAGED: the steal found nothing in a ring that holds two"
+  -- the allowance is per worker: a tick refreshes one and leaves the other's polls alone
+  let polled : Multi Nat 256 := ring2.tick 0
+  let other := (polled.workers[1]?).map (fun p => p.lifoPolls)
+  IO.println s!"  tick 0 leaves carrier 1's allowance where it was   {other == some 0}"
+  IO.println "  these arms observe the staging. The obligations and their breaking controls are the"
+  IO.println "  theorems in LeanIn.Model.Multi, audited there by `#print axioms`."
+
 def main : IO UInt32 := do
   let tids := [0, 1]
   let n := 4
@@ -142,6 +194,9 @@ def main : IO UInt32 := do
   IO.println "  (parks, releases the lock, takes it again, and is no longer enrolled)"
   checkPath "the cycle a runtime `wait` spans (same thread, released at the park)"
     parkResumeCycle tids n
+  IO.println ""
+  IO.println ""
+  carriersObligations
   IO.println ""
   IO.println "  Not testable here: the contracts themselves. They quantify over an `opaque` relation, so"
   IO.println "  their dynamics are not observable; `lake exe controls` observes the primitives instead."

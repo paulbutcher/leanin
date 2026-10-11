@@ -1,377 +1,656 @@
 import Std
+import LeanIn.Data.Deque
 import LeanIn.Sched.Pool
+import LeanIn.Model.Multi
 import LeanIn.Sched.Scheduler
 
+-- `Pool` is built on `Ring`, whose operations need `Inhabited α` (`toList` falls back to `default`), so
+-- anything holding a `Pool` needs the instance in scope. Carried once here rather than at each mention.
+set_option linter.unusedSectionVars false
+
 /-!
-# The executor's state, and the critical sections around it
+# The executor at P carriers
 
-`Pool` and `Scheduler` are the two halves of what a worker holds. This file is where they are held
-*together*, and that is not a packaging choice: the model's protocol is atomic per transaction — `enqueue`
-adds work *and* unparks in one step, `park` checks the work state and parks in one step — and one
-`Std.Mutex` around the pair is what makes an executor agree with it.
+`Sched.Pool` is one worker's queue and `Sched.Scheduler` is the wake protocol's abstract state; this file is
+where a *set* of them is held together, and the shape follows from one decision: **a worker's queue is its
+own, and the inject is shared**. So there is one `Std.Mutex` per worker's pool and one for the shared cell
+holding the inject's items *and* the idle bookkeeping — the parked count, the carrier count and the stopping
+flag. The parked count lives with the inject's contents because a push that must unpark and a park that must
+re-check the inject are then the *same* critical section: that is what makes a cross-carrier wake impossible
+to lose between the check and the wait.
 
-Three transactions, and the projection that makes them comparable:
+## The critical sections, per queue
 
-| operation | pool | scheduler |
+| queue | lock | transactions |
 |---|---|---|
-| `submit` | `Pool.submit` | `Sched.enqueue` |
-| `take` | `Pool.take`, and `Sched.take` only when it returned a task | |
-| `park` | unchanged | `Sched.park`, refused while work is held |
+| worker `i`'s pool | that pool's own mutex | take slot/flush/ring; a local submit into the ring; a local spawn into the slot; the tick; one thief's steal; a metrics read |
+| the shared inject and its idle counters | the inject's own mutex | push one and unpark one parked worker; pop one; park (re-check the inject, record the park, wait); stop (set the flag, notify all); a metrics read |
 
-`Aligned` -- the scheduler's work count and the pool's held work being one quantity -- is what `take`'s two
-halves must not come apart through. **Its preservation is proved**, one theorem per transaction below: a
-tick, a submit, a spawn and a take. Those four are the whole of what a transaction can do to the pair — the
-two pool operations that add work, the one that removes it, and the allowance refresh that moves neither
-side — and the proofs are the pool's own count laws applied to the scheduler's two counters.
-`tests/ModelOracle.lean` checks the same equation after every step of its script, which is where it is
-observed rather than proved.
+**Lock order: pool → inject, everywhere.** The paths that take both are a local push whose placement
+overflows and a take whose allowance has run out with the slot occupied; each takes its pool first. Nothing
+takes the inject and then a pool, so two locks is the most any path holds and the order is total.
 
-`Executor.work` is one step of a worker — take work, or park until there is some — and the carrier loop is
-that step run until `none`. The records and the driver that emits them are not here.
+## Which worker, and what a worker is
+
+`Executor.workerLoop e fire i` is one carrier's shift: take from worker `i`'s own queue, then one steal
+attempt, then the shared list; park when all three are empty. `fire` is the caller's, because what an item
+*is* and how it is run belong to the layer above this one — the runtime passes `Item.fireWith` and the
+worker's own route. The driver's path (`run`/`blockOn`) is worker `0`'s loop run **on the calling thread**,
+through the same operations, which is why no existing scenario's driver changed.
+
+`Executor.submit`/`spawn`/`take`/`takeReport`/`tick`/`work` are the driver's spelling of worker `0`'s
+operations: the calling thread stands in for worker `0`, so a single-carrier path takes the same critical
+sections a carrier does.
+
+## The local route, and why a local push must still wake
+
+A push a step makes on its own worker is the owner's, and the owner is running the step that makes it, so it
+owes no wake. That is not every local push. `LeanIn/Task/Basic.lean`'s `Async.await` and `select` register
+`ctx.resume` on a `Join` cell, and the thread that *runs* that continuation is whichever carrier resolved the
+cell — which, for a child delivered through the shared list, is not the awaiting worker. So an off-owner item
+can land in a worker's own queue, and the waiting predicate cannot see it: it re-checks the shared cell, and
+reading the owner's pool there would invert the total lock order. The audit that named the two seam completions
+(`Runtime/Leaf.lean`'s leaf continuations and `Runtime/Blocking.lean`'s blocking completion) therefore had a
+**third** site on the task layer, and it is why `Executor.wakeIfParked` records a per-worker flag and wakes every
+waiter from `submitLocalRaw`/`spawnLocalRaw` — an off-owner local push is visible to the shared cell and the
+owner is among the woken. A local push that *is* owner-made pays that section for nothing; with one condvar and
+a `notifyOne` a wake can reach a waiter other than the owner, which is why the wake is a broadcast.
+
+**This is the standing mechanism, not a staging stand-in.** Its removal belongs to a following item that
+rebinds each item's `Ctx.resume` at fire time to the firing worker's route — the shape `Item.act : Nat → IO Unit`
+already models for roots — because that makes the continuation's route the *resolver's* and the local route
+owner-only again. Routing this site through `resumeShared` instead was rejected: the route on the cell is the
+awaiter's but the continuation runs on the resolver, so a shared route would send every await continuation
+through the shared list and let a chain cross a carrier on a tree where nothing was stolen.
+
+**Every off-owner push that is not one of those three sites takes the shared route**: the external spawn, a
+local overflow and the flush arrive at `Executor.pushItems`, which appends and, inside the same section, unparks
+one waiter. The two seam completions take `Ctx.resumeShared` for the same reason.
+
+The parallel entry starts `p` dedicated carriers and submits the program's root to the shared list, and the
+caller **only waits** on the program's completion (`Runtime.runCarriers`, `Executor.waitFinished`); it does
+not run worker `0`'s loop, because worker `0` already has a carrier thread.
+
+## What a transient write does to a count
+
+Every transaction that changes a pool's held work composes with the pool's own count laws
+(`Pool.toRing_inFlight`, `Pool.take_inFlight`, `Pool.flushSlot_inFlight`): the flush is the only path where
+an item *leaves* the pool without being taken, and the append the flush performs on the shared list is what
+completes its accounting.
 -/
 
 namespace LeanIn.Sched
 
--- `Pool` is built on `Ring`, whose operations need `Inhabited α` (`toList` falls back to `default`), so
--- anything holding a `Pool` needs the instance in scope. Carried once here rather than at each mention.
 variable {α : Type} [Inhabited α]
 
-/-- The executor's state: the pool's bookkeeping beside the wake protocol. -/
-structure State (α : Type) (cap : Nat) where
-  /-- The pool's ring, LIFO slot and inject queue. -/
-  pool  : Pool α cap
-  /-- The wake protocol, over the workers. -/
-  sched : Scheduler
-deriving Inhabited, Repr
+/-- **What a worker's fire supplies**: how to enqueue an item on the worker that is firing. The step's body
+receives it at fire time, which is what makes a chain follow the worker that ran its parent rather than the
+worker that spawned it.
 
-/-- **One quantity.** The scheduler's work count and the pool's held work are the same number, which is what
-lets the two sides of a comparison refer to the same work rather than to two counters that move together by
-coincidence. -/
-def State.Aligned (st : State α cap) : Prop := st.sched.work = st.pool.inFlight
+A structure rather than a bare function type, and that is a typing fact rather than taste: a field whose type
+is a function *mentioning the item type in its domain* — `act : (Item → BaseIO Unit) → IO Unit` — is a
+non-positive occurrence, and Lean refuses to declare the item at all. A structure applied to the item type is
+positive, so the route is one, and `enqueue` is the function. -/
+structure Route (α : Type) where
+  /-- Enqueue an item on the worker that supplied this route. -/
+  enqueue : α → BaseIO Unit
 
-/-- **The projection onto the model.** The oracle's own `State`, field for field. -/
-def State.toModel (st : State α cap) : Model.Pool α × Model.Sched :=
-  (st.pool.toModel, st.sched.toModel)
+/-- The route a function gives: the shape a caller that already has the enqueue function uses. -/
+def Route.ofFn {α : Type} (f : α → BaseIO Unit) : Route α := ⟨f⟩
 
-/-- What one carrier has fired, and the nanoseconds of the installed clock it spent inside them.
+/-- What one carrier has fired, the thread it ran on, and the nanoseconds of the installed clock it spent
+inside them.
 
 Measured only by a metered executor, and a duration needs a clock: under the live clock this is
 `IO.monoNanosNow`, under a driver's virtual clock it is virtual nanoseconds, which do not advance while work
-runs. So `busyNanos` is a reading to print rather than a quantity to assert. -/
+runs. So `busyNanos` is a reading to print rather than a quantity to assert. The `tid` is recorded once, when
+the carrier starts, which is what makes "which carriers ran anything" readable without the client keeping its
+own log. -/
 structure CarrierCounters where
+  /-- The carrier's thread id, recorded at the start of its shift. -/
+  tid       : UInt64 := 0
   /-- Items this carrier ran. -/
   fired     : Nat := 0
   /-- Nanoseconds of the installed clock spent inside them. -/
   busyNanos : Nat := 0
 deriving Inhabited, Repr
 
-/-- An executor: one mutex over the pair. Every transaction below is one critical section, which is what
-makes the model's atomicity a property of this code rather than a hope about the scheduler. -/
-structure Executor (α : Type) (cap : Nat) where
-  state : Std.Mutex (State α cap)
-  /-- A worker waiting for work parks on this. The *state* says a worker is parked; only the condvar makes a
-  thread sleep, and a push notifies under the same lock the predicate is re-checked under. -/
-  cv    : Std.Condvar
-  /-- **What a transaction writes into the cell while it holds the lock.**
+/-- **The shared cell**: the inject's items and the idle bookkeeping, under one lock.
 
-`Array.set` copies when its array is still referenced elsewhere, and the cell's own reference to the state
+`served` is what this cell has handed out, so the composition's own take count is the sum of the places an
+item can be taken from — every worker's pool, and here. -/
+structure InjectState (α : Type) where
+  /-- The shared queue: external wakes and every worker's overflow. Unbounded. -/
+  items    : Deque α := {}
+  /-- Waiters parked now: every wait records itself — the carriers and the calling-thread driver alike — and
+  this is the count a push tests before it notifies one of them. -/
+  parked   : Nat := 0
+  /-- Carriers in total. Constant: carriers neither arrive nor leave. -/
+  total    : Nat := 0
+  /-- Set by `stop`. -/
+  stopping : Bool := false
+  /-- Items this cell has served. -/
+  served   : Nat := 0
+  /-- **The driver's own stop condition, in the cell it waits on.**
+
+A wait whose predicate omits the condition it waits *for* is the same defect class as a missing wake: the
+driver parks on this cell, and the program's last step may run on a carrier, so nothing else can make the top
+of the driver's loop reachable again. The completion records itself here and notifies in one section, and the
+driver's predicate reads it in the same section as the shared list — one cell, S1's discipline, no second lock
+and so no second order. A *further refusal* on a park cannot lose a wakeup (`Live` is monotone in refusals),
+so the model's `park` premise is untouched. One driver per executor, so one flag. -/
+  finished : Bool := false
+  /-- **A push into worker `i`'s own queue has happened**, one flag per worker.
+
+The local route is *meant* to be owner-only (`spawnLocal` notifies nobody), and it is for every push a step
+makes on its own worker. It is **not** owner-only for a `Join`-cell continuation: `Async.await` and `select`
+register `ctx.resume`, and the thread that *runs* that continuation is whichever one resolved the cell — the
+carrier that ran the awaited task's last step — which for a child delivered through the shared list is not the
+awaiting worker. So an off-owner item can land in a worker's own queue, and the waiting predicate cannot see it
+(it re-checks the shared cell, and reading the owner's pool there would invert the lock order). This flag
+carries that push's visibility into the shared cell: recorded under this cell's lock after the pool's, it is
+what a waiter can see, and `wakeIfParked` wakes every waiter so the owner is among them. One flag per worker,
+because a cell-wide flag is consumed by whichever waiter evaluates a predicate first, which need not be the
+owner. -/
+  poked    : List Bool := []
+deriving Inhabited
+
+/-- **Set or clear worker `i`'s poke flag**, leaving a list that is too short alone, as `countersAt` does for
+the per-carrier counters: the list is indexed by worker number, so a partial list must not be a defect. -/
+private def pokedAt (i : Nat) (v : Bool) : List Bool → List Bool
+  | [] => []
+  | b :: rest => match i with
+    | 0 => v :: rest
+    | n + 1 => b :: pokedAt n v rest
+
+/-- The composition's own accounting, as one reading: every worker's pool, the shared list, and the two
+counters that say what has left. `held` is the same sum the model's `Multi.held` is, which is what makes a
+record read through it a reading of the specification's own quantity rather than a second count. -/
+structure Snapshot (α : Type) (cap : Nat) where
+  /-- Every worker's pool, read under its own lock. -/
+  workers      : List (Pool α cap)
+  /-- The shared list's contents, oldest first. -/
+  inject       : List α
+  /-- What the shared cell has served. -/
+  injectServed : Nat
+  /-- Waiters parked now, each wait having recorded itself. -/
+  parked       : Nat
+  /-- Carriers in total. -/
+  total        : Nat
+  /-- Set by `stop`. -/
+  stopping     : Bool
+
+/-- Work ready to be taken anywhere: every worker's own queue plus the shared list. -/
+def Snapshot.held (s : Snapshot α cap) : Nat :=
+  (s.workers.map Pool.inFlight).sum + s.inject.length
+
+/-- Work taken so far: what the workers served plus what the shared cell did. -/
+def Snapshot.taken (s : Snapshot α cap) : Nat :=
+  (s.workers.map Pool.taken).sum + s.injectServed
+
+/-- **The projection onto the model.** The same composition `Model.Multi` describes, with the park flags
+rebuilt from the count the cell keeps. -/
+def Snapshot.toModel (s : Snapshot α cap) : Model.Multi α cap :=
+  { workers  := s.workers.map Pool.toModel
+    inject   := { items := s.inject }
+    -- `parked` counts waiters, and the driver that waits on the shared cell is not a carrier, so a parked
+    -- driver can carry the count past the carrier count; the model's flags are one per carrier, and `min`
+    -- keeps the list that length (`total - parked` saturates to zero past the end).
+    parked   := List.replicate (min s.parked s.total) true ++ List.replicate (s.total - s.parked) false
+    stopping := s.stopping
+    pushed   := s.held + s.taken
+    taken    := s.taken }
+
+/-- An executor: one mutex per worker's pool, one over the shared cell, and one condvar every park waits
+on. -/
+structure Executor (α : Type) (cap : Nat) where
+  private mk ::
+  /-- One pool per carrier, each behind its own lock. -/
+  private workers           : Array (Std.Mutex (Pool α cap))
+  /-- The shared list and the idle counters. The *cell* says a carrier is parked; only the condvar makes a
+  thread sleep, and a push notifies under the same lock a park re-checks its predicate under. -/
+  private inject            : Std.Mutex (InjectState α)
+  private cv                : Std.Condvar
+  /-- Whether a carrier accumulates `counters`. Off for `Executor.new`, on for a metered executor: the
+  default item path pays one test of this field and neither a lock nor a clock read. -/
+  private metered           : Bool
+  /-- Per-carrier accumulators, one entry per carrier, index `i` for worker `i`. Written by a carrier when
+  it starts and around each item it runs, and read by a metrics read; a read copies a few scalars per
+  carrier, mutates nothing and notifies nobody, so it cannot perturb what it measures. -/
+  private counters          : Std.Mutex (List CarrierCounters)
+  /-- The value a worker index that is out of range resolves to. `Array.getD` is the total accessor and an
+  array of mutexes has no default, so the fallback exists; every index this file resolves is taken modulo
+  the carrier count, so it is never the cell a transaction runs on. -/
+  private spare             : Std.Mutex (Pool α cap)
+  /-- **What a transaction writes into a pool's cell while it holds that pool's lock.**
+
+`Array.set` copies when its array is still referenced elsewhere, and the cell's own reference to the pool
 being read is exactly that other reference — so every ring mutation under `Mutex.atomically` was copying the
-slots. Writing this value releases the cell's hold, leaving the state the transaction read as the only owner
+slots. Writing this value releases the cell's hold, leaving the pool the transaction read as the only owner
 of its slots, and the mutation then happens in place. Nothing outside the critical section can see it: the
 lock is held for the whole transaction, and the value the transaction computes is written back before the
-lock is released.
+lock is released. -/
+  poolPlaceholder   : Pool α cap
+  /-- The inject cell's own placeholder, for the same reason: the deque's `Array` would otherwise be copied
+  by the transaction that grows or writes it. -/
+  injectPlaceholder : InjectState α
 
-A transaction that ends without storing a new state writes the state it read back instead, which is what the
-take sites do when the pool turns out to be empty. Every site that can modify the pool sets this first, and no
-site reads the pool value it read after modifying it: the take sites ask the scheduler first, so a refusal
-never modifies anything. -/
-  placeholder : State α cap
-  /-- Whether the carrier loop accumulates `counters`. Off for `Executor.new`, on for `Executor.newMetered`:
-  the default item path pays one test of this field and neither a lock nor a clock read. -/
-  metered : Bool
-  /-- Per-carrier accumulators, index 0 while there is one carrier. Written by the carrier loop around each
-  item's run and read by `Handle.metrics`; a read copies two scalars per carrier, mutates nothing and notifies
-  nobody, so it cannot perturb what it measures. -/
-  counters : Std.Mutex (List CarrierCounters)
+/-- **Replace the entry at index `i`**, leaving a list that is too short alone. Written out rather than taken
+from core because the per-carrier list is indexed by worker number and a partial list must not be a defect. -/
+def countersAt (i : Nat) (f : CarrierCounters → CarrierCounters) : List CarrierCounters → List CarrierCounters
+  | [] => []
+  | c :: rest => match i with
+    | 0 => f c :: rest
+    | n + 1 => c :: countersAt n f rest
 
 def Executor.new (α : Type) (cap : Nat) (workers : Nat) : IO (Executor α cap) := do
-  -- A placeholder of its own, not the state the cell starts with: a transaction mutates the state it read,
-  -- so sharing one value between the cell and the placeholder would let a transaction mutate the placeholder.
-  let fresh := { pool := emptyPool α cap, sched := Scheduler.initial workers }
-  return { state := ← Std.Mutex.new fresh,
-           cv := ← Std.Condvar.new
-           placeholder := { pool := emptyPool α cap, sched := Scheduler.initial workers },
-           metered := false,
-           counters := ← Std.Mutex.new [] }
+  -- A pool per carrier, and never zero: every transaction resolves its worker index modulo this count, so an
+  -- empty array would leave the driver with nothing to run on.
+  let n := max 1 workers
+  let mut ws : Array (Std.Mutex (Pool α cap)) := #[]
+  for _ in List.range n do
+    ws := ws.push (← Std.Mutex.new (emptyPool α cap))
+  return { workers           := ws
+           inject            := ← Std.Mutex.new
+             { items := {}, parked := 0, total := n, stopping := false, served := 0
+               poked := List.replicate n false }
+           cv                := ← Std.Condvar.new
+           metered           := false
+           counters          := ← Std.Mutex.new ((List.range n).map (fun _ => ({} : CarrierCounters)))
+           spare             := ← Std.Mutex.new (emptyPool α cap)
+           poolPlaceholder   := emptyPool α cap
+           injectPlaceholder := { items := {}, parked := 0, total := 0, stopping := false, served := 0 } }
 
-/-- **Record one fired item on carrier 0.** The metered path's own write, one critical section per item — which
-is the cost the default configuration does not pay. -/
-def Executor.accrue (e : Executor α cap) (busyNanos : Nat) : IO Unit :=
+/-- How many carriers this executor was built with. -/
+def Executor.workerCount (e : Executor α cap) : Nat := e.workers.size
+
+/-- **Whether this executor accumulates per-carrier counters.** A read of the one flag the item path tests. -/
+def Executor.isMetered (e : Executor α cap) : Bool := e.metered
+
+/-- **Accrue a carrier's busy time**, for the driver's own metered path: one counters section. -/
+def Executor.accrueAt (e : Executor α cap) (i : Nat) (busy : Nat) : IO Unit :=
   e.counters.atomically do
     let cs ← get
-    match cs with
-    | []        => set ([{ fired := 1, busyNanos := busyNanos }] : List CarrierCounters)
-    | c :: rest => set ({ c with fired := c.fired + 1, busyNanos := c.busyNanos + busyNanos } :: rest)
+    set (countersAt i (fun c => { c with fired := c.fired + 1, busyNanos := c.busyNanos + busy }) cs)
 
-/-- **Submit, without the real-world token.** The body of `submit`, split out because a *waker* runs in
-`BaseIO`: a continuation registered on a stock `Task` cannot call an `IO` action, and enqueuing is the one
-thing a waker does. Everything here — the state lock, the condvar — is `BaseIO`-compatible, so nothing is
-duplicated: `submit` is this plus the token.
+/-- **An executor that accumulates per-carrier counters.** `Executor.new` leaves metering off. -/
+def Executor.newMetered (α : Type) (cap : Nat) (workers : Nat) : IO (Executor α cap) := do
+  let e ← Executor.new α cap workers
+  return { e with metered := true }
 
-The pool takes the work *and* the scheduler records it, as one step; reading `inFlight` afterwards is the work
-the pool holds. -/
-def Executor.submitBase (e : Executor α cap) (x : α) : BaseIO Unit :=
-  e.state.atomically do
+/-- Worker `i`'s lock, taken modulo the carrier count so a caller cannot index past the array. -/
+def Executor.cell (e : Executor α cap) (i : Nat) : Std.Mutex (Pool α cap) :=
+  if h : i % e.workers.size < e.workers.size then e.workers[i % e.workers.size]'h else e.spare
+
+/-! ### The shared cell's transactions -/
+
+/-- **Append to the shared list and unpark one parked carrier**, in the one section every cross-carrier wake
+passes through.
+
+The items are the overflow of a placement or the task a flush cleared out of a slot; either way they are
+appended here rather than written into a pool, because the list is shared. -/
+def Executor.pushItems (e : Executor α cap) (xs : List α) : BaseIO Unit :=
+  e.inject.atomically do
     let st ← get
-    let wasParked := st.sched.parked ≠ 0
-    -- Release the cell's hold before the pool is modified, so the ring's slots are uniquely owned and the
-    -- mutation happens in place (see `Placeholder`). The old pool is not read again after this point.
-    set e.placeholder
-    set ({ st with pool := st.pool.submit x, sched := st.sched.enqueue })
-    -- The notify is inside the critical section, which is the discipline the whole protocol rests on: a
-    -- worker's predicate is re-checked under this lock, so a wakeup cannot slip between the check and the
-    -- wait. `Sched.enqueue` already unparked a worker in the *state*; this is what wakes the thread.
-    --
-    -- Only when a worker *was* parked, which is what Tokio's `schedule_local` does and what the state
-    -- already tells us: with nobody parked there is no thread to wake, and a worker that parks later
-    -- re-checks the predicate under this same lock and finds the work, so nothing can be lost by skipping it.
-    if wasParked then e.cv.notifyOne
+    set e.injectPlaceholder
+    set { st with items := xs.foldl (fun d x => d.push x) st.items }
+    if 0 < st.parked then e.cv.notifyOne
 
-/-- Submit, or an external event delivering work: the one above, in `IO`. -/
-def Executor.submit (e : Executor α cap) (x : α) : IO Unit := do e.submitBase x
+/-- Push one item into the shared list, across a carrier boundary. -/
+def Executor.pushInjectRaw (e : Executor α cap) (x : α) : BaseIO Unit :=
+  e.pushItems [x]
 
-/-- **Take one item of work, and report the decision.** The pool and the scheduler advance together, or
-neither does — a pool that returned a task while the scheduler removed no work would break `Aligned`, and one
-lock is what makes that unreachable rather than merely unlikely.
+/-- **Record that worker `i`'s own queue got a push, and wake every parked waiter.**
 
-**The scheduler is consulted first, and the pool is read only when it accepts.** `Aligned` — which holds of a
-fresh executor and is preserved by each of the transition theorems above — says `work = inFlight`, and
-`inFlight = 0` is exactly the pool having nothing to give, so a refusal means an empty pool and an acceptance
-means a non-empty one. The two orders therefore agree on every state a call boundary can be in, and a refusal
-needs no restore: the pool is never modified on that path, which is what lets the take below modify it in
-place. -/
-def Executor.takeReport (e : Executor α cap) : IO (Sched.TakeReport α cap) :=
-  e.state.atomically do
+A local push into the owner's own queue owes no wake *when the owner makes it*, and that is every push a step
+makes on its own worker. It is not every local push: a `Join`-cell continuation (`Async.await`, `select`) runs
+on whichever carrier resolved the cell, so it can push onto a worker that is parked. This records the push in
+the shared cell — the only place a waiting predicate can see it under the lock order — and wakes every waiter,
+so the owner is among the woken; a spurious wake is what `A4` allows. -/
+def Executor.wakeIfParked (e : Executor α cap) (i : Nat) : BaseIO Unit := do
+  e.inject.atomically do
     let st ← get
-    match st.sched.take with
-    | none    =>
-      -- Refused, so under `Aligned` the pool is empty and there is no take to undo. The report is still a
-      -- read-out of the pool with no item in it, which is what the earlier form returned here; because the
-      -- cell still holds the state that was read, that read copies rather than modifying it in place.
-      let r := st.pool.takeReport
-      return { r with item := none, pool := st.pool }
-    | some s' =>
-      -- The scheduler accepted, so this take is the one that will be stored: release the cell's hold first,
-      -- and the ring mutation below happens in place.
-      set e.placeholder
-      let r := st.pool.takeReport
-      match r.item with
-      | none => set st; return r
-      | some _ => set ({ st with pool := r.pool, sched := s' }); return r
+    set { st with poked := pokedAt i true st.poked }
+    if 0 < st.parked then e.cv.notifyAll else pure ()
+
+/-- Pop one item off the front of the shared list. -/
+def Executor.popInject (e : Executor α cap) : IO (Option α) :=
+  e.inject.atomically do
+    let st ← get
+    set e.injectPlaceholder
+    let r := st.items.pop
+    match r.1 with
+    | some x => set { st with items := r.2, served := st.served + 1 }; return (some x)
+    | none   => set st; return none
+
+/-- **Record that the driver's program has produced its value**, and wake every waiter, in the shared cell's
+own section. Called by a driver's completion, which may be running on a carrier. -/
+def Executor.noteFinished (e : Executor α cap) : IO Unit :=
+  e.inject.atomically do
+    let st ← get
+    set { st with finished := true }
+    e.cv.notifyAll
+
+/-- Clear the driver's stop condition before a run starts. One driver per executor, so one flag, and a second
+run on the same executor must not inherit the first one's. -/
+def Executor.clearFinished (e : Executor α cap) : IO Unit :=
+  e.inject.atomically do
+    let st ← get
+    set { st with finished := false }
+
+/-- Is the executor stopping? A reading of the one flag every park and every loop exit reads. -/
+def Executor.isStopping (e : Executor α cap) : IO Bool :=
+  e.inject.atomically do return (← get).stopping
+
+/-- Shutdown: the flag is set under the shared lock, so a park either sees it or is refused, and every
+parked carrier is woken. -/
+def Executor.stop (e : Executor α cap) : IO Unit :=
+  e.inject.atomically do
+    let st ← get
+    set { st with stopping := true }
+    e.cv.notifyAll
+
+/-! ### A worker's own queue -/
+
+/-- **T3, the local submit**: worker `i`'s ring, and the placement rule's overflow appended to the shared
+list in the same path. The shared section is taken after this pool's, which is the only lock order here.
+
+`@[inline]`: a per-item hot path, like `takeFor` — the body is one pool transaction. -/
+@[inline]
+def Executor.submitLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Unit :=
+  (e.cell i).atomically do
+    let p ← get
+    set e.poolPlaceholder
+    let r := p.submit x
+    set r.2
+    if !r.1.isEmpty then e.pushItems r.1
+    e.wakeIfParked i
+
+/-- **T2, the local spawn**: worker `i`'s LIFO slot, displacing its occupant through the same placement
+rule a submit uses. -/
+@[inline]
+def Executor.spawnLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Unit :=
+  (e.cell i).atomically do
+    let p ← get
+    set e.poolPlaceholder
+    let r := p.spawn x
+    set r.2
+    if !r.1.isEmpty then e.pushItems r.1
+    e.wakeIfParked i
+/-- **T4, the tick**: worker `i`'s allowance refreshes, and only worker `i`'s. -/
+def Executor.tickFor (e : Executor α cap) (i : Nat) : IO Unit :=
+  (e.cell i).atomically do
+    set (Pool.tick (← get))
+
+/-- **T5, the steal**: one element out of one other worker's queue.
+
+The thief takes **one** element — the victim's ring front — and the item *is* the take: it is returned to the
+caller and nothing is staged in the thief's own queue. Batch size one is the design, and the reason is the lock
+discipline D4 records: under a lock, batching lengthens the critical section and blocks the victim, so the
+inversion is not worth the amortisation. The victim's **LIFO slot is never stolen**: `takeFromRing` cannot see
+it, so the ring is the thief's only reach — which is also why a chain, whose links live in the slot, does not
+cross carriers. -/
+def Executor.stealInto (e : Executor α cap) (_i j : Nat) : IO (Option α) := do
+  (e.cell j).atomically do
+    let p ← get
+    set e.poolPlaceholder
+    let r := p.takeFromRing
+    set r.2
+    return r.1
+
+/-- **T1 and S2: take one item for worker `i`.**
+
+Worker `i`'s own queue first — the slot while the allowance lasts, else the slot cleared for the shared
+list and then the ring — then one steal attempt against one other worker, round-robin, then the shared list.
+The flush runs inside this pool's section and appends to the shared list there, which is the pool → inject
+order again.
+
+`@[inline]`: this is the per-item hot path, and the body's cost is all in its single pool transaction — a
+call boundary here costs as much as the transaction, measured. -/
+@[inline]
+def Executor.takeFor (e : Executor α cap) (i : Nat) : IO (Option α) := do
+  let item ← (e.cell i).atomically do
+    let p ← get
+    set e.poolPlaceholder
+    -- A take is a turn, and the allowance is per turn: refresh it in this same transaction, so the LIFO slot
+    -- keeps serving the chain that lives in it rather than being disabled after three polls for the rest of
+    -- the run. Doing it here rather than in a separate `tick` section keeps the take at one pool section.
+    let rep := (Pool.tick p).takeReport
+    set rep.pool
+    if !rep.flushed.isEmpty then e.pushItems rep.flushed
+    return rep.item
+  match item with
+  | some x => return some x
+  | none =>
+    if 1 < e.workers.size then
+      match ← e.stealInto i ((i + 1) % e.workers.size) with
+      | some x => return some x
+      | none   => pure ()
+    e.popInject
+
+/-! ### Parking -/
+
+/-- **S3, park worker `i`**: refused while its own queue or the shared list holds anything, recorded and
+waited for otherwise.
+
+The worker's own emptiness is read under its own lock first — only worker `i` writes that queue while it is
+not running a step — and the inject's contents and the stopping flag are re-checked **inside** the shared
+section that records the park and waits. That re-check is what a push cannot slip past: a push either happened
+before this section and appears in the shared list, or happens after it and sees the park.
+
+The park is recorded in the shared cell, which is what makes `parked` readable — and what a push tests before
+it notifies. -/
+def Executor.park (e : Executor α cap) (i : Nat) : IO Bool := do
+  let empty ← (e.cell i).atomically do return (← get).inFlight == 0
+  if !empty then return false
+  else
+    let recorded ← IO.mkRef false
+    e.inject.atomicallyOnce e.cv
+      (pred := do
+        let st ← get
+        let mine := st.poked.getD i false
+        if st.stopping ∨ mine ∨ st.items.size ≠ 0 then
+          if mine then set { st with poked := pokedAt i false st.poked }
+          return true
+        else
+          -- Every waiter records itself, once per wait. The predicate is re-evaluated after every wake, and a
+          -- spurious one must not carry the count past the threads that are actually parked.
+          let already ← recorded.get
+          if !already then
+            set { st with parked := st.parked + 1 }
+            recorded.set true
+          return false)
+      (k := do
+        let st ← get
+        if ← recorded.get then
+          set { st with parked := if 0 < st.parked then st.parked - 1 else 0 }
+          recorded.set false)
+    return true
+
+/-- **The driver's wait**: block until the shared list holds something or the program has finished.
+
+It records the wait in the same `parked` field a carrier's park does, because the driver on the calling thread
+*is* the waiter in its configuration — worker `0` is the thread that parks — and a producer's wake is decided
+by that field. A wait that did not record itself is a wait nothing wakes: the shipped single-carrier driver
+always counted itself (`Executor.parkUntilWork` set `sched.parked := 1` while waiting), and a second source of
+truth for who waits is exactly what the protocol's one-cell design exists to avoid.
+
+It does *not* treat `stopping` as a reason to proceed, because a stop is a drain and the driver is the thread
+that keeps draining it: a continuation registered on a leaf is not in any queue, and abandoning the wait
+abandons it. It does read `finished`, because the program's last step may run on a carrier while the driver
+waits here. -/
+def Executor.waitForWork (e : Executor α cap) : IO Unit := do
+  let recorded ← IO.mkRef false
+  e.inject.atomicallyOnce e.cv
+    (pred := do
+      let st ← get
+      let mine := st.poked.getD 0 false
+      if st.items.size ≠ 0 ∨ mine ∨ st.finished then
+        if mine then set { st with poked := pokedAt 0 false st.poked }
+        return true
+      else
+        -- Every waiter records itself, once per wait, the driver included: a wait that did not record itself
+        -- is a wait nothing wakes, and a re-evaluated predicate must not count the same wait twice.
+        let already ← recorded.get
+        if !already then
+          set { st with parked := st.parked + 1 }
+          recorded.set true
+        return false)
+    (k := do
+      let st ← get
+      if ← recorded.get then
+        set { st with parked := if 0 < st.parked then st.parked - 1 else 0 }
+        recorded.set false)
+
+/-- **The parallel entry's wait**: block the calling thread until the program records its completion.
+
+The caller of `Runtime.runCarriers` is not a carrier and does not run worker `0`'s loop, so it waits on the
+completion flag the program's last step sets (`noteFinished`) in the one cell a notify is serializable
+against. No `parked` accounting is kept: nothing wakes this wait by the count, and `noteFinished` issues a
+`notifyAll` under the same lock the predicate is evaluated under. -/
+def Executor.waitFinished (e : Executor α cap) : IO Unit := do
+  e.inject.atomicallyOnce e.cv
+    (pred := do return (← get).finished)
+    (k := pure ())
+
+/-! ### The carrier loop -/
+
+/-- One more item fired on this carrier's books, and the clock it took. -/
+def Executor.fireMetered (e : Executor α cap) (i : Nat) (fire : Nat → α → IO Unit) (x : α) : IO Unit := do
+  if e.metered then
+    let t0 ← IO.monoNanosNow
+    fire i x
+    let t1 ← IO.monoNanosNow
+    e.counters.atomically do
+      set (countersAt i (fun c => { c with fired := c.fired + 1, busyNanos := c.busyNanos + (t1 - t0) })
+        (← get))
+  else fire i x
+
+/-- Record this carrier's thread id in its own counters entry, once, at the start of its shift. -/
+def Executor.noteTid (e : Executor α cap) (i : Nat) : IO Unit := do
+  let tid ← IO.getTID
+  e.counters.atomically do
+    set (countersAt i (fun c => { c with tid := tid }) (← get))
+
+/-- **A carrier's shift.**
+
+Take or park, until `stopping` is seen with nothing left to take; `fire` is the caller's, because what an item
+is and how it runs belong to the layer above. A stop is a *drain*: the loop leaves when the flag is set **and**
+this worker's own queue and the shared list are both empty, which is what `takeFor` returning `none` with
+`stopping` set means.
+
+There is deliberately **no** staged cut on this path. A cut on the wake half — the shared push's notify, this
+predicate's re-check of the shared list, the take's consultation of it — reds the shipped single-carrier
+contract as soon as one carrier is parked, so it would cost an existing scenario rather than stage a new one:
+the staged reds this milestone measures are the parallel entry and the steal, and the parked count's
+accounting. -/
+def Executor.workerLoop (e : Executor α cap) (fire : Nat → α → IO Unit) (i : Nat) : IO Unit := do
+  e.noteTid i
+  let mut go := true
+  while go do
+    match ← e.takeFor i with
+    | some x => e.fireMetered i fire x
+    | none   =>
+      if ← e.isStopping then go := false
+      else let _ ← e.park i; pure ()
+
+/-! ### The driver's operations: worker 0 on the calling thread -/
+
+/-- **Submit into worker `0`'s queue**: the driver's spelling, with the calling thread standing in for
+worker `0`. -/
+def Executor.submit (e : Executor α cap) (x : α) : IO Unit := do e.submitLocalRaw 0 x
+
+/-- The `BaseIO` spelling a waker needs: enqueuing is the one thing a continuation registered on a stock
+`Task` does, and a waker cannot call `IO`. -/
+def Executor.submitBase (e : Executor α cap) (x : α) : BaseIO Unit := e.submitLocalRaw 0 x
+
+/-- Submit into worker `i`'s queue, in `IO`. -/
+def Executor.submitInto (e : Executor α cap) (i : Nat) (x : α) : IO Unit := do e.submitLocalRaw i x
+
+/-- **Spawn on worker `0`**, owner-local: the item takes the slot. -/
+def Executor.spawn (e : Executor α cap) (x : α) : IO Unit := do e.spawnLocalRaw 0 x
+
+/-- The `BaseIO` spelling of the local spawn. -/
+def Executor.spawnBase (e : Executor α cap) (x : α) : BaseIO Unit := e.spawnLocalRaw 0 x
+
+/-- Spawn on worker `i`, in `IO`. -/
+def Executor.spawnInto (e : Executor α cap) (i : Nat) (x : α) : IO Unit := do e.spawnLocalRaw i x
+
+/-- **The driver's tick**: worker `0`'s allowance refreshes. -/
+def Executor.tick (e : Executor α cap) : IO Unit := e.tickFor 0
+
+/-- **A take for worker `0`, with the decision its record reads.**
+
+The driver's take is the carrier's: the pool's own decision first (slot, flush, ring) and then the shared
+list, so a `queue`-served item is whichever of the two held it. The record's `observed`/`served` come from
+the pool's decision, which is the only place the allowance is observable. -/
+def Executor.takeReport (e : Executor α cap) : IO (TakeReport α cap) := do
+  let rep ← (e.cell 0).atomically do
+    let p ← get
+    set e.poolPlaceholder
+    let rep := p.takeReport
+    set rep.pool
+    if !rep.flushed.isEmpty then e.pushItems rep.flushed
+    return rep
+  match rep.item with
+  | some _ => return rep
+  | none   =>
+    match ← e.popInject with
+    | some x => return { rep with item := some x }
+    | none   => return rep
 
 /-- Take one item of work: the decision without its report. -/
 def Executor.take (e : Executor α cap) : IO (Option α) := do
   return (← e.takeReport).item
 
-/-- **A fresh tick: the LIFO allowance refreshes.** Nothing else moves, and the proof is one line because
-of it — a tick cannot change what the executor holds, only how it will serve the next take. -/
-def Executor.tick (e : Executor α cap) : IO Unit :=
-  e.state.atomically do
-    let st ← get
-    set ({ st with pool := st.pool.tick })
+/-- Wait for work and take one, or report that the executor is stopping with nothing left. -/
+private def Executor.waitThenTake (e : Executor α cap) : IO (Option α) := do
+  if ← e.isStopping then return none
+  else
+    e.waitForWork
+    e.takeFor 0
 
-/-- **Local spawn: work that is ready on this worker.** The pool places it in the LIFO slot (displacing the
-occupant through the same overflow rule a submit uses), and the scheduler records the work and unparks a
-worker, as one step — `Sched.enqueue`, exactly as `submit` does it.
+/-- **One step of the driver**: take work, or wait until there is some. `idle` is asked once, and only when
+the queues are empty while the executor still runs: it returns `true` when it produced work — a driver
+advancing a virtual clock, whose fired timer enqueued a resumed step — so the second take finds it.
 
-The difference from `submit` is only *where* the pool puts it, which is the whole point of the operation: the
-slot is what keeps a chained task on the core that just ran its parent, and it is why the allowance exists. -/
-def Executor.spawnBase (e : Executor α cap) (x : α) : BaseIO Unit :=
-  e.state.atomically do
-    let st ← get
-    let wasParked := st.sched.parked ≠ 0
-    -- Release the cell's hold before the pool is modified, so the ring's slots are uniquely owned and the
-    -- mutation happens in place (see `Placeholder`). The old pool is not read again after this point.
-    set e.placeholder
-    set ({ st with pool := st.pool.spawn x, sched := st.sched.enqueue })
-    if wasParked then e.cv.notifyOne
-
-/-- Local spawn: the one above, in `IO`. -/
-def Executor.spawn (e : Executor α cap) (x : α) : IO Unit := do e.spawnBase x
-
-/-- Park: refused while work is held, granted otherwise. The check and the park are one critical section,
-which is exactly what the model's `park` encodes and the only reason a wakeup cannot be lost between them:
-an `enqueue` must take the same lock to unpark. -/
-def Executor.park (e : Executor α cap) : IO Bool :=
-  e.state.atomically do
-    let st ← get
-    match st.sched.park with
-    | none    => return false
-    | some s' => set ({ st with sched := s' }); return true
-
-/-- Shutdown: the flag is set under the lock, so a park either sees it or is refused. -/
-def Executor.stop (e : Executor α cap) : IO Unit :=
-  e.state.atomically do
-    let st ← get
-    set ({ st with sched := st.sched.stop })
-    e.cv.notifyAll
-
-omit [Inhabited α] in
-/-- A tick moves neither side of the alignment. -/
-theorem Aligned.tick (st : State α cap) (h : st.Aligned) : ({ st with pool := st.pool.tick }).Aligned := by
-  unfold State.Aligned Pool.inFlight at h ⊢
-  unfold Pool.tick at ⊢
-  omega
-
-/-- **A submission keeps the alignment.** The pool holds one more and the scheduler records one more, so
-the two sides move together — with room or on a full ring, since the eviction is a move. -/
-theorem Aligned.submit (st : State α cap) (h : st.Aligned) (x : α) (hw : st.pool.ring.WF)
-    (hcap : 0 < cap) :
-    ({ st with pool := st.pool.submit x, sched := st.sched.enqueue } : State α cap).Aligned := by
-  have hp : (st.pool.submit x).inFlight = st.pool.inFlight + 1 :=
-    inFlight_submit st.pool x hw hcap
-  unfold State.Aligned at h ⊢
-  show (st.sched.enqueue).work = (st.pool.submit x).inFlight
-  rw [hp]
-  simp only [Scheduler.enqueue]
-  omega
-
-/-- **A spawn keeps the alignment.** The slot write and the enqueue are the same pair of moves a submission
-makes — the pool holds one more, the scheduler records one more — so the same proof does the work. -/
-theorem Aligned.spawn (st : State α cap) (h : st.Aligned) (x : α) (hw : st.pool.ring.WF)
-    (hcap : 0 < cap) :
-    ({ st with pool := st.pool.spawn x, sched := st.sched.enqueue } : State α cap).Aligned := by
-  have hp : (st.pool.spawn x).inFlight = st.pool.inFlight + 1 :=
-    spawn_inFlight st.pool x hw hcap
-  unfold State.Aligned at h ⊢
-  show (st.sched.enqueue).work = (st.pool.spawn x).inFlight
-  rw [hp]
-  simp only [Scheduler.enqueue]
-  omega
-
-/-- **A take keeps the alignment.** The pool holds one fewer and the scheduler's count drops by one, which
-is the same move — and this is the transaction `Executor.take`, `Executor.takeReport` and the `k` of
-`Executor.work` each perform, in one critical section per call. A scheduler that refused leaves the pool as
-it was, which is no transaction at all and needs no theorem. -/
-theorem Aligned.takeReport (st : State α cap) (h : st.Aligned) (hw : st.pool.ring.WF)
-    (s' : Scheduler) (hr : (st.pool.takeReport).item.isSome) (hs : st.sched.take = some s') :
-    ({ st with pool := (st.pool.takeReport).pool, sched := s' } : State α cap).Aligned := by
-  have hp : ((st.pool.takeReport).pool).inFlight + 1 = st.pool.inFlight :=
-    takeReport_inFlight st.pool hw hr
-  -- The scheduler's count is the one it just removed.
-  have hs' : s' = { st.sched with work := st.sched.work - 1 } := by
-    rw [Scheduler.take] at hs
-    split at hs
-    · exact (Option.some.inj hs).symm
-    · exact absurd hs (by simp)
-  unfold State.Aligned at h
-  show s'.work = ((st.pool.takeReport).pool).inFlight
-  rw [hs']
-  dsimp only
-  omega
-
-/-- **Take without the parking machinery.** `some (some x)` when it took work, `some none` when the pool is
-empty *and* stopping, `none` when it is empty but still running — so the caller knows to park.
-
-This is the shape Tokio's worker loop has, and it is the shape a worker should have: take, and only park when
-there was nothing to take. The take is one critical section and nothing else; parking is not on this path at
-all. A take that returns nothing implies `inFlight = 0`, because `Pool.take` flushes an occupied LIFO slot
-before serving the ring, so the predicate below re-checks exactly the condition this could not decide. -/
-def Executor.tryTake (e : Executor α cap) : IO (Option (Option α)) :=
-  e.state.atomically do
-    let st ← get
-    match st.sched.take with
-    | none    =>
-      -- Refused, so under `Aligned` there is nothing in the pool: this is the empty-pool branch the earlier
-      -- form reached after taking, which asked only whether the pool was stopping.
-      return (if st.sched.stopping then some none else none)
-    | some s' =>
-      set e.placeholder
-      match st.pool.take with
-      | (none, _) => set st; return none
-      | (some x, p') => set ({ st with pool := p', sched := { s' with parked := 0 } }); return (some (some x))
-
-/-- **Park until there is work to take, or until the executor is stopping with the pool empty.**
-
-The wait `Executor.workWith` falls back to, split out so the idle-hooked path and the plain one share it. The
-predicate is re-checked under the same lock a submit notifies under, which is what makes the model's
-check-and-park atomicity real: a worker that finds nothing parks *inside* this critical section rather than
-between two of them, so a wakeup cannot be lost in the gap. -/
-private def Executor.parkUntilWork (e : Executor α cap) : IO (Option α) :=
-  e.state.atomicallyOnce e.cv
-    (pred := do
-      let st ← get
-      if st.pool.inFlight ≠ 0 ∨ st.sched.stopping then return true
-      else
-        -- Nothing to take, so this worker is about to park — and it says so *while still holding the
-        -- lock*, in the same critical section that will wait. A submit cannot slip between the check and
-        -- the park, which is the whole content of the model's `park` having no transition while work is
-        -- held. Guarded on `parked = 0` so a spurious wake does not record a second park for the same
-        -- worker; the `k` below clears it. One worker is `parked := 1`, which is M3's single carrier.
-        if st.sched.parked = 0 then
-          set ({ st with sched := { st.sched with parked := 1 } })
-        return false)
-    (k := do
-      let st ← get
-      match st.sched.take with
-      | none    => return none
-      | some s' =>
-        set e.placeholder
-        match st.pool.take with
-        | (none, _) => set st; return none
-        -- Waking to take work means the worker is no longer parked, in the same critical section as the
-        -- take, so the state never shows a worker both parked and holding work.
-        | (some x, p') => set ({ st with pool := p', sched := { s' with parked := 0 } }); return (some x))
-
-/-- **One step of a worker: take work, or park until there is some.**
-
-`idle` is asked once, and only when the pool has nothing to give while the executor still runs: it returns
-`true` when it produced work — a driver advancing a virtual clock, whose fired timer enqueued a resumed step —
-so the second take finds it. With the constant-`false` hook this is `Executor.work`, one test later.
-
-`none` means the pool was stopping. A take advances the pool and the scheduler together, exactly as
-`Executor.take` does — the two halves of the alignment cannot come apart here either.
-
-**The common case does not reach the park.** `tryTake` runs first, and only when it reports an empty pool that
-is still running does this fall back to `parkUntilWork` — which is once per drained queue rather than once per
-item. -/
+`none` means the executor is stopping with nothing left to take, which is the condition a serving loop exits
+on; a wait that wakes for no item leaves the caller free to wait again. -/
 def Executor.workWith (e : Executor α cap) (idle : IO Bool) : IO (Option α) := do
-  match ← e.tryTake with
-  | some r => return r
+  match ← e.takeFor 0 with
+  | some x => return some x
   | none   =>
     if ← idle then
-      match ← e.tryTake with
-      | some r => return r
-      | none   => e.parkUntilWork
-    else e.parkUntilWork
+      match ← e.takeFor 0 with
+      | some x => return some x
+      | none   => e.waitThenTake
+    else e.waitThenTake
 
-/-- One step of a worker with nowhere to advance to: `Executor.workWith` and a hook that reports nothing. -/
+/-- One step of the driver with nowhere to advance to. -/
 def Executor.work (e : Executor α cap) : IO (Option α) := e.workWith (do return false)
 
-/-- Is the executor stopping? A stop is a flag every transaction already reads — `tryTake` refuses and reports it
-— and a loop that has to *decide* whether to keep accepting needs the same reading from outside rather than a
-second copy of the flag. -/
-def Executor.isStopping (e : Executor α cap) : IO Bool :=
-  e.state.atomically do
-    return (← get).sched.stopping
+/-- **The whole composition as one reading**, for a client that needs more than the two counts: every
+worker's pool under its own lock, the shared list, and the idle counters. -/
+def Executor.snapshot (e : Executor α cap) : IO (Snapshot α cap) := do
+  let mut ps : List (Pool α cap) := []
+  for i in List.range e.workers.size do
+    let p ← (e.cell i).atomically do return (← get)
+    ps := ps ++ [p]
+  let st ← e.inject.atomically do return (← get)
+  return { workers := ps, inject := st.items.toList, injectServed := st.served,
+           parked := st.parked, total := st.total, stopping := st.stopping }
 
-/-- **The whole state as the specification sees it**, for a client that needs more than the two counts:
-`inFlight`, `taken` and `parked` all come from here. Using the projection rather than a bespoke accessor is
-deliberate -- it is the same function the refinement is stated over, so a record read through it cannot
-disagree with the model about what the implementation holds. -/
-def Executor.snapshot (e : Executor α cap) : IO (Model.Pool α × Model.Sched) :=
-  e.state.atomically do
-    let st ← get
-    return st.toModel
+/-- **What the executor currently holds and how many carriers are parked**: the composition's own two
+numbers, read as one snapshot. -/
+def Executor.observe (e : Executor α cap) : IO (Nat × Nat) := do
+  let s ← e.snapshot
+  return (s.held, s.parked)
 
-/-- **What the executor currently holds, read through the model projection.** Both numbers are the
-specification's own fields: `work` and `parked` out of `Scheduler.toModel`, the scheduler half of
-`State.toModel`. A reading taken here is therefore the value the refinement is stated over rather than a
-second count that must be related to it — the pool's own count is the one that must agree with `work`, and
-`State.Aligned` is what proves it does. -/
-def Executor.observe (e : Executor α cap) : IO (Nat × Nat) :=
-  e.state.atomically do
-    let s := (← get).sched.toModel
-    return (s.work, s.parked)
+/-- The per-carrier accumulators, read without mutating or notifying anything. -/
+def Executor.metrics (e : Executor α cap) : IO (Option (List CarrierCounters)) := do
+  if e.metered then
+    let cs ← e.counters.atomically do return (← get)
+    return some cs
+  else return none
 
 end LeanIn.Sched

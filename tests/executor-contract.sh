@@ -3006,6 +3006,310 @@ check_sc17() {
   done
 }
 
+# --- SC18 — the carriers, the thief, and a wake from a thread that is not a carrier ————————————
+
+# list_ids <bracketed-comma-list> — print each id on its own line, or return nonzero when the field is not a
+# bracketed comma-separated list of nonempty ids. A dropped, empty, doubled or unbracketed entry is rejected
+# before any id is compared, so a truncated list cannot satisfy a containment by accident.
+list_ids() {
+  local list="$1" inner e
+  case "$list" in
+  '['*']')
+    inner="${list#[}"
+    inner="${inner%]}"
+    ;;
+  *) return 1 ;;
+  esac
+  case "$inner" in '' | ',' | ','* | *',' | *',,'*) return 1 ;; esac
+  local IFS=','
+  for e in $inner; do printf '%s\n' "$e"; done
+}
+
+# carriers_ok <record> — SC18-O1 as a detector: the work was spread over more than one of the *started*
+# carriers (`distinctCarriers ≥ 2`) and every tid the work recorded is one of the carriers' own
+# (`ranTids ⊆ carrierTids`), the same detector's `P = 1` control read exactly one carrier
+# (`carrierCount1 = 1`), and the chain stayed on one carrier (`chainCarriers = 1`). Every operand is read
+# from its own named field. The record's `carriers` field (how many carriers the entry actually started) is
+# shape-checked but is **not** asserted here: O1's red is the relation `ranTids ⊆ carrierTids`, so with the
+# staged entry's `carriers = 0` the caller's tid is in `ranTids` and `carrierTids` is empty, and the red stays
+# the relation rather than this count.
+carriers_ok() {
+  local rec="$1" p dc cc1 chain ranTids carrierTids t c found
+  record_is "$rec" carriers p carrierTids ranTids distinctCarriers carrierCount1 chainCarriers parkedBefore \
+    readyBefore ranTid spawnTid inWorkerTids wokeRounds ran1 ran2 parkedAfter readyAfter inFlightAfter \
+    pendingHooks scaleN remaining runUs || return 1
+  p="$(field p "$rec")" || return 1
+  dc="$(field distinctCarriers "$rec")" || return 1
+  cc1="$(field carrierCount1 "$rec")" || return 1
+  chain="$(field chainCarriers "$rec")" || return 1
+  ranTids="$(field ranTids "$rec")" || return 1
+  carrierTids="$(field carrierTids "$rec")" || return 1
+  case "$p$dc$cc1$chain" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$p" -ge 1 ] || return 1
+  [ "$dc" -ge 2 ] || return 1
+  [ "$cc1" -eq 1 ] || return 1
+  [ "$chain" -eq 1 ] || return 1
+  local -a ran=() car=()
+  mapfile -t ran < <(list_ids "$ranTids") || return 1
+  mapfile -t car < <(list_ids "$carrierTids") || return 1
+  [ "${#ran[@]}" -ge 1 ] || return 1
+  [ "${#car[@]}" -ge 1 ] || return 1
+  for t in "${ran[@]}"; do
+    found=0
+    for c in "${car[@]}"; do
+      if [ "$c" = "$t" ]; then found=1; break; fi
+    done
+    [ "$found" -eq 1 ] || return 1
+  done
+}
+
+# steal_ok <record> — SC18-O2 as a detector: the thief took exactly one item for the caller (`stolen = 1`)
+# from the victim's ring, so the ring lost exactly one (`victimRingBefore ≥ 1`, `victimRingAfter + 1 =
+# victimRingBefore`); the victim's slot read the same either side of the call (`victimSlotAfter =
+# victimSlotBefore`); the thief's own slot is where it left things and the design leaves it empty
+# (`thiefRingAfter = 0`, `thiefSlotAfter = -`); the same call read zero on the empty victim
+# (`stolenFromEmpty = 0`, `emptyVictimRingBefore = 0`); and the slot-only victim's slot was not taken
+# (`slotStolen = no`). The slot half is bound to an **occupancy** reading, not assumed: `slotVictimSlotBefore`
+# is the slot-only victim's slot as the call read it, asserted `some`, so a `no` cannot pass on an empty slot
+# (under a ring-only steal an empty slot yields the same `no`, which is the vacuous gap this closes). Every
+# operand is read from its own named field.
+steal_ok() {
+  local rec="$1" vb vsb stolen va vsa sfe evb tra tsa ss svsb
+  record_is "$rec" victimRingBefore victimSlotBefore stolen victimRingAfter victimSlotAfter stolenFromEmpty \
+    emptyVictimRingBefore slotStolen slotVictimSlotBefore thiefRingAfter thiefSlotAfter thiefTid victimTid || return 1
+  vb="$(field victimRingBefore "$rec")" || return 1
+  vsb="$(field victimSlotBefore "$rec")" || return 1
+  stolen="$(field stolen "$rec")" || return 1
+  va="$(field victimRingAfter "$rec")" || return 1
+  vsa="$(field victimSlotAfter "$rec")" || return 1
+  sfe="$(field stolenFromEmpty "$rec")" || return 1
+  evb="$(field emptyVictimRingBefore "$rec")" || return 1
+  tra="$(field thiefRingAfter "$rec")" || return 1
+  tsa="$(field thiefSlotAfter "$rec")" || return 1
+  ss="$(field slotStolen "$rec")" || return 1
+  svsb="$(field slotVictimSlotBefore "$rec")" || return 1
+  case "$vb$stolen$va$sfe$evb$tra" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$vb" -ge 1 ] || return 1
+  [ "$stolen" -eq 1 ] || return 1
+  [ "$va" -eq "$((vb - 1))" ] || return 1
+  [ "$sfe" -eq 0 ] || return 1
+  [ "$evb" -eq 0 ] || return 1
+  [ "$tra" -eq 0 ] || return 1
+  [ "$vsa" = "$vsb" ] || return 1
+  [ "$tsa" = "-" ] || return 1
+  [ "$ss" = "no" ] || return 1
+  [ "$svsb" = "some" ] || return 1
+}
+
+# wake_ok <record> <bound> — SC18-O3 as a detector: every carrier was parked with nothing ready when the
+# foreign push arrived (`parkedBefore = p`, `readyBefore = 0`); the pushed work ran on a carrier, not on the
+# thread that spawned it (`ranTid ≠ spawnTid`, `inWorkerTids = yes`); the wake arrived inside the bound
+# (`wokeRounds < bound`, where `bound` is this detector's second argument — the bound the mode printed, not a
+# literal, so a run at another bound does not silently pass) and the same protocol woke twice (`ran1 = yes`,
+# `ran2 = yes`); the drain left nothing held or outstanding (`inFlightAfter = 0`, `pendingHooks = 0`); and the
+# scale arm completed at `scaleN = 100000` (`remaining = 0`). Every operand is read from its own named field.
+wake_ok() {
+  local rec="$1" bound="$2" p pb rb ranTid spawnTid iw wr ran1 ran2 ifa pend sn rem
+  record_is "$rec" carriers p carrierTids ranTids distinctCarriers carrierCount1 chainCarriers parkedBefore \
+    readyBefore ranTid spawnTid inWorkerTids wokeRounds ran1 ran2 parkedAfter readyAfter inFlightAfter \
+    pendingHooks scaleN remaining runUs || return 1
+  case "$bound" in '' | *[!0-9]*) return 1 ;; esac
+  p="$(field p "$rec")" || return 1
+  pb="$(field parkedBefore "$rec")" || return 1
+  rb="$(field readyBefore "$rec")" || return 1
+  ranTid="$(field ranTid "$rec")" || return 1
+  spawnTid="$(field spawnTid "$rec")" || return 1
+  iw="$(field inWorkerTids "$rec")" || return 1
+  wr="$(field wokeRounds "$rec")" || return 1
+  ran1="$(field ran1 "$rec")" || return 1
+  ran2="$(field ran2 "$rec")" || return 1
+  ifa="$(field inFlightAfter "$rec")" || return 1
+  pend="$(field pendingHooks "$rec")" || return 1
+  sn="$(field scaleN "$rec")" || return 1
+  rem="$(field remaining "$rec")" || return 1
+  case "$p$pb$rb$wr$ifa$pend$sn$rem" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$pb" -eq "$p" ] || return 1
+  [ "$rb" -eq 0 ] || return 1
+  [ "$ranTid" != "$spawnTid" ] || return 1
+  [ "$iw" = "yes" ] || return 1
+  [ "$wr" -lt "$bound" ] || return 1
+  [ "$ran1" = "yes" ] || return 1
+  [ "$ran2" = "yes" ] || return 1
+  [ "$ifa" -eq 0 ] || return 1
+  [ "$pend" -eq 0 ] || return 1
+  [ "$sn" -eq 100000 ] || return 1
+  [ "$rem" -eq 0 ] || return 1
+}
+
+check_sc18() {
+  local out status v ctl carriers steal sendctl round
+  local carriersStart p ranTids carrierTids distinctCarriers carrierCount1 chainCarriers parkedBefore readyBefore
+  local ranTid spawnTid inWorkerTids wokeRounds ran1 ran2 parkedAfter readyAfter inFlightAfter pendingHooks
+  local scaleN remaining
+  local victimRingBefore victimSlotBefore stolen victimRingAfter victimSlotAfter stolenFromEmpty
+  local emptyVictimRingBefore slotStolen thiefRingAfter thiefSlotAfter thiefTid victimTid
+  local marked unmarkedPushes
+  local o1bad o2bad o3bad
+  local cfg bound
+  local -a records=()
+  local variant_count=4
+
+  # The invocation runs first, so the detectors' exercises below read the bound the mode printed rather than a
+  # literal: the bound lives in the mode's own configuration line, and a wake detector comparing `wokeRounds`
+  # against a constant would silently pass a run made at another bound.
+  #
+  # The scale arm's cost is the shared cell's contention (record §4.7), so this scenario's watchdog is raised
+  # to a stated value rather than left at the default: a bound the requirement itself exceeds is a setup
+  # error waiting to happen, and the default 300s does not cover a run whose push stage alone is minutes.
+  watchdog_seconds=1200
+  out="$(bounded lake exe controls --runtime-carriers)"
+  status=$?
+  check_status SC18 "$status" "lake exe controls --runtime-carriers"
+  require_header "$out"
+  cfg="$(grep '^carrierscfg|' <<<"$out" | head -1)"
+  [ -n "$cfg" ] ||
+    setup_error "SC18: the configuration record is missing" "no carrierscfg record in the invocation"
+  bound_field bound bound "${cfg#carrierscfg|}" "SC18 config"
+
+  # The detectors' own control, from the record syntax and the expectation alone: each must accept a
+  # well-formed record and reject the near miss its clause would produce on the staged tree — the work on
+  # the calling thread, a thief that kept a batch, a chain across carriers, and a slot-cleared victim. The
+  # near misses are written here rather than taken from the mode, because the detectors' contract is shaped
+  # by the record syntax and the expectation.
+  carriers_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=1|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1' ||
+    setup_error "SC18: the carrier detector rejected a well-formed record" \
+      "the detectors' own control, not the SC18 Then"
+  steal_ok 'victimRingBefore=200|victimSlotBefore=-|stolen=1|victimRingAfter=199|victimSlotAfter=-|stolenFromEmpty=0|emptyVictimRingBefore=0|slotStolen=no|slotVictimSlotBefore=some|thiefRingAfter=0|thiefSlotAfter=-|thiefTid=9|victimTid=9' ||
+    setup_error "SC18: the steal detector rejected a well-formed record" \
+      "the detectors' own control, not the SC18 Then"
+  wake_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=1|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1' "$bound" ||
+    setup_error "SC18: the wake detector rejected a well-formed record" \
+      "the detectors' own control, not the SC18 Then"
+  if wake_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=1|parkedBefore=4|readyBefore=0|ranTid=9|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1' "$bound"; then
+    setup_error "SC18: the wake detector accepted a near miss" \
+      "record: [the work ran on the thread that spawned it]" \
+      "the detectors' own control, not the SC18 Then"
+  fi
+  if steal_ok 'victimRingBefore=200|victimSlotBefore=-|stolen=1|victimRingAfter=198|victimSlotAfter=-|stolenFromEmpty=0|emptyVictimRingBefore=0|slotStolen=no|slotVictimSlotBefore=some|thiefRingAfter=0|thiefSlotAfter=some|thiefTid=9|victimTid=9'; then
+    setup_error "SC18: the steal detector accepted a near miss — the clause-two batch record" \
+      "record: [a thief that took two from the ring]" \
+      "the detectors' own control, not the SC18 Then"
+  fi
+  if carriers_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=2|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1'; then
+    setup_error "SC18: the carrier detector accepted a near miss — the chain half" \
+      "record: [a chain observed across carriers]" \
+      "the detectors' own control, not the SC18 Then"
+  fi
+  if steal_ok 'victimRingBefore=200|victimSlotBefore=-|stolen=1|victimRingAfter=199|victimSlotAfter=-|stolenFromEmpty=0|emptyVictimRingBefore=0|slotStolen=yes|slotVictimSlotBefore=some|thiefRingAfter=0|thiefSlotAfter=-|thiefTid=9|victimTid=9'; then
+    setup_error "SC18: the steal detector accepted a near miss — the slot-cleared record" \
+      "record: [the slot-only victim's slot was taken]" \
+      "the detectors' own control, not the SC18 Then"
+  fi
+  printf 'SC18 control: rejected the work on the calling thread, a thief that kept a batch, a chain across carriers, and a slot-cleared victim\n'
+
+  mapfile -t records < <(grep '^carriers|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC18 Then: the carrier behaviour not observed exactly once" \
+      "expected exactly one carriers| record, saw ${#records[@]}"
+  carriers="${records[0]}"
+  mapfile -t records < <(grep '^steal|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC18 Then: the steal behaviour not observed exactly once" \
+      "expected exactly one steal| record, saw ${#records[@]}"
+  steal="${records[0]}"
+  sendctl="$(grep '^sendctl|' <<<"$out" | head -1)"
+  [ -n "$sendctl" ] ||
+    setup_error "SC18: the send-marker record is missing" "no sendctl record in the invocation"
+  ctl="$(grep '^carriersctl|' <<<"$out" | head -1)"
+  [ -n "$ctl" ] ||
+    setup_error "SC18: the checker controls are missing" "no carriersctl record in the invocation"
+
+  record_is "${carriers#carriers|}" carriers p carrierTids ranTids distinctCarriers carrierCount1 chainCarriers \
+    parkedBefore readyBefore ranTid spawnTid inWorkerTids wokeRounds ran1 ran2 parkedAfter readyAfter \
+    inFlightAfter pendingHooks scaleN remaining runUs ||
+    fail "SC18 Then: the carrier behaviour not observed exactly once" \
+      "the record is not exactly carriers/p/carrierTids/ranTids/distinctCarriers/carrierCount1/chainCarriers/parkedBefore/readyBefore/ranTid/spawnTid/inWorkerTids/wokeRounds/ran1/ran2/parkedAfter/readyAfter/inFlightAfter/pendingHooks/scaleN/remaining/runUs with nonempty values: [$carriers]"
+  record_is "${steal#steal|}" victimRingBefore victimSlotBefore stolen victimRingAfter victimSlotAfter \
+    stolenFromEmpty emptyVictimRingBefore slotStolen slotVictimSlotBefore thiefRingAfter thiefSlotAfter thiefTid victimTid ||
+    fail "SC18 Then: the steal behaviour not observed exactly once" \
+      "the record is not exactly victimRingBefore/victimSlotBefore/stolen/victimRingAfter/victimSlotAfter/stolenFromEmpty/emptyVictimRingBefore/slotStolen/slotVictimSlotBefore/thiefRingAfter/thiefSlotAfter/thiefTid/victimTid with nonempty values: [$steal]"
+
+  # The checker control and the send-marker readings are fixture facts, checked strictly separately from the
+  # Then: a near miss a detector accepts, or a nonzero unmarked-push count, is a fixture defect.
+  record_is "${ctl#carriersctl|}" accepted rejected variants ||
+    setup_error "SC18: the checker-control record is not the expected shape" "control: [$ctl]"
+  bound_field v accepted "$ctl" "SC18 control"
+  [ "$v" = "yes" ] ||
+    setup_error "SC18: the checker did not accept the well-formed records" "accepted=$v"
+  bound_field v rejected "$ctl" "SC18 control"
+  [ "$v" = "yes" ] ||
+    setup_error "SC18: the checker did not reject every near miss" "rejected=$v"
+  bound_field v variants "$ctl" "SC18 control"
+  [ "$v" -eq "$variant_count" ] ||
+    setup_error "SC18: the checker did not test every variant" "variants=$v expected=$variant_count"
+  bound_field unmarkedPushes unmarkedPushes "$sendctl" "SC18 control"
+  [ "$unmarkedPushes" -eq 0 ] ||
+    setup_error "SC18: a queue push did not go through the marker" "unmarkedPushes=$unmarkedPushes"
+
+  bound_field carriersStart carriers "$carriers" "SC18 Then"
+  bound_field p p "$carriers" "SC18 Then"
+  bound_field ranTids ranTids "$carriers" "SC18 Then"
+  bound_field carrierTids carrierTids "$carriers" "SC18 Then"
+  bound_field distinctCarriers distinctCarriers "$carriers" "SC18 Then"
+  bound_field carrierCount1 carrierCount1 "$carriers" "SC18 Then"
+  bound_field chainCarriers chainCarriers "$carriers" "SC18 Then"
+  bound_field parkedBefore parkedBefore "$carriers" "SC18 Then"
+  bound_field readyBefore readyBefore "$carriers" "SC18 Then"
+  bound_field ranTid ranTid "$carriers" "SC18 Then"
+  bound_field spawnTid spawnTid "$carriers" "SC18 Then"
+  bound_field inWorkerTids inWorkerTids "$carriers" "SC18 Then"
+  bound_field wokeRounds wokeRounds "$carriers" "SC18 Then"
+  bound_field ran1 ran1 "$carriers" "SC18 Then"
+  bound_field ran2 ran2 "$carriers" "SC18 Then"
+  bound_field inFlightAfter inFlightAfter "$carriers" "SC18 Then"
+  bound_field pendingHooks pendingHooks "$carriers" "SC18 Then"
+  bound_field scaleN scaleN "$carriers" "SC18 Then"
+  bound_field remaining remaining "$carriers" "SC18 Then"
+  bound_field victimRingBefore victimRingBefore "$steal" "SC18 Then"
+  bound_field victimSlotBefore victimSlotBefore "$steal" "SC18 Then"
+  bound_field stolen stolen "$steal" "SC18 Then"
+  bound_field victimRingAfter victimRingAfter "$steal" "SC18 Then"
+  bound_field victimSlotAfter victimSlotAfter "$steal" "SC18 Then"
+  bound_field stolenFromEmpty stolenFromEmpty "$steal" "SC18 Then"
+  bound_field emptyVictimRingBefore emptyVictimRingBefore "$steal" "SC18 Then"
+  bound_field slotStolen slotStolen "$steal" "SC18 Then"
+  bound_field slotVictimSlotBefore slotVictimSlotBefore "$steal" "SC18 Then"
+  bound_field thiefSlotAfter thiefSlotAfter "$steal" "SC18 Then"
+
+  # The three clauses are evaluated on their own named fields, in clause order, and every one is evaluated so
+  # the ones that hold are observed to hold. The staged tree fails O1 and O2 (record §7) — clause three has no
+  # staged red, because the parked-accounting cut is withdrawn and `parkedBefore = p` holds on both trees — so
+  # each failing clause's own assertion is printed, in order, before the check exits.
+  o1bad=0 o2bad=0 o3bad=0
+  carriers_ok "${carriers#carriers|}" || o1bad=1
+  steal_ok "${steal#steal|}" || o2bad=1
+  wake_ok "${carriers#carriers|}" "$bound" || o3bad=1
+  local -a then_lines=()
+  [ "$o1bad" -eq 0 ] ||
+    then_lines+=("SC18 Then: the work did not run on more than one carrier
+  observed: p=$p carriers=$carriersStart carrierCount1=$carrierCount1 distinctCarriers=$distinctCarriers spawnTid=$spawnTid ranTids=$ranTids carrierTids=$carrierTids")
+  [ "$o2bad" -eq 0 ] ||
+    then_lines+=("SC18 Then: a thief took more than one element from the victim's ring
+  observed: victimRingBefore=$victimRingBefore victimRingAfter=$victimRingAfter victimSlotBefore=$victimSlotBefore victimSlotAfter=$victimSlotAfter slotStolen=$slotStolen slotVictimSlotBefore=$slotVictimSlotBefore stolen=$stolen thiefSlotAfter=$thiefSlotAfter stolenFromEmpty=$stolenFromEmpty")
+  [ "$o3bad" -eq 0 ] ||
+    then_lines+=("SC18 Then: not every carrier was parked when the push arrived
+  observed: p=$p parkedBefore=$parkedBefore readyBefore=$readyBefore ranTid=$ranTid inWorkerTids=$inWorkerTids wokeRounds=$wokeRounds ran1=$ran1 ran2=$ran2 inFlightAfter=$inFlightAfter pendingHooks=$pendingHooks")
+  if [ "${#then_lines[@]}" -ne 0 ]; then
+    local line
+    for line in "${then_lines[@]}"; do printf '%s\n' "$line" >&2; done
+    exit 1
+  fi
+
+  printf 'SC18 ok: carriers=%s distinctCarriers=%s carrierCount1=%s chainCarriers=%s | victimRingBefore=%s victimRingAfter=%s stolen=%s slotStolen=%s thiefSlotAfter=%s | parkedBefore=%s readyBefore=%s ranTid=%s spawnedTid=%s inFlightAfter=%s remaining=%s\n' \
+    "$carriersStart" "$distinctCarriers" "$carrierCount1" "$chainCarriers" "$victimRingBefore" "$victimRingAfter" "$stolen" \
+    "$slotStolen" "$thiefSlotAfter" "$parkedBefore" "$readyBefore" "$ranTid" "$spawnTid" "$inFlightAfter" "$remaining"
+}
+
 case "${1:-}" in
 SC1) check_sc1 ;;
 SC2) check_sc2 ;;
@@ -3024,8 +3328,9 @@ SC14) check_sc14 ;;
 SC15) check_sc15 ;;
 SC16) check_sc16 ;;
 SC17) check_sc17 ;;
+SC18) check_sc18 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18\n' >&2
   exit 2
   ;;
 esac

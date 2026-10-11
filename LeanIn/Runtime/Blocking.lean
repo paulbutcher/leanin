@@ -16,13 +16,13 @@ the pool's own condvar, with `submit`, `shutdown` and `shutdownAndWait` as the o
 submission path is on it: `spawnBlocking` derives from `spawnBlockingE`, whose step registers the job's
 liveness witness in `Hooks` (so `Runtime.pending` counts a blocking job exactly as it counts a leaf
 registration) and submits the job to the pool; when the job finishes on a pool thread it resolves that
-witness and delivers the completion through `ctx.resume`. The handle is the ordinary `Task.Task α` the task
+witness and delivers the completion through `ctx.resumeShared`. The handle is the ordinary `Task.Task α` the task
 layer already produces for a spawned computation, so `await`, `Runtime.cancel` and `concurrently` work on a
 blocking job with no new handle type and no new instance.
 
-**The completion goes through `ctx.resume`, not `k`.** `k` is the continuation of the *submitting* step; if
+**The completion goes through `ctx.resumeShared`, not `k`.** `k` is the continuation of the *submitting* step; if
 the job thread ran it, the computation would continue on the job thread and everything downstream of it would
-too. `ctx.resume` is the runtime's scheduling function, so the completion is delivered as a fresh item on the
+too. `ctx.resumeShared` is the runtime's shared scheduling function, so the completion is delivered as a fresh item on the
 carrier, and it stamps that item with `ctx.cancel` — so if the submitting computation is cancelled, `Item.fire`
 skips the completion even though the job itself cannot be stopped: a cancelled computation runs no further
 step of it. A failing job catches its own failure, so it cannot kill a pool worker and leave the exited count
@@ -153,7 +153,7 @@ leaf seam's panicking/`…E` pair has, for a caller that treats a failed job as 
 
 The step registers the job's liveness witness in `Hooks` — one promise, and the derived task `Runtime.pending`
 reads, neither of which costs a thread — and then submits the job to the pool. When the job finishes on a pool
-thread it resolves that witness and delivers the completion through `ctx.resume`, so the awaiting computation
+thread it resolves that witness and delivers the completion through `ctx.resumeShared`, so the awaiting computation
 continues on the carrier and not on the job's thread; the failure rides in the value, as `EAsync` does
 everywhere else. The job catches its own failure here, so a failing job cannot kill a pool worker. -/
 def spawnBlockingE (p : BlockingPool) (hooks : Hooks) (act : IO α) : Task.EAsync IO.Error α :=
@@ -172,7 +172,7 @@ def spawnBlockingE (p : BlockingPool) (hooks : Hooks) (act : IO α) : Task.EAsyn
        p.submit (do
           let r : Except IO.Error α ← try Except.ok <$> act catch e => pure (.error e)
           done.resolve ()
-          ctx.resume (Task.Item.ofAction (k r)))
+          ctx.resumeShared (Task.Item.ofAction (k r)))
      catch e => done.resolve (); throw e⟩
 
 /-- **Run a blocking action**, carrying no failure channel: the failure is a defect, so a failing job is a

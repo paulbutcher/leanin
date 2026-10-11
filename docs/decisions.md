@@ -852,6 +852,124 @@ non-change.
 
 ______________________________________________________________________
 
+### D19 — The queue discipline at P carriers: one lock per worker, one shared inject, and the wake protocol across threads.
+
+W8's decision record. It instantiates D4 for a *set* of workers and closes D9's trigger.
+
+**One lock per worker's pool, one for the shared cell.** A worker's ring and LIFO slot sit behind that
+worker's own `Std.Mutex`; the shared list, the parked count, the carrier count and the stopping flag sit
+behind one more. That is D4 unchanged — no atomics, no lock-free deque (there are none in Lean), batch size
+one — and it is what makes a worker's own queue writable by its owner alone. **The lock order is
+`pool → inject`, everywhere**, and nothing takes the inject's lock and then a pool's: the only two-lock
+paths are a local push whose placement overflows, and a take whose allowance has run out with the slot
+occupied; both hold a pool first. A second order would be a deadlock waiting for a schedule, so it is stated
+as an invariant rather than left to whichever path is read.
+
+**The routes, and why `Item` carries an index rather than a function.** A step's re-enqueue route is not
+captured once at its spawn site: the *worker that fires a step* supplies its own route, so a child follows the
+worker that ran its parent (D5's interface rule "a chain stays on the core its parent ran on", now at P
+carriers). The route cannot travel *in the item* as a function — a field whose type mentions `Item` in a
+function-argument position is a non-positive occurrence and Lean refuses to declare the item — so
+`Task.Item.act` takes the firing worker's **index** (`Nat → IO Unit`), a root is built with
+`Item.ofIndexed`, and `Item.ofAction` keeps its signature and ignores the index. The worker fires with
+`it.act i` and the root's closure reads that worker's route from it.
+
+**The local route is owner-only for owner-made pushes, and there is a third off-owner site.** A push a step
+makes on its own worker owes no wake — the owner is running the step that makes it — and the two *seam*
+completions (`Runtime/Leaf.lean`'s leaf continuations and `Runtime/Blocking.lean`'s blocking completion) take
+`Ctx.resumeShared`, the shared route, because they run on a thread that is not the owning carrier. **The audit
+found two sites and there is a third, on the task layer**: `LeanIn/Task/Basic.lean`'s `Async.await` and
+`select` register `ctx.resume` on a `Join` cell, and whichever carrier resolves the cell runs the continuation
+— for a child delivered through the shared list, not the awaiting worker. An off-owner item therefore can land
+in a worker's own queue, and with no notification that is a lost wakeup; the implementation carries a
+**per-worker `poked` flag and a broadcast** (`Executor.wakeIfParked`, read and cleared only by that worker's
+predicate) to make it visible under the lock order. **This is the standing mechanism at this boundary, not a
+staging stand-in**: the bit's removal belongs to a *following* item that rebinds each item's `Ctx.resume` at
+fire time to the firing worker's route — the shape `Item.act : Nat → IO Unit` already models for roots — and
+not to this one. **Moving this site to `resumeShared` was considered and rejected**: the route on the cell is
+the *awaiter's* but the continuation runs on the *resolver*, so routing it shared would send every await
+continuation through the shared list and let a chain cross a carrier on a tree where nothing was stolen —
+the locality the chain rows measure. Rule 2 therefore covers **two of three** sites (the two seam completions)
+and leaves the third on the task layer. One new `Ctx` field, `resumeShared`, travels with the
+continuation; `Ctx` has no defaults by design, so a construction site that forgets it does not compile. **The
+residual convention**: a *user* who calls `ctx.resume` directly from a thread that is not the owning carrier
+takes the local route into a possibly-parked owner's pool, and Lean exposes no closure environment to check a
+caller's captured cell — both are facts about code this library does not own, and D9's successor below records
+the narrowed promise.
+
+**Every waiter parks through the one path, the calling-thread driver included.** `run`/`blockOn`/`runWith`/
+`runVirtual` run worker `0`'s loop on the calling thread, so the driver records itself in the same `parked`
+count a carrier does, in the same critical section a push tests before it notifies; there is deliberately no
+second "someone is waiting" field. The driver also has a **second stop condition** and the park covers it: a
+program can be completed by a carrier while its driver waits, so the completion writes the finish flag and
+notifies in the inject cell's own section, and the driver's predicate reads it there. `runCarriers` — the
+parallel entry — starts `p` dedicated carriers for workers `0 … p−1`, submits the root to the shared list,
+and the caller **only waits** on the completion; it does not run worker `0`'s loop, because worker `0`
+already has a carrier thread and a second thread on one queue is not a wider driver.
+
+**O2's close.** `Task.Sendable`'s constructor is private to `LeanIn.Task`, so a `Sendable` exists only where
+the library makes one, and the library's own marker-requiring routes (`Executor.pushInject`/`spawnLocal`/
+`submitLocal`) are the ones that take one. **Compiler-enforced**: those routes, the minting at the spawn API,
+and the capability boundary — `Sched.Executor`'s constructor and fields are private, verified cross-module by
+`LeanIn/Test/ExecutorNarrowing.lean` (five refusal routes, each with an affirmative control), so a caller
+cannot hold a carrier-side capability it did not receive. **Audit-enforced, not compiler-enforced**: the raw
+transactions the routes wrap are public, because `Sendable` sits above `Sched.Executor` in the import DAG and
+no module the executor can see can both mint a `Sendable` and consume it — so "every push into a carrier's
+queue takes one" holds for this library's call sites by audit, and the compiler enforces it only for code that
+goes through the routes. **Convention**, stated at `Runtime.spawn` and
+in [`interface.md`](interface.md) §5: a caller's captured environment, because a private constructor narrows
+a *type* and a closure's environment is not one. **D9's pointer** — this is the "revisit once the interface
+has seen use" event, and the answer is that the marker covers the task and the capability and not the capture.
+
+**The inject's store.** Not a `List` (its O(1) end is the front, so every append walks it — the burst
+cliff of [`PERFORMANCE.md`](PERFORMANCE.md) §4.3) and not `Std.Queue` (a second container with none of
+`Ring`'s proof work and a header that calls itself temporary). It is an **index-based growable deque over
+`Ring`'s store** (`Data/Slots.lean` is the shared store; `Ring` keeps `cap` a type parameter and `Bounded`
+means exactly what it meant; `Deque` is the unbounded view). Its three costs are stated rather than
+minimised — linearisation on growth, compaction of the consumed prefix, the release-the-hold rule D12 already
+follows — all O(1) amortised, so the reason is structural reuse rather than speed; a plain `Array` was
+rejected because it moves the O(n) onto the take path. The model's `inject : List α` is the specification and
+keeps its `++ [x]`.
+
+**The inject stays unbounded, and bounding its *admission* is its own item.** The inject is also the *resume*
+path, so a capacity on it would make a producer either refuse a resume (a lost wakeup, exactly what
+`Multi.Live` proves against) or block (which a libuv callback may not). The sound route — an admission bound
+with a refusal on the external spawn entry, in `trySend`'s shape — is a public-contract change with its own
+observable and is scheduled as W17 (its row in [`tokio-workplan.md`](tokio-workplan.md) §3 and its section in
+§2), so this milestone measures one system and its burst rows stay comparable across the container change.
+
+**The model at P carriers.** `Model.Scheduler` is untouched and stays the abstract single-carrier protocol;
+`Model.Pool` loses its `inject` field (its `take` is slot-else-ring, its `flushSlot` is the spent-allowance
+*move*, and the inject-owning layer flushes before it consults the ring, which is where SC5's ordering lives);
+`Model.Inject` is the shared list; `Model.Multi` carries the composition, the transitions (`pushLocal`,
+`pushShared`, `flushLocal`, `stealInto` — the thief takes one, held −1 and taken +1 with one pool lock — and
+`park`), and the three obligations re-discharged: `reachable_live`, riding on **two** inductive invariants
+`ZeroParked` and `InjectWatched` (the flush and a local overflow write the inject without unparking anyone, so
+the per-worker invariant alone would not imply `Live`); `reachable_consistent`; and `reachable_bound`. Each
+carries a breaking control with its load-bearing half named. The single-carrier statement is a corollary
+through the projection `Multi.toSched`. `#print axioms` names nothing beyond `propext`/`Quot.sound`.
+
+**The register and the TCB are unchanged.** New code reaches `Std.Mutex` (A1), `Std.Condvar` (A4/A5) and
+`IO.asTask … Task.Priority.dedicated` (A6, `startCarriers` only, already controlled by `controlDedicated`),
+all on D7's list; the deque is pure Lean over `Array`, which is already `Ring`'s store. No new `#[extern]`,
+no extern call, no `IO.Promise` construction in library code (the blocking pool's direct reach stays the
+only one). [`proof-strategy.md`](proof-strategy.md) §2 and [`primitive-theory.md`](primitive-theory.md) §6
+record the non-change.
+
+**The take path, and its measured cost.** The restructured take pays **one** pool section when its own queue
+serves it, and a second (the inject) only when the pool is empty — the split's price, and the reason the
+served take is the like-for-like row against the single-cell design. It also pays a **third** when the LIFO
+allowance is spent with the slot occupied: the flush moves the item to the shared list and the take fetches it
+back. Since nothing refreshed the allowance, that arm ran on *every* take after three (the LIFO slot is
+otherwise dead for the rest of the run), which is why the take row and the chain row regressed against the
+single-cell baseline; the repair refreshes the allowance **inside the take's own transaction**
+(`(Pool.tick p).takeReport`), so the spent-allowance arm runs once per allowance rather than on every take,
+and the extra section is not paid. The remaining gap to the D4-single-cell baseline is the split's own
+per-operation overhead, and the second measurement condition is recorded with that reading in
+[`PERFORMANCE.md`](PERFORMANCE.md) §3.5 rather than absorbed.
+
+______________________________________________________________________
+
 ## Open
 
-None. All decisions are closed; D9 should be revisited once the interface has seen use.
+None. All decisions are closed; D9's successor is D19.
