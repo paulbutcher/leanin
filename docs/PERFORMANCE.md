@@ -156,9 +156,10 @@ channel — and it is now a two-list FIFO with an explicit size, O(1) amortised 
 this row replaces was **9.4–14.3 µs** per message against **246–304 ns** for the stock channel in those same
 runs, the mode's own
 `chanRatioPct` 1–3. After the change the row (§4.8) reads **275–919 ns** ours against **187–531 ns** stock in the same
-runs, and what is left of the gap is not the queue: every send and receive is a step with its item and context
-bookkeeping and a full mutex transaction, where `Std.Sync.Channel` is a straight promise-based hand-off, and that
-per-operation step machinery is the **~1.3–2.3×** the row still reads. The comparison is same-run — both figures
+runs, and what is left of the gap is not the queue: as the `chanunit|` decomposition in §4.8 prices, it is a full
+mutex transaction whose `prune` step is unconditional, plus the CPS closure chain the operation is written in,
+where `Std.Sync.Channel` is a straight promise-based hand-off — not the item-and-context bookkeeping a step
+carries, which that row prices at **~22 ns** and which is not incurred per message at all. The comparison is same-run — both figures
 come from one `syncbench|` line, as §1 requires — and the run's own `chanRatioPct` reads 44–76 on the typical run
 and 33–106 across the whole set, a spread wider than §1's ±30% because the box was shared while these ran (load
 average ~4 on 8 cores, and the lock rows moved up and down with it). At `LEAN_NUM_THREADS=1` the same rows read
@@ -505,13 +506,50 @@ messages through the stock channel, with the ratio computed inside the run; at `
 read **323–904 ns** ours against **220–540 ns** stock. This is the row that makes the section title true — a
 comparison with another implementation, and one we lose.
 
-What remains of the gap is the **per-operation step machinery** — every send and receive is a step carrying its
-item and its context bookkeeping and taking a full mutex transaction — against `Std.Sync.Channel`'s straight
-promise-based hand-off, and that machinery is the **~1.3–2.3×** the row still reads. It is not the queue: the
-queue was a `List` appended under the lock (`state.queue ++ [v]`, O(queue length) per send, so O(n²) to fill a
-capacity-n channel) and is now a two-list FIFO with an explicit size, O(1) amortised in both directions, which
-took the row from the **9.4–14.3 µs** ours against **246–304 ns** stock it replaced to the figures above. The
-construction, field by field, is §3.1.
+What remains of the gap was previously written as the **per-operation step machinery** — "every send and
+receive is a step carrying its item and its context bookkeeping and taking a full mutex transaction". The
+decomposition `--runtime-chan` prints in the same construction (`chanunit|`, n = 2 000, in the same run as the
+pair above, on this box at load average 3.95–4.35) prices that sentence and does not support it. The step
+construction is nearly free: `nsStep` — `Item.ofAction` plus the stamp that fills its token — reads **19–25 ns**
+and `nsCtx` — the `Ctx`'s two `BaseIO` closure fields — **1–2 ns**, and both are per *construction*, not per
+message: the served run builds a single root `Item.ofIndexed` and one `Ctx` for the whole `2n`-operation
+program, so neither costs anything in this row. The park path is not taken either — the capacity-n channel
+never fills, as §3.1 records — so the waiter's `Join` is never built (`nsJoinPark`, `Join.new` plus
+`Join.onReady`, **134–224 ns per registration**, contributing zero here).
+
+The served message instead decomposes as **574–735 ns** (`nsWhole`, the row's own figure) against the stock
+channel's **460–589 ns** in the same run — the 1.06–1.35× (`chanRatioPct` 74–94 there) inside the recorded
+band. Of that whole, in
+nanoseconds per message:
+
+* **78–92 ns** is the mutual exclusion itself — two bare `Std.Mutex.atomically` transactions (`nsBareTx`),
+  consistent with `--runtime-unit`'s plumbing row (61–68 ns) and `--runtime-ops`' mutex section (29–49 ns);
+* **200–256 ns** is the served transaction's own state work (`nsServedTx` minus `nsBareTx`), split — by a full
+  capacity-1 channel's `trySend`, which runs the served branch's `else`, against a roomy channel's
+  `trySend`/`tryRecv` — into the `live`/`prune` walk plus the room check, **92–110 ns** (`nsPruneWalk`), and
+  the enqueue or dequeue and the wake, **108–150 ns** (`nsEnqueue`). On this path the two halves are
+  comparable, and neither is a few nanoseconds: the enqueue is a cons but each send also copies the
+  `ChanState` record twice, and `prune` runs its `filterM` over two *empty* lists unconditionally;
+* **~120–180 ns** is the CPS closure chain the operation is written in (`nsLoopAsync`, the same program with
+  `pure ()` in place of every send and receive), with the served operation's own closure and its call into
+  `sendStep`/`recvStep` in the residual between `nsChanWork` and `nsServedTx`.
+
+So the served row's cost is a full mutex transaction whose `prune` step is unconditional, plus the CPS closure
+chain the operation is written in — not item-and-context bookkeeping, which is zero here. It is not the queue:
+the queue was a `List` appended under the lock (`state.queue ++ [v]`, O(queue length) per send, so O(n²) to
+fill a capacity-n channel) and is now a two-list FIFO with an explicit size, O(1) amortised in both directions,
+which took the row from the **9.4–14.3 µs** ours against **246–304 ns** stock it replaced to the figures above.
+The construction, field by field, is §3.1.
+
+**The `live` walk is the park path's quadratic, and it is separate from this row.** Parking n waiters costs
+more than linearly per waiter, and the cause is not the list append the commit replaced but `live`, which
+filters the whole waiter list with a per-element `token.isSet` read. That walk is what makes a cancelled waiter
+discoverable — a parked waiter holds no `Hooks` registration to retire, so it is found only when the primitive
+next touches its list — and it sits on the park path twice per parked operation: `acquireStep` walks in the
+readiness check and again in the parked branch, and `Channel.prune` walks both the sender and the receiver
+list, so the channel's park pays four walks. The decomposition above does not price that path (the served row
+never takes it); the `waiterbench|` rows on the same line do. Whether the readiness check's walk can be
+dropped without losing the discovery is not settled by these readings, and nothing here changes the walk.
 
 Both sides of that row are a trade, and the trade is what the ratio prices. `Std.Sync.Channel`'s `send` is a
 blocking wait: `Channel.Sync.send` is `IO.wait (← Channel.send ch v)`, and the bounded send path underneath
@@ -519,7 +557,7 @@ parks the sender on a bare `IO.Promise` — it creates one, enqueues it as a pro
 `result?` (`Std/Sync/Channel.lean`) — so the stock channel's per-operation cheapness is bought by occupying a
 pool worker for the whole wait, and Lean's pool grows around that (a `Task.get` from a pooled task raises the
 pool cap by one, the mechanism `docs/lean-scheduler.md` records). Ours parks the *computation* and leaves the
-carrier free, and the step machinery this row prices is exactly what buys that. So we are **1.3–2.3× slower per
+carrier free, and the CPS closure chain and the mutex transaction this row prices are exactly what buys that. So we are **1.3–2.3× slower per
 message because we do not block the carrier** — the same trade seen from the other side in §4.1, where a
 blocking call that does not take the pool stops everything — and the row reads as the price of that choice
 rather than a plain deficit.
@@ -565,7 +603,8 @@ record is not updated for it.
 | `nix develop -c lake exe controls --runtime-time` | 16 × 50 ms sleeps and their event order, two timeout outcomes, the task layer's first-writer law, and the blocking path for the same sleeps |
 | `nix develop -c lake exe controls --runtime-drain` | a stop with a connection in flight: whether the connection completes after the stop, whether the pool is empty and whether a leaf registration is outstanding when the run returns, and how long the drain takes |
 | `nix develop -c lake exe controls --runtime-cancel` | a disconnect cancelling the work: the counter as it stood in the cancelling step and after the run returns, the work's own registrations before and after, the cancelled handle's outcome, and a second cancellation; plus the cost of the new operation — spawn-and-await against cancelling a parked task — and the registry's size before and after cancelling 200 parked awaits |
-| `nix develop -c lake exe controls --runtime-sync` | the sync primitives' cost (§3.1): lock/unlock uncontended, and contended with the permit held across a yield — the row printing `heldAcrossYield=yes\|no` from the yielding chains' own `tryLock` probe — a release that wakes 16 parked waiters, the semaphore's acquire and release, and a message through the bounded channel beside the same message count through `Std.Sync.Channel` in one run; plus SC13's `sync\|` record and its checker's `syncctl\|` readings |
+| `nix develop -c lake exe controls --runtime-sync` | the sync primitives' cost (§3.1): lock/unlock uncontended, and contended with the permit held across a yield — the row printing `heldAcrossYield=yes\|no` from the yielding chains' own `tryLock` probe — a release that wakes 16 parked waiters, the semaphore's acquire and release, and a message through the bounded channel beside the same message count through `Std.Sync.Channel` in one run; plus SC13's `sync\|` record and its checker's `syncctl\|` readings, the `waiterbench\|` rows for parking waiters, and the `chanunit\|` decomposition of the served channel operation |
+| `nix develop -c lake exe controls --runtime-chan` | the served channel operation decomposed (§4.8): the whole served send/receive, the stock channel beside it in the same run, the bare mutex transaction, the served transaction's `prune`/enqueue split, the `Async` loop skeleton, the parked waiter's `Join`, one step and its `Ctx`, and a native `Task` calibration |
 | `LEAN_NUM_THREADS=1 nix develop -c lake exe controls --runtime-sync` | the same `syncbench\|` rows, and the invocation §3.1's `LEAN_NUM_THREADS=1` channel figures come from — the stock channel beside ours at one pool thread |
 | `nix develop -c lake exe controls --runtime-registry` | the handle registry's cost (§3.2): 10 000 handles registered and drained, the same count awaited from a bare `List` as the control, and a drain over 4 outstanding handlers released after it begins; plus SC15's `context\|` and `registry\|` records and its checker's `registryctl\|` readings |
 | `LEAN_NUM_THREADS=1 nix develop -c lake exe controls --runtime-registry` | the same `registrybench\|`/`registryhand\|`/`registryheld\|` rows at one pool thread — the invocation §3.2's one-thread figures come from, since the registry is single-carrier code and the figure is not a scaling claim |

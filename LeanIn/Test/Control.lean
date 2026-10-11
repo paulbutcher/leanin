@@ -1664,8 +1664,9 @@ not granted the lock, a cancelled receiver consumes no message, a cancelled send
 Every comparison is a named field of the mode's one `sync|` record, and every event in its `order`
 field was appended by the actor that caused it, where it happened. Nothing reads a queue or a slot:
 the boundary is the executable's stdout. The mode also prints its own checker's readings on a
-well-formed record and on near misses (`syncctl|`), and a `syncbench|` measurement line that is
-printed and never asserted. -/
+well-formed record and on near misses (`syncctl|`), and three measurement lines that are printed and never
+asserted: `syncbench|`, the per-operation costs, `waiterbench|`, the cost of parking a large number of
+waiters on one primitive, and `chanunit|`, the served channel operation decomposed part by part. -/
 
 /-- The `sync|` record's fields, in the order the mode prints them. -/
 def syncFields : List String :=
@@ -1882,6 +1883,231 @@ def syncBench : IO String := do
   let stdNs := (scT1 - scT0) / n
   return s!"nsLockUncontended={lockNs / n}|nsLockContended={contNs / n}|heldAcrossYield={heldStr}|nsReleaseWakeW={relNs / w}|nsSemAcquire={semAcqNs / n}|nsSemRelease={semRelNs / n}|nsChanOurs={ours}|nsChanStd={stdNs}|chanRatioPct={stdNs * 100 / ours}"
 
+/-- **Park `n` computations on one operation and time the registration path.**
+
+Each child increments a shared counter as its first action and the child that reaches `n` resolves a
+promise the parent waits on, so the parent resumes only after the last child's parking step has run to its
+end on the single carrier — a child that increments and then parks does both inside one step, so the
+`n`th increment is the last park. The window opens before the child spawns, so the spawn-only control
+subtracted in `waiterBench` is like-for-like.
+
+The `n` handles are returned so the caller can cancel the parked waiters: cancelling sets each token and
+resolves each cell, so a run whose children never get a permit still ends without waking them. Printed,
+never asserted. -/
+def parkTimed (hooks : Runtime.Hooks) (n : Nat) (park : LeanIn.Task.Async Unit) :
+    LeanIn.Task.Async (Nat × List (LeanIn.Task.Task Unit)) := do
+  let counter ← IO.mkRef (0 : Nat)
+  let p ← (IO.Promise.new : IO (IO.Promise (Except IO.Error Unit)))
+  let t0 ← IO.monoNanosNow
+  let hs ← (List.range n).mapM fun _ => LeanIn.Task.Async.spawn (do
+    let c ← counter.get
+    counter.set (c + 1)
+    if c + 1 == n then p.resolve (Except.ok ())
+    park)
+  let _ ← Runtime.awaitPromiseE hooks p
+  let t1 ← IO.monoNanosNow
+  return (t1 - t0, hs)
+
+/-- Run `parkTimed` for `n` on one freshly-built executor, cancel the parked waiters so the run can end,
+and return the nanoseconds the window took. -/
+def parkRun (n : Nat) (park : LeanIn.Task.Async Unit) : IO Nat := do
+  let e ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let hooks ← Runtime.Hooks.new
+  Runtime.run e (do
+    let (ns, hs) ← parkTimed hooks n park
+    for h in hs do Runtime.cancel hooks h ()
+    for h in hs do let _ ← LeanIn.Task.Async.await h; pure ()
+    pure ns)
+
+/-- **The raw list costs the registration path is built on**, in the same window: building an `n`-element
+list by `acc ++ [x]` and by `x :: acc`. The lengths are summed and printed as a checksum so neither build
+can be elided. -/
+def nativeListNs (n : Nat) : IO (Nat × Nat × Nat) := do
+  let t0 ← IO.monoNanosNow
+  let app := (List.range n).foldl (fun acc x => acc ++ [x]) []
+  let t1 ← IO.monoNanosNow
+  let cons := (List.range n).foldl (fun acc x => x :: acc) []
+  let t2 ← IO.monoNanosNow
+  return (t1 - t0, t2 - t1, app.length + cons.length)
+
+/-- The machine's 1-minute load average, so a reading can be set beside the load it was taken under. -/
+def loadAvg : IO String := do
+  try
+    let s ← IO.FS.readFile "/proc/loadavg"
+    return (s.splitOn " ").headD "?"
+  catch _ => return "?"
+
+/-- **The `waiterbench|` rows: parking a large number of waiters.**
+
+One line per size `n`: the nanoseconds to park `n` computations on the semaphore's `acquire`, on a full
+channel's `send` and on an empty channel's `recv`, total and per waiter; the same invocation's spawn-only
+control, total and per waiter; the registration left after the control is subtracted, per waiter — the
+figure that shows whether the registration path still grows with the list — and the raw `++`/cons list
+costs and the load average of the same window. Printed, never asserted (§1: a timing assertion is a flake
+with a schedule). -/
+def waiterBench : IO Unit := do
+  let sizes := [256, 512, 1024, 2048, 4096]
+  let load ← loadAvg
+  for n in sizes do
+    let ctlNs ← parkRun n (pure ())
+    let s ← LeanIn.Task.Sync.Semaphore.new 0
+    let semNs ← parkRun n (LeanIn.Task.Sync.Semaphore.acquire s)
+    let cs ← LeanIn.Task.Sync.Channel.new Unit 1
+    let _ ← LeanIn.Task.Sync.Channel.trySend cs ()
+    let sendNs ← parkRun n (LeanIn.Task.Sync.Channel.send cs ())
+    let cr ← LeanIn.Task.Sync.Channel.new Unit 1
+    let recvNs ← parkRun n (LeanIn.Task.Sync.Channel.recv cr)
+    let (appNs, consNs, chk) ← nativeListNs n
+    let perNs (x : Nat) : Nat := x / n
+    let regNs (x : Nat) : Nat := (x - ctlNs) / n
+    IO.println s!"waiterbench|n={n}|semNs={semNs}|semPerWaiter={perNs semNs}|semRegPerWaiter={regNs semNs}|sendNs={sendNs}|sendPerWaiter={perNs sendNs}|sendRegPerWaiter={regNs sendNs}|recvNs={recvNs}|recvPerWaiter={perNs recvNs}|recvRegPerWaiter={regNs recvNs}|ctlNs={ctlNs}|ctlPerWaiter={perNs ctlNs}|natAppendNs={appNs}|natConsNs={consNs}|natSum={chk}|load={load}"
+
+/-- The machine's 1-minute load average, so a reading carries the load it was taken under (§1). -/
+def chanLoadAvg : IO String := do
+  try
+    let s ← IO.FS.readFile "/proc/loadavg"
+    return (s.splitOn " ").headD "?"
+  catch _ => return "?"
+
+/-- **One served channel operation, decomposed.** The `syncbench|` channel row prices the whole served
+send/receive at a capacity-`n` channel — where, as its own comment records, the queue reaches its bound only
+as the last send completes and the send-park path is therefore never taken — and attributes the residual
+against `Std.Channel` to "the per-operation step machinery" without pricing any of it. This mode prices the
+parts, in one invocation and beside the stock channel measured in that same run, so the parts have the whole
+they decompose.
+
+Every figure is nanoseconds per operation over `n = 2000`, printed and never asserted (§1: a timing assertion
+is a flake with a schedule):
+
+* `nsWhole` — the `syncbench|` construction itself: `n` sends into a capacity-`n` channel then `n` receives,
+  driven through `Runtime.run`. This is the number the row prints, so the parts have something to sum to.
+* `nsStd` — the same `n` messages through the stock channel in this same run, so the pair stays intact.
+* `nsLoopAsync` — the same program shape with `pure ()` in place of every send and receive: the CPS closure
+  chain and the `forIn`/`bind` skeleton of the `Async` path, with no channel in it, per message.
+* `nsLoopIo` — the `IO` loop skeleton alone, per message, the baseline the two transaction rows are read
+  against.
+* `nsServedTx` — the served transaction through the public `trySend`/`tryRecv`, which run the *same* critical
+  section a served `send`/`recv` step runs (prune, the room check, enqueue/dequeue, the wake and the store),
+  with `nsLoopIo` subtracted; the figure to compare against `--runtime-unit`'s bare-plumbing rows.
+* `nsBareTx` — a bare `Std.Mutex.atomically` (read the state, write it back) over the *same* `ChanState`, with
+  `nsLoopIo` subtracted; the delta to `nsServedTx` is what prune and the enqueue/dequeue and the wake add.
+* `nsPruneWalk` / `nsEnqueue` — that delta split in two, per message (`nsOpPrune`/`nsOpEnqueue`, per
+  operation, and the raw per-operation `nsOpBare`/`nsOpServed` beside them). A full capacity-1 channel's
+  `trySend` runs the served branch's `else` — the `live`/`prune` walk over the two waiter lists, the room
+  check and the state write, enqueuing nothing; a roomy channel's `trySend`/`tryRecv` run the `then` and add
+  the enqueue or the dequeue and the wake. The walk and the enqueue sum to `nsPruneEnqueue`.
+* `nsJoinPark` — `Join.new` then `Join.onReady`, the cell a **parked** waiter registers and parks on. The
+  served path never reaches it (the capacity-`n` channel never fills), so its contribution to `nsWhole` is
+  zero; the row prices the park path the served row does not take.
+* `nsStep` — `Item.ofAction` plus `Item.stamp`, one step as a `Task.Async` operation costs it. The served run
+  constructs one root `Item.ofIndexed` for the whole `2n`-operation program, so its contribution to `nsWhole`
+  is zero; the row prices one step.
+* `nsCtx` — the `Ctx` record's two `BaseIO` closure fields, the `BaseIO` boundary a step carries.
+* `nsNative` — a native `Task` spawn+join, this window's calibration (§1).
+
+The channel's waiter lists are empty throughout the served path, so `live`'s `liftM`/`filterM` runs over `[]`
+and cannot be priced apart from prune without a non-empty list — which needs the park path. That is stated
+rather than approximated. -/
+def chanDecomp : IO String := do
+  let n := 2000
+  let k := 20000
+  -- Best of two, divided by the operation count, so it is nanoseconds per operation, like `--runtime-unit`.
+  let bestNs (iters : Nat) (x : IO Unit) : IO Nat := do
+    let mut b := 0
+    for _ in List.range 2 do
+      let t0 ← IO.monoNanosNow
+      x
+      let t1 ← IO.monoNanosNow
+      if b == 0 || t1 - t0 < b then b := t1 - t0
+    return b / iters
+  -- The whole served operation: the `syncbench|` construction, per message.
+  let nsWhole ← bestNs n do
+    let c ← LeanIn.Task.Sync.Channel.new Nat n
+    let e ← Sched.Executor.new LeanIn.Task.Item 256 1
+    let _ ← Runtime.run e (do
+      for i in List.range n do LeanIn.Task.Sync.Channel.send c i
+      for _ in List.range n do
+        let _ ← LeanIn.Task.Sync.Channel.recv c
+        pure ())
+    pure ()
+  -- The stock channel, same run and same message count.
+  let nsStd ← bestNs n do
+    let c ← Std.Channel.new (some n)
+    for i in List.range n do
+      let _ ← IO.wait (← Std.Channel.send c i)
+      let _ ← IO.wait (← Std.Channel.recv c)
+  -- The `Async` loop skeleton with no channel: the CPS closure chain and the `forIn`/`bind`, per message.
+  let nsLoopAsync ← bestNs n do
+    let e ← Sched.Executor.new LeanIn.Task.Item 256 1
+    let _ ← Runtime.run e (do
+      for _ in List.range n do (pure () : LeanIn.Task.Async Unit)
+      for _ in List.range n do (pure () : LeanIn.Task.Async Unit))
+    pure ()
+  -- The `IO` loop skeleton alone, per message.
+  let nsLoopIo ← bestNs n do
+    for _ in List.range (2 * n) do pure ()
+  -- The served transaction split, **per operation**. A full capacity-1 channel's `trySend` runs the served
+  -- branch's `else`: `prune` the two waiter lists, check the room, write the state back, enqueue nothing. A
+  -- roomy channel's `trySend`/`tryRecv` run the `then`: the same prune and check, then the enqueue or the
+  -- dequeue and the wake. The per-message `nsServedTx`/`nsBareTx` and the halves `nsPruneWalk`/`nsEnqueue`
+  -- are all derived from these three, so the halves sum to `nsPruneEnqueue` by construction rather than to
+  -- within two independent best-of-two samples' noise.
+  let nsOpBare ← bestNs (2 * n) do
+    let c ← LeanIn.Task.Sync.Channel.new Nat 1
+    for _ in List.range (2 * n) do
+      c.state.atomically do let st ← get; set st
+  let nsOpFull ← bestNs (2 * n) do
+    let c ← LeanIn.Task.Sync.Channel.new Nat 1
+    let _ ← LeanIn.Task.Sync.Channel.trySend c 0
+    for i in List.range (2 * n) do
+      let _ ← LeanIn.Task.Sync.Channel.trySend c i
+  let nsOpServed ← bestNs (2 * n) do
+    let c ← LeanIn.Task.Sync.Channel.new Nat n
+    for i in List.range n do
+      let _ ← LeanIn.Task.Sync.Channel.trySend c i
+    for _ in List.range n do
+      let _ ← LeanIn.Task.Sync.Channel.tryRecv c
+  -- The parked waiter's cell, per registration.
+  let nsJoinPark ← bestNs k do
+    for _ in List.range k do
+      let j ← LeanIn.Task.Join.new (α := Unit)
+      LeanIn.Task.Join.onReady j (fun _ => pure ())
+  -- One step, per step.
+  let cancel ← LeanIn.Task.Cancel.new
+  let nsStep ← bestNs k do
+    for _ in List.range k do
+      let it := LeanIn.Task.Item.stamp (LeanIn.Task.Item.ofAction (pure ())) cancel
+      if it.cancel.isNone then IO.println "chanunit: the stamp left the token empty"
+  -- The `Ctx` record's two `BaseIO` closure fields, per construction.
+  let nsCtx ← bestNs k do
+    for _ in List.range k do
+      let ctx : LeanIn.Task.Ctx :=
+        { cancel := cancel
+        , resume := fun (_ : LeanIn.Task.Item) => (pure () : BaseIO Unit)
+        , resumeShared := fun (_ : LeanIn.Task.Item) => (pure () : BaseIO Unit)
+        , «local» := {} }
+      if ctx.cancel.id == 0 then IO.println "chanunit: the ctx has no token"
+  -- This window's native calibration: a native `Task` spawned and joined.
+  let nsNative ← bestNs k do
+    for _ in List.range k do
+      let t ← IO.asTask (pure ()) _root_.Task.Priority.default
+      let _ ← IO.wait t
+  let nsServedTx := 2 * nsOpServed - nsLoopIo
+  let nsBareTx := 2 * nsOpBare - nsLoopIo
+  let nsOpPrune := nsOpFull - nsOpBare
+  let nsOpEnqueue := nsOpServed - nsOpFull
+  let nsPruneWalk := 2 * nsOpPrune
+  let nsEnqueue := 2 * nsOpEnqueue
+  let ours := max 1 nsWhole
+  return s!"n={n}|nsWhole={ours}|nsStd={nsStd}|chanRatioPct={nsStd * 100 / ours}|nsServedTx={nsServedTx}|nsBareTx={nsBareTx}|nsPruneEnqueue={nsServedTx - nsBareTx}|nsPruneWalk={nsPruneWalk}|nsEnqueue={nsEnqueue}|nsOpBare={nsOpBare}|nsOpPrune={nsOpPrune}|nsOpEnqueue={nsOpEnqueue}|nsOpServed={nsOpServed}|nsLoopAsync={nsLoopAsync}|nsLoopIo={nsLoopIo}|nsChanWork={nsWhole - nsLoopAsync}|nsJoinPark={nsJoinPark}|nsStep={nsStep}|nsCtx={nsCtx}|nsNative={nsNative}|load={← chanLoadAvg}"
+
+/-- Print the served channel operation's decomposition alone: the whole served send/receive, its parts, and
+the stock channel beside it, all in one run. Diagnostic, printed and never asserted — `lake exe controls
+--runtime-chan`, and the same `chanunit|` line is printed from `--runtime-sync` beside `syncbench|`. -/
+def runtimeChan : IO UInt32 := do
+  IO.println s!"chanunit|{← chanDecomp}"
+  return 0
+
 /-- **SC13's mode.** One invocation, one `Runtime.run`: the mutex clause, the channel flood with its
 control, the semaphore's count, and the three cancellation laws, each probe non-parking so a locked-out
 or lost-value production state prints a field rather than hanging. -/
@@ -2044,6 +2270,8 @@ def runtimeSync : IO UInt32 := do
   IO.println syncCtlLine
   let bench ← syncBench
   IO.println s!"syncbench|{bench}"
+  waiterBench
+  IO.println s!"chanunit|{← chanDecomp}"
   return 0
 
 /-- The service run's own annotations, appended under one `Std.Mutex`: the ordered `events` list of
@@ -4028,6 +4256,7 @@ def main (args : List String) : IO UInt32 := do
   | "--runtime-ops" :: _ => return ← runtimeOps
   | "--runtime-async" :: _ => return ← runtimeAsync
   | "--runtime-unit" :: _ => return ← runtimeUnit
+  | "--runtime-chan" :: _ => return ← runtimeChan
   | "--runtime-net" :: _ => return ← runtimeNet
   | "--runtime-time" :: _ => return ← runtimeTime
   | "--runtime-connect" :: _ => return ← runtimeConnect
