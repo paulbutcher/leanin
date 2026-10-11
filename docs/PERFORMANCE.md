@@ -157,7 +157,7 @@ this row replaces was **9.4–14.3 µs** per message against **246–304 ns** fo
 runs, the mode's own
 `chanRatioPct` 1–3. After the change the row (§4.8) reads **275–919 ns** ours against **187–531 ns** stock in the same
 runs, and what is left of the gap is not the queue: as the `chanunit|` decomposition in §4.8 prices, it is a full
-mutex transaction whose `prune` step is unconditional, plus the CPS closure chain the operation is written in,
+mutex transaction whose waiter-list sweep is paid on every operation, plus the CPS closure chain the operation is written in,
 where `Std.Sync.Channel` is a straight promise-based hand-off — not the item-and-context bookkeeping a step
 carries, which that row prices at **~22 ns** and which is not incurred per message at all. The comparison is same-run — both figures
 come from one `syncbench|` line, as §1 requires — and the run's own `chanRatioPct` reads 44–76 on the typical run
@@ -529,27 +529,40 @@ nanoseconds per message:
   `trySend`/`tryRecv` — into the `live`/`prune` walk plus the room check, **92–110 ns** (`nsPruneWalk`), and
   the enqueue or dequeue and the wake, **108–150 ns** (`nsEnqueue`). On this path the two halves are
   comparable, and neither is a few nanoseconds: the enqueue is a cons but each send also copies the
-  `ChanState` record twice, and `prune` runs its `filterM` over two *empty* lists unconditionally;
+  `ChanState` record twice, and the `sweep` that decides whether a walk is due is paid over two *empty* lists
+  even when it walks nothing — which is why this figure is largely fixed cost rather than a walk's cost, and
+  why amortizing the walk (see below) left the served row within noise;
 * **~120–180 ns** is the CPS closure chain the operation is written in (`nsLoopAsync`, the same program with
   `pure ()` in place of every send and receive), with the served operation's own closure and its call into
   `sendStep`/`recvStep` in the residual between `nsChanWork` and `nsServedTx`.
 
-So the served row's cost is a full mutex transaction whose `prune` step is unconditional, plus the CPS closure
+So the served row's cost is a full mutex transaction whose waiter-list sweep is paid on every operation, plus the CPS closure
 chain the operation is written in — not item-and-context bookkeeping, which is zero here. It is not the queue:
 the queue was a `List` appended under the lock (`state.queue ++ [v]`, O(queue length) per send, so O(n²) to
 fill a capacity-n channel) and is now a two-list FIFO with an explicit size, O(1) amortised in both directions,
 which took the row from the **9.4–14.3 µs** ours against **246–304 ns** stock it replaced to the figures above.
 The construction, field by field, is §3.1.
 
-**The `live` walk is the park path's quadratic, and it is separate from this row.** Parking n waiters costs
-more than linearly per waiter, and the cause is not the list append the commit replaced but `live`, which
-filters the whole waiter list with a per-element `token.isSet` read. That walk is what makes a cancelled waiter
+**The `live` walk was the park path's quadratic, and it is now amortized.** Parking n waiters cost more than
+linearly per waiter, and the cause was not the list append an earlier commit replaced but `live`, which filters
+the whole waiter list with a per-element `token.isSet` read. That walk is what makes a cancelled waiter
 discoverable — a parked waiter holds no `Hooks` registration to retire, so it is found only when the primitive
-next touches its list — and it sits on the park path twice per parked operation: `acquireStep` walks in the
-readiness check and again in the parked branch, and `Channel.prune` walks both the sender and the receiver
-list, so the channel's park pays four walks. The decomposition above does not price that path (the served row
-never takes it); the `waiterbench|` rows on the same line do. Whether the readiness check's walk can be
-dropped without losing the discovery is not settled by these readings, and nothing here changes the walk.
+next touches its list — and it sat on the park path **twice per parked operation**: `acquireStep` walked in the
+readiness check and again in the parked branch, and `Channel.prune` walks both the sender and the receiver list,
+so the channel's park paid four walks. Pruning is garbage collection over list *length* and not a correctness
+requirement: a cancelled waiter left in place is stamped by `ctx.resume`, skipped by `Item.fire`, and consumes
+no permit, no slot and no message. So the parked branch no longer re-walks a list its own readiness check has
+just cleaned, and the walk that remains runs only when the list has grown past twice its length at the previous
+walk (`sweep`), which charges a walk of length L to at least L/2 registrations made since and makes
+registration O(1) amortized — parking n waiters is O(n).
+
+The `waiterbench|` rows price both sides of that. The per-waiter cost of parking was **25 016 ns at n=256 rising
+to 285 915 ns at n=4096**, doubling with each doubling of n — the quadratic's signature — and is now **flat at
+647/448/673/397/1776** ns across the same sizes, 39× to 354× lower. What remains after subtracting the row's own
+spawn-only control shows no trend with n; the absolute per-waiter figure tracks the control at every size (at
+n=4096, 42 469 ns against 41 887), so the only rise left in the row is the harness's own `spawn` path. The
+decomposition above does not price this path, since the served row never parks; the `waiterbench|` rows on the
+same line do.
 
 Both sides of that row are a trade, and the trade is what the ratio prices. `Std.Sync.Channel`'s `send` is a
 blocking wait: `Channel.Sync.send` is `IO.wait (← Channel.send ch v)`, and the bounded send path underneath

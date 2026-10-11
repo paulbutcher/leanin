@@ -32,8 +32,8 @@ nothing.** The adapter route is rejected for exactly that reason; the mechanism 
 law, because the wake is revocable.
 
 **Cancellation, per primitive.** A mutex or semaphore waiter's retry is stamped with the waiter's token by
-`ctx.resume`, so `Item.fire` skips it, and its entry is pruned at the next operation; it was never granted
-anything, so a cancelled acquirer consumes no permit and is never a holder. A channel sender's value enters
+`ctx.resume`, so `Item.fire` skips it, and its entry is dropped by a later walk over the list; it was never
+granted anything, so a cancelled acquirer consumes no permit and is never a holder. A channel sender's value enters
 the queue only inside the sender's own step, and a receiver's dequeue only inside the receiver's own step, so a
 cancelled sender enqueues nothing and consumes no slot and a cancelled receiver consumes no message. A
 cancelled waiter's cell is still resolved (the wake was taken and cleared), but its step is skipped, which is a
@@ -92,12 +92,19 @@ private def wakeAll (ws : List Waiter) : IO Unit :=
 `n` of them is linear rather than quadratic. No `++ [w]` append remains, and no order is given up: a `release`
 takes the *whole* list and clears it, `wakeAll` resolves every entry, and each woken waiter re-checks the permit
 count and re-acquires in whatever order the carrier serves its step, so nothing reads the list's order. `live`
-only filters it, preserving whatever order it holds. -/
+only filters it, preserving whatever order it holds, and `sweep` decides when to filter. `waitersLen` is the
+list's length, tracked explicitly for the same reason as the channel's `size`: `sweep` compares the length
+against its last walked value on every operation, and recomputing `List.length` there would walk the list
+anyway and put the quadratic back. -/
 structure SemState where
   /-- Permits currently available. A release adds one; a grant takes one. -/
   permits : Nat
   /-- Computations parked for a permit, newest first. Order is not a guarantee. -/
   waiters : List Waiter
+  /-- The length of `waiters`, kept so a `sweep` can decide whether to walk without walking. -/
+  waitersLen : Nat
+  /-- The `waiters` length at the previous `sweep`; the next walk is due when the list exceeds twice it. -/
+  waitersScanned : Nat
 
 /-- **An async semaphore.** The mechanism itself: a permit count and a waiter list under one `Std.Mutex`. -/
 structure Semaphore where
@@ -122,7 +129,10 @@ The two waiter lists are **conses** (`w : ws`), newest at the head, so registeri
 parking `n` of them is linear rather than quadratic. No `++ [w]` append remains, and no order is given up: a wake
 takes the *whole* list and clears it (`wakeAll`), every parked waiter is resolved, and the woken waiter re-checks
 the state and re-acquires in whatever order the carrier serves its step, so nothing reads the list's order.
-`live` only filters it, preserving whatever order it holds. -/
+`live` only filters it, preserving whatever order it holds, and `sweep` decides when to filter. Each list's
+length is tracked explicitly, `sendersLen` and `receiversLen`, for the same reason as `size`: `sweep` compares
+the length against its last walked value on every operation, and recomputing `List.length` there would walk the
+list anyway and put the quadratic back. -/
 structure ChanState (α : Type) where
   /-- The queue's read side: buffered values, oldest at the head. -/
   front : List α
@@ -134,6 +144,14 @@ structure ChanState (α : Type) where
   senders : List Waiter
   /-- Receivers parked because the queue was empty. Order is not a guarantee. -/
   receivers : List Waiter
+  /-- The length of `senders`, kept so a `sweep` can decide whether to walk without walking. -/
+  sendersLen : Nat
+  /-- The length of `receivers`, kept so a `sweep` can decide whether to walk without walking. -/
+  receiversLen : Nat
+  /-- The `senders` length at the previous `sweep`; the next walk is due when the list exceeds twice it. -/
+  sendersScanned : Nat
+  /-- The `receivers` length at the previous `sweep`; the next walk is due when the list exceeds twice it. -/
+  receiversScanned : Nat
 
 /-- **A bounded channel.** The bound is the caller's argument; `cap = 0` is refused at `new`. -/
 structure Channel (α : Type) where
@@ -148,11 +166,34 @@ private def live {m : Type → Type} [Monad m] [MonadLiftT BaseIO m] (ws : List 
     let gone ← liftM (w.token.isSet : BaseIO Bool)
     return !gone
 
+/-- **The waiter list, with a walk taken only when it has earned one.** `live` is the only thing that discovers a
+cancelled waiter, and it walks the whole list with a per-element `token.isSet` read; calling it on every
+operation would make parking `n` waiters O(n²). Instead the list is walked only when its length exceeds twice
+`scanned`, the length it had at the previous walk, so a walk of length L is charged against at least L/2
+registrations made since that previous walk and the total walk cost over any run stays linear in the number of
+registrations. Between walks a cancelled waiter is left where it is, and that costs nothing: it is skipped by
+`Item.fire` and consumes no permit, slot or message (the module header), so the walk is garbage collection over
+list length and never a correctness requirement. A list that stops growing is not walked again — no walk can
+find what it cannot see, and the next operation that takes and clears the list resets it.
+
+`len` is the list's own length, carried in the state and kept equal to `ws.length`: the comparison here runs on
+every operation, and reading `List.length` would walk the list to decide whether to walk it. The result is `some`
+with the walked list and its length only when the walk was taken, and `none` when it was not — so the common
+operation allocates nothing and the caller leaves the state alone, and only the walk it paid for builds the new
+list. -/
+private def sweep {m : Type → Type} [Monad m] [MonadLiftT BaseIO m] (ws : List Waiter) (len scanned : Nat) :
+    m (Option (List Waiter × Nat)) := do
+  if len > 2 * scanned then
+    let ws' ← live ws
+    return some (ws', ws'.length)
+  else
+    return none
+
 namespace Semaphore
 
 /-- A semaphore with `permits` available. -/
 def new (permits : Nat) : IO Semaphore :=
-  return ⟨← Std.Mutex.new { permits := permits, waiters := [] }⟩
+  return ⟨← Std.Mutex.new { permits := permits, waiters := [], waitersLen := 0, waitersScanned := 0 }⟩
 
 /-- **The acquisition step**, and the retry a wake schedules. One critical section tries to take a permit; if
 none is available the second registers a fresh `Join` and the computation parks on it. A wake only re-enters
@@ -160,13 +201,16 @@ this step, which re-reads the state: a wake is a hint, so nothing is transferred
 nothing. -/
 private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ctx) : IO Unit := do
   let ready ← s.state.atomically do
-    let st ← get
-    let ws ← live st.waiters
+    let st0 ← get
+    let swept ← sweep st0.waiters st0.waitersLen st0.waitersScanned
+    let st := match swept with
+      | some (ws, len) => { st0 with waiters := ws, waitersLen := len, waitersScanned := len }
+      | none           => st0
     if st.permits > 0 then
-      set { st with permits := st.permits - 1, waiters := ws }
+      set { st with permits := st.permits - 1 }
       return true
     else
-      set { st with waiters := ws }
+      set st
       return false
   if ready then
     k ()
@@ -175,12 +219,11 @@ private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ct
     let j : Join Unit ← Join.new
     let parked ← s.state.atomically do
       let st ← get
-      let ws ← live st.waiters
       if st.permits > 0 then
-        set { st with permits := st.permits - 1, waiters := ws }
+        set { st with permits := st.permits - 1 }
         return false
       else
-        set { st with waiters := Waiter.mk j ctx.cancel :: ws }
+        set { st with waiters := Waiter.mk j ctx.cancel :: st.waiters, waitersLen := st.waitersLen + 1 }
         return true
     if parked then
       Join.onReady j (fun () => ctx.resume (Item.ofAction (acquireStep s k ctx)))
@@ -194,13 +237,16 @@ def acquire (s : Semaphore) : Task.Async Unit :=
 /-- Take a permit if one is available, without parking. -/
 def tryAcquire (s : Semaphore) : IO Bool :=
   s.state.atomically do
-    let st ← get
-    let ws ← live st.waiters
+    let st0 ← get
+    let swept ← sweep st0.waiters st0.waitersLen st0.waitersScanned
+    let st := match swept with
+      | some (ws, len) => { st0 with waiters := ws, waitersLen := len, waitersScanned := len }
+      | none           => st0
     if st.permits > 0 then
-      set { st with permits := st.permits - 1, waiters := ws }
+      set { st with permits := st.permits - 1 }
       return true
     else
-      set { st with waiters := ws }
+      set st
       return false
 
 /-- **Return a permit, and wake the whole waiter list as a hint.** The list is taken and cleared inside the
@@ -209,7 +255,7 @@ consumes nothing. -/
 def release (s : Semaphore) : IO Unit := do
   let ws ← s.state.atomically do
     let st ← get
-    set { st with permits := st.permits + 1, waiters := [] }
+    set { st with permits := st.permits + 1, waiters := [], waitersLen := 0, waitersScanned := 0 }
     return st.waiters
   wakeAll ws
 
@@ -244,14 +290,21 @@ def new (α : Type) (cap : Nat) : IO (Channel α) := do
   if cap == 0 then
     throw (IO.userError s!"Sync.Channel.new: capacity {cap} leaves no room for a value, so a sender could \
       never be served; a rendezvous needs a different shape than a buffer")
-  return { state := ← Std.Mutex.new { front := ([] : List α), back := [], size := 0, senders := [], receivers := [] }, cap := cap }
+  return { state := ← Std.Mutex.new { front := ([] : List α), back := [], size := 0, senders := [], receivers := [], sendersLen := 0, receiversLen := 0, sendersScanned := 0, receiversScanned := 0 }, cap := cap }
 
-/-- The channel state with its cancelled waiters dropped. Polymorphic in the monad so it can run inside a
-critical section without a lift at the call site. -/
+/-- The channel state with a `sweep` over each waiter list, so a cancelled waiter is dropped only when its list
+has grown enough to earn the walk. Polymorphic in the monad so it can run inside a critical section without a
+lift at the call site. -/
 private def prune {m : Type → Type} [Monad m] [MonadLiftT BaseIO m] (st : ChanState α) : m (ChanState α) := do
-  let senders ← live st.senders
-  let receivers ← live st.receivers
-  return { st with senders := senders, receivers := receivers }
+  let ss ← sweep st.senders st.sendersLen st.sendersScanned
+  let st := match ss with
+    | some (ws, len) => { st with senders := ws, sendersLen := len, sendersScanned := len }
+    | none           => st
+  let rs ← sweep st.receivers st.receiversLen st.receiversScanned
+  let st := match rs with
+    | some (ws, len) => { st with receivers := ws, receiversLen := len, receiversScanned := len }
+    | none           => st
+  return st
 
 /-- **Enqueue**: prepend to the write side and count it, O(1). -/
 private def enqueue (st : ChanState α) (v : α) : ChanState α :=
@@ -275,7 +328,7 @@ private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (c
   let ready ← c.state.atomically do
     let st ← prune (← get)
     if st.size < c.cap then
-      set { (enqueue st v) with receivers := [] }
+      set { (enqueue st v) with receivers := [], receiversLen := 0, receiversScanned := 0 }
       return some st.receivers
     else
       set st
@@ -285,12 +338,12 @@ private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (c
   | none    =>
     let j : Join Unit ← Join.new
     let parked ← c.state.atomically do
-      let st ← prune (← get)
+      let st ← get
       if st.size < c.cap then
-        set { (enqueue st v) with receivers := [] }
+        set { (enqueue st v) with receivers := [], receiversLen := 0, receiversScanned := 0 }
         return some st.receivers
       else
-        set { st with senders := Waiter.mk j ctx.cancel :: st.senders }
+        set { st with senders := Waiter.mk j ctx.cancel :: st.senders, sendersLen := st.sendersLen + 1 }
         return none
     match parked with
     | some ws => wakeAll ws; k ()
@@ -306,7 +359,7 @@ def trySend (c : Channel α) (v : α) : IO Bool := do
   let r ← c.state.atomically do
     let st ← prune (← get)
     if st.size < c.cap then
-      set { (enqueue st v) with receivers := [] }
+      set { (enqueue st v) with receivers := [], receiversLen := 0, receiversScanned := 0 }
       return some st.receivers
     else
       set st
@@ -322,7 +375,7 @@ private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) :
     let st ← prune (← get)
     match dequeue st with
     | some (v, st') =>
-      set { st' with senders := [] }
+      set { st' with senders := [], sendersLen := 0, sendersScanned := 0 }
       return some (v, st.senders)
     | none =>
       set st
@@ -332,13 +385,13 @@ private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) :
   | none         =>
     let j : Join Unit ← Join.new
     let parked ← c.state.atomically do
-      let st ← prune (← get)
+      let st ← get
       match dequeue st with
       | some (v, st') =>
-        set { st' with senders := [] }
+        set { st' with senders := [], sendersLen := 0, sendersScanned := 0 }
         return some (v, st.senders)
       | none =>
-        set { st with receivers := Waiter.mk j ctx.cancel :: st.receivers }
+        set { st with receivers := Waiter.mk j ctx.cancel :: st.receivers, receiversLen := st.receiversLen + 1 }
         return none
     match parked with
     | some (v, ws) => wakeAll ws; k v
@@ -354,7 +407,7 @@ def tryRecv (c : Channel α) : IO (Option α) := do
     let st ← prune (← get)
     match dequeue st with
     | some (v, st') =>
-      set { st' with senders := [] }
+      set { st' with senders := [], sendersLen := 0, sendersScanned := 0 }
       return some (v, st.senders)
     | none =>
       set st
