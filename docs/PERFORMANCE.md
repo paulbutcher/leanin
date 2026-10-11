@@ -122,9 +122,9 @@ observation that the interleaving actually happened: a non-parking `tryLock` ins
 permit already held by the other computation while this one expected to acquire it, and it reads `no`, never
 omitted, when it did not; the wake row prices one
 release that wakes 16 parked waiters, per waiter; the semaphore rows are n acquires and n releases, uncontended;
-the channel rows send n values into a **capacity-n** channel and drain them with n receives — capacity n for n
+the channel pair sends n values into a **capacity-n** channel and drains them with n receives — capacity n for n
 sends, so the queue reaches its bound only as the last send completes and the send-park path is never exercised —
-and pair our per-message
+and pairs our per-message
 figure with the same n messages through `Std.Sync.Channel` **in the same run**, the run computing the ratio
 itself.
 
@@ -134,7 +134,6 @@ itself.
 | lock/unlock, two computations contending (permit held across a yield) | 1 356–2 059 ns per pair | — | ⚪ no baseline | `--runtime-sync` |
 | a release waking 16 parked waiters | 628–1 275 ns per waiter | — | ⚪ no baseline: the design's O(w) wake cost, with no earlier mechanism to divide by | `--runtime-sync` |
 | semaphore acquire / release, uncontended | 69–135 ns / 67–148 ns | — | ⚪ no baseline | `--runtime-sync` |
-| a message through our bounded channel (capacity n with n sends, so it never fills and the send-park path is not priced) | **275–919 ns** | `Std.Sync.Channel`, same run: **187–531 ns** | 🔴 **~1.3–2.3× worse** on the typical run; the run's own `chanRatioPct` reads 44–76 there, and 33–106 across the whole set | `--runtime-sync` |
 
 The lock and semaphore rows are first measurements — the primitives did not exist before W6 — so they carry no
 baseline and are ⚪. `nsLockContended` now reads *above* `nsLockUncontended` (1 356–2 059 ns against 343–667 ns
@@ -149,12 +148,14 @@ waited — the case an async mutex exists for. The line carries that evidence it
 reads `yes` when the yielding chains' `tryLock` probe finds the permit held — the same observation the trace
 records — so the row states the interleaving happened instead of inferring it from the shape. The wake row below
 — not this one — is where the design's O(w) cost
-is priced. The channel row is the one that is
-not ahead, and the residual is the task layer rather than the queue. The queue used to be a `List` appended under
-the lock — `state.queue ++ [v]`, O(queue length) per send, so O(n²) to fill a capacity-n channel — and it is now a
-two-list FIFO with an explicit size, O(1) amortised in both directions. The reading this row replaces was
-**9.4–14.3 µs** per message against **246–304 ns** for the stock channel in those same runs, the mode's own
-`chanRatioPct` 1–3. After the change the row reads **275–919 ns** ours against **187–531 ns** stock in the same
+is priced. The channel comparison is the one that is
+not ahead — its row is carried in §4.8, so that this section holds only rows we win and rows that are not
+comparisons at all — and the residual is the task layer rather than the queue. The queue used to be a `List`
+appended under the lock — `state.queue ++ [v]`, O(queue length) per send, so O(n²) to fill a capacity-n
+channel — and it is now a two-list FIFO with an explicit size, O(1) amortised in both directions. The reading
+this row replaces was **9.4–14.3 µs** per message against **246–304 ns** for the stock channel in those same
+runs, the mode's own
+`chanRatioPct` 1–3. After the change the row (§4.8) reads **275–919 ns** ours against **187–531 ns** stock in the same
 runs, and what is left of the gap is not the queue: every send and receive is a step with its item and context
 bookkeeping and a full mutex transaction, where `Std.Sync.Channel` is a straight promise-based hand-off, and that
 per-operation step machinery is the **~1.3–2.3×** the row still reads. The comparison is same-run — both figures
@@ -363,22 +364,37 @@ thread), and both readings are recorded rather than one chosen.
 
 ## 4. 🔴 Where we are worse
 
-Stated before anything above it, because it is the honest part of this document. Three rows carry no factor: the
-§4.1 row is now **parity** — W4's blocking pool is what moved it, and the residual below is what remains — one
-has no baseline to divide by yet, and one is about the instruments rather than the runtime. Each multiplier is
+Stated before anything above it, because it is the honest part of this document. The section holds one
+**external comparison that we lose** — a message through our bounded channel against `Std.Sync.Channel`, our
+**275–919 ns** against its **187–531 ns** in the same run (§4.8) — and one **external comparison at parity** —
+blocking work against the stock pool, which W4's blocking pool moved from 🔴 4.0× worse to a tie and which is
+marked ⚪ because a pair that ties attributes nothing either way (§4.1). It also holds the **internal cost
+decompositions**, all ⚪: the burst submit and burst spawn (§4.3), the submit burst against our own steady state
+(§4.4) and the ring push with the array shared (§4.5) each set this runtime against a narrower arm of itself,
+and the structural rows (§4.2, §4.6) and the instrument row (§4.7) are facts about this runtime and these
+instruments, or pairs of our own numbers, rather than comparisons at all. Which rows have another
+implementation as their baseline and which are against ourselves is readable from the marker and from each row's
+own stated reason.
+
+Of the 47 rows in §§2–4, **12 compare us against another implementation and carry a
+verdict — 11 🟢 and 1 🔴 — and 35 are ⚪**. Thirteen rows in all have another implementation as their baseline:
+those 12, plus the §4.1 parity pair, which is external and ⚪ at once because a tie attributes nothing. The other
+34 ⚪ rows are internal: decompositions of our own cost, same-run pairs against ourselves, and facts about the
+instruments. (The printed rows in §3.5 and §5 are outside this count.) Each multiplier is
 same-run, like every other in this document, and the subsections below explain the mechanism rather than repeat
 the arithmetic.
 
-| worse, and where it comes from | ours | baseline | leanin is | source |
+| row, and where it comes from | ours | baseline | leanin is | source |
 |---|---|---|---|---|
-| blocking work, on a carrier or through the pool (§4.1) | 25 767 µs through the pool | stock pool 25 146 µs | ⚪ parity: W4's blocking pool moved it from 🔴 4.0× worse; a blocking call that does not take the pool still stops everything | `--runtime-bench` |
-| core parallelism (§4.2) | 4 distinct carriers at `p=4`, `distinctCarriers=4` | — | 🟢 the structural row is superseded by W8's carriers | `--runtime-carriers` |
-| a burst submit into an undrained pool (§4.3) | 586–881 ns | 53–77 ns of lock, state copy and enqueue | 🔴 **~11× worse** | `--runtime-unit` |
-| a burst spawn into an undrained pool (§4.3) | 440–792 ns | the same 53–77 ns | 🔴 **~10× worse** | `--runtime-unit` |
-| the submit burst against steady state (§4.4) | 850–894 ns, one transaction | 485–502 ns, which is two | 🔴 **~1.7–1.8× worse** | `--runtime-ops` |
-| a ring push whose array is shared (§4.5) | 191–464 ns | 10–16 ns, the same push uniquely held | 🔴 **~20× worse** | `--runtime-unit` |
-| carriers added to a serial client (§4.6) | 1 worker: 10 795 µs | 4 workers: 7 988 µs | ⚪ superseded: that client is serial by construction; the parallel row is `parbatch|` (§3.5) | `--runtime-async` |
-| what the instruments can resolve (§4.7) | ±30% run-to-run | — | ⚪ no factor: a limit of the measurement, not of the runtime | all of the above |
+| blocking work, on a carrier or through the pool (§4.1) | 25 767 µs through the pool | stock pool 25 146 µs | ⚪ **an external comparison at parity**: W4's blocking pool moved it from 🔴 4.0× worse, and a tie attributes nothing either way; a blocking call that does not take the pool still stops everything | `--runtime-bench` |
+| core parallelism (§4.2) | 4 distinct carriers at `p=4`, `distinctCarriers=4` | — | ⚪ **not a comparison**: a fact about our own runtime with no baseline to divide by; the structural row is superseded by W8's carriers, whose `parbatch` sweep is §3.5 | `--runtime-carriers` |
+| a burst submit into an undrained pool (§4.3) | 586–881 ns | 53–77 ns of lock, state copy and enqueue | ⚪ **not a comparison**: the baseline is our own step's transaction plumbing — the same runtime without the pool — so the ~11× decomposes our own cost rather than measuring us against another implementation | `--runtime-unit` |
+| a burst spawn into an undrained pool (§4.3) | 440–792 ns | the same 53–77 ns | ⚪ **not a comparison**, for the same reason: our own plumbing figure again, so the ~10× is a decomposition of our own cost | `--runtime-unit` |
+| the submit burst against steady state (§4.4) | 850–894 ns, one transaction | 485–502 ns, which is two | ⚪ **not a comparison**: the baseline is our own steady-state spawn-and-take — one of our transactions set against two of ours — so the ~1.7–1.8× is a decomposition and not a defeat | `--runtime-ops` |
+| a ring push whose array is shared (§4.5) | 191–464 ns | 10–16 ns, the same push uniquely held | ⚪ **not a comparison**: the baseline is the same operation under a different ownership discipline — our own ring with the array uniquely held — so the ~20× prices the copy between two arms of our own ring | `--runtime-unit` |
+| carriers added to a serial client (§4.6) | 1 worker: 10 795 µs | 4 workers: 7 988 µs | ⚪ **not a comparison**: that client is serial by construction, so the pair is internal; the parallel row is the `parbatch` sweep in §3.5 | `--runtime-async` |
+| what the instruments can resolve (§4.7) | ±30% run-to-run | — | ⚪ **not a comparison**: a limit of the measurement, not of the runtime | all of the above |
+| a message through our bounded channel against `Std.Sync.Channel` (§4.8) | **275–919 ns** | `Std.Sync.Channel`, same run: **187–531 ns** | 🔴 **~1.3–2.3× worse**: the one external comparison this document loses, same-run as §1 requires; the residual is the per-operation step machinery, not the queue | `--runtime-sync` |
 
 ### 4.1 Blocking work stops everything, unless it takes the pool
 
@@ -430,12 +446,16 @@ deque's push is what §4.4's `--runtime-ops` burst and the `--runtime-carriers` 
 where the old cost showed: it read **2 730 ns** against `Pool.submit`'s 830 ns when the overflow appended a
 growing list, and reads **440–792 ns** now that it only returns the overflow; `Pool.submit`, whose overflow the
 old shape reached on the same saturation, moved less, to **586–881 ns**. Both are burst rows, and the burst rows
-are what happens when nothing takes.
+are what happens when nothing takes. The figure both divide by — the plumbing row — is our own step's
+transaction without the pool, so the ~11× and ~10× decompose our own cost and the rows are ⚪, not a comparison
+with another implementation.
 
 ### 4.4 The same, seen from one operation
 
 `Executor.submit` sits in the table against `spawn+take (steady)`, and the comparison is deliberately harsh: one
-transaction against two. `Executor.spawn` (**496–517 ns** in this window) does not show the effect, because it
+transaction against two — but it is a comparison inside our own runtime, which is why the row is ⚪ and its ratio
+decomposes our cost rather than measuring us against another implementation. `Executor.spawn` (**496–517 ns** in
+this window) does not show the effect, because it
 writes the LIFO slot and only occasionally reaches the ring. Re-taken with `--runtime-ops` in the window §4.3
 names (load average 3.5–4.0), the burst submit reads **850–894 ns** against the steady spawn-and-take's
 **485–502 ns**, so the one transaction still costs **~1.7–1.8×** the two it is set against — the recorded pair,
@@ -453,7 +473,9 @@ before it modifies the pool, which is where that sharing came from, and the take
 it reads the pool — but the row stays in the harness because the effect is easy to reintroduce. Re-taken across
 the §4.3 window (load average 3.05–4.00, and 15 further runs at 3.3), the pair reads **10–16 ns** uniquely held
 against **191–464 ns** shared, roughly 20× either way; the recorded 6 ns / 121 ns is an earlier window that I did
-not reproduce here, and the ratio is what the row exists for.
+not reproduce here, and the ratio is what the row exists for. Both arms are our own ring — the same push with
+the array uniquely held — so the pair is ⚪ and prices a copy inside our own structure, not a comparison with
+another implementation.
 
 ### 4.6 Added carriers no longer read as "no scaling"
 
@@ -472,6 +494,24 @@ Not a claim about the runtime, but about the instruments, and it limits what can
 ThreadSanitizer in the runtime. Combined with the ±30% drift in §1, small effects cannot be resolved today: the
 reorder in `Executor`'s take path was worth 2–8%, which is inside the noise of a single run and needed five
 interleaved pairs to see.
+
+### 4.8 The one external comparison we lose: a message through our bounded channel
+
+Against `Std.Sync.Channel`, in the same run: **275–919 ns** ours against **187–531 ns** stock per message, the
+run's own `chanRatioPct` reading 44–76 on the typical run and 33–106 across the whole set — a spread wider than
+§1's ±30%, because the box was shared while these ran. Both figures come from one `syncbench|` line, as §1
+requires of a comparison: n sends into a capacity-n channel drained by n receives, ours beside the same n
+messages through the stock channel, with the ratio computed inside the run; at `LEAN_NUM_THREADS=1` the same rows
+read **323–904 ns** ours against **220–540 ns** stock. This is the row that makes the section title true — a
+comparison with another implementation, and one we lose.
+
+What remains of the gap is the **per-operation step machinery** — every send and receive is a step carrying its
+item and its context bookkeeping and taking a full mutex transaction — against `Std.Sync.Channel`'s straight
+promise-based hand-off, and that machinery is the **~1.3–2.3×** the row still reads. It is not the queue: the
+queue was a `List` appended under the lock (`state.queue ++ [v]`, O(queue length) per send, so O(n²) to fill a
+capacity-n channel) and is now a two-list FIFO with an explicit size, O(1) amortised in both directions, which
+took the row from the **9.4–14.3 µs** ours against **246–304 ns** stock it replaced to the figures above. The
+construction, field by field, is §3.1.
 
 ## 5. ⚪ Rows that are about a pool, not about us
 
