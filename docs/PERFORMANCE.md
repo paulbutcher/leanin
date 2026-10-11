@@ -373,10 +373,10 @@ the arithmetic.
 |---|---|---|---|---|
 | blocking work, on a carrier or through the pool (§4.1) | 25 767 µs through the pool | stock pool 25 146 µs | ⚪ parity: W4's blocking pool moved it from 🔴 4.0× worse; a blocking call that does not take the pool still stops everything | `--runtime-bench` |
 | core parallelism (§4.2) | 4 distinct carriers at `p=4`, `distinctCarriers=4` | — | 🟢 the structural row is superseded by W8's carriers | `--runtime-carriers` |
-| a burst submit into an undrained pool (§4.3) | 830 ns | 41 ns of lock, state copy and enqueue | 🔴 **20× worse** | `--runtime-unit` |
-| a burst spawn into an undrained pool (§4.3) | 2 730 ns | the same 41 ns | 🔴 **67× worse** | `--runtime-unit` |
-| the submit burst against steady state (§4.4) | 951 ns, one transaction | 339 ns, which is two | 🔴 **2.8× worse** | `--runtime-ops` |
-| a ring push whose array is shared (§4.5) | 121 ns | 6 ns, the same push uniquely held | 🔴 **20× worse** | `--runtime-unit` |
+| a burst submit into an undrained pool (§4.3) | 586–881 ns | 53–77 ns of lock, state copy and enqueue | 🔴 **~11× worse** | `--runtime-unit` |
+| a burst spawn into an undrained pool (§4.3) | 440–792 ns | the same 53–77 ns | 🔴 **~10× worse** | `--runtime-unit` |
+| the submit burst against steady state (§4.4) | 850–894 ns, one transaction | 485–502 ns, which is two | 🔴 **~1.7–1.8× worse** | `--runtime-ops` |
+| a ring push whose array is shared (§4.5) | 191–464 ns | 10–16 ns, the same push uniquely held | 🔴 **~20× worse** | `--runtime-unit` |
 | carriers added to a serial client (§4.6) | 1 worker: 10 795 µs | 4 workers: 7 988 µs | ⚪ superseded: that client is serial by construction; the parallel row is `parbatch|` (§3.5) | `--runtime-async` |
 | what the instruments can resolve (§4.7) | ±30% run-to-run | — | ⚪ no factor: a limit of the measurement, not of the runtime | all of the above |
 
@@ -407,33 +407,53 @@ starts `p` dedicated carriers and the parallel arm's work runs on them — SC18-
 row's old form (`--runtime-bench`'s one-carrier client) still reads one thread, because that client drives
 `Runtime.run`; the multi-carrier reading is `--runtime-carriers` and is in §3.5.
 
-### 4.3 A burst into an undrained pool grows its overflow
+### 4.3 A burst into an undrained pool no longer grows with the backlog
 
 ```
-unit: transaction plumbing 41ns | + Pool.submit 830ns | + Pool.spawn 2730ns
+unit: transaction plumbing 61ns | + Pool.submit 695ns | + Pool.spawn 664ns
 ```
 
-The lock, the state copy and the scheduler record cost **41 ns**, and that is the whole of a transaction that
-does not touch the pool. `Pool.submit` and `Pool.spawn` add the numbers in the table because the overflow
-appends the evicted half to `inject`, which is a `List`: a burst nothing drains grows it, and the append is
-proportional to its length. In steady state the same work is **339 ns for a spawn and a take together**, which
-is the honest per-item figure — the burst rows are what happens when nothing takes.
+One line from one of nine invocations (`nix develop -c lake exe controls --runtime-unit`, already the best of
+two inside each). Across them, on this eight-core box at load average 3.05–4.00 — a shared box; the same tree in
+the same window reads `ops: native Task spawn+join 9 602–15 512 ns` — the plumbing row reads **53–77 ns**,
+`Pool.submit` **586–881 ns** and `Pool.spawn` **440–792 ns**. The plumbing figure is the lock, the state copy
+and the scheduler record: the whole of a transaction that does not touch the pool. Each pool operation adds one
+ring placement to it, and the harness loops 20 000 of them through a 256-slot ring with nothing taking, so the
+ring is saturated and the overflow arm runs about once per 128 placements. That arm sheds the newer half by
+*moving the live count* — `Ring.keepFirst`, nothing copied — and **returns** the evicted half to the caller.
+There is no `inject` field here to append it to: the pool is inject-free ("the shared queue is the executor's
+cell, not a worker's"), so the append a burst would walk is not in this structure at all. It is the caller's
+work, in `Executor.pushItems`, into the shared cell's `Deque`, whose `push` writes at the back of the live range
+and rebuilds only when the store is exhausted — **amortised O(1)** where the pool's own `List` append was
+O(length). (This harness takes the pool half of each placement, so it prices the pool's own work; the shared
+deque's push is what §4.4's `--runtime-ops` burst and the `--runtime-carriers` rows reach.) `Pool.spawn`'s row is
+where the old cost showed: it read **2 730 ns** against `Pool.submit`'s 830 ns when the overflow appended a
+growing list, and reads **440–792 ns** now that it only returns the overflow; `Pool.submit`, whose overflow the
+old shape reached on the same saturation, moved less, to **586–881 ns**. Both are burst rows, and the burst rows
+are what happens when nothing takes.
 
 ### 4.4 The same, seen from one operation
 
 `Executor.submit` sits in the table against `spawn+take (steady)`, and the comparison is deliberately harsh: one
-transaction against two. `Executor.spawn` (464 ns) does not show the effect, because it writes the LIFO slot
-and only occasionally reaches the ring.
+transaction against two. `Executor.spawn` (**496–517 ns** in this window) does not show the effect, because it
+writes the LIFO slot and only occasionally reaches the ring. Re-taken with `--runtime-ops` in the window §4.3
+names (load average 3.5–4.0), the burst submit reads **850–894 ns** against the steady spawn-and-take's
+**485–502 ns**, so the one transaction still costs **~1.7–1.8×** the two it is set against — the recorded pair,
+951 ns against 339 ns, was the same shape at 2.8× in an earlier window. The burst's own cost is the ring
+placement on a saturated ring (the shared-array copy §4.5 prices), not the transaction.
 
 ### 4.5 A ring mutation still copies its slots when the array is shared
 
 ```
-unit: Ring.push unique array 6ns | array shared with a live ring 121ns
+unit: Ring.push unique array 15ns | array shared with a live ring 422ns
 ```
 
 The copy is 2 KB, and it happens whenever the array is referenced twice. `Executor` now releases the cell's hold
 before it modifies the pool, which is where that sharing came from, and the take path asks the scheduler before
-it reads the pool — but the row stays in the harness because the effect is easy to reintroduce.
+it reads the pool — but the row stays in the harness because the effect is easy to reintroduce. Re-taken across
+the §4.3 window (load average 3.05–4.00, and 15 further runs at 3.3), the pair reads **10–16 ns** uniquely held
+against **191–464 ns** shared, roughly 20× either way; the recorded 6 ns / 121 ns is an earlier window that I did
+not reproduce here, and the ratio is what the row exists for.
 
 ### 4.6 Added carriers no longer read as "no scaling"
 
