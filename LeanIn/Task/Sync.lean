@@ -86,11 +86,17 @@ defect. -/
 private def wakeAll (ws : List Waiter) : IO Unit :=
   for w in ws do Join.resolveFirst w.wake ()
 
-/-- **The semaphore's state**: the permits available, and the computations parked for one. -/
+/-- **The semaphore's state**: the permits available, and the computations parked for one.
+
+`waiters` is a **cons list** (`w : ws`), newest at the head, so registering a parked waiter is O(1) and parking
+`n` of them is linear rather than quadratic. No `++ [w]` append remains, and no order is given up: a `release`
+takes the *whole* list and clears it, `wakeAll` resolves every entry, and each woken waiter re-checks the permit
+count and re-acquires in whatever order the carrier serves its step, so nothing reads the list's order. `live`
+only filters it, preserving whatever order it holds. -/
 structure SemState where
   /-- Permits currently available. A release adds one; a grant takes one. -/
   permits : Nat
-  /-- Computations parked for a permit, oldest first. Order is not a guarantee. -/
+  /-- Computations parked for a permit, newest first. Order is not a guarantee. -/
   waiters : List Waiter
 
 /-- **An async semaphore.** The mechanism itself: a permit count and a waiter list under one `Std.Mutex`. -/
@@ -110,7 +116,13 @@ so **both ends are O(1) amortised** — no `++ [v]` append remains, and filling 
 linear in messages rather than quadratic. `size` is the queue's occupancy (`size = front.length + back.length`),
 tracked explicitly because `List.length` walks the list: recomputing it on every send would put the O(n) back
 into the enqueue path and with it the quadratic fill. The bound is the separate `cap` count, never this
-representation. -/
+representation.
+
+The two waiter lists are **conses** (`w : ws`), newest at the head, so registering a parked waiter is O(1) and
+parking `n` of them is linear rather than quadratic. No `++ [w]` append remains, and no order is given up: a wake
+takes the *whole* list and clears it (`wakeAll`), every parked waiter is resolved, and the woken waiter re-checks
+the state and re-acquires in whatever order the carrier serves its step, so nothing reads the list's order.
+`live` only filters it, preserving whatever order it holds. -/
 structure ChanState (α : Type) where
   /-- The queue's read side: buffered values, oldest at the head. -/
   front : List α
@@ -168,7 +180,7 @@ private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ct
         set { st with permits := st.permits - 1, waiters := ws }
         return false
       else
-        set { st with waiters := ws ++ [Waiter.mk j ctx.cancel] }
+        set { st with waiters := Waiter.mk j ctx.cancel :: ws }
         return true
     if parked then
       Join.onReady j (fun () => ctx.resume (Item.ofAction (acquireStep s k ctx)))
@@ -278,7 +290,7 @@ private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (c
         set { (enqueue st v) with receivers := [] }
         return some st.receivers
       else
-        set { st with senders := st.senders ++ [Waiter.mk j ctx.cancel] }
+        set { st with senders := Waiter.mk j ctx.cancel :: st.senders }
         return none
     match parked with
     | some ws => wakeAll ws; k ()
@@ -326,7 +338,7 @@ private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) :
         set { st' with senders := [] }
         return some (v, st.senders)
       | none =>
-        set { st with receivers := st.receivers ++ [Waiter.mk j ctx.cancel] }
+        set { st with receivers := Waiter.mk j ctx.cancel :: st.receivers }
         return none
     match parked with
     | some (v, ws) => wakeAll ws; k v
