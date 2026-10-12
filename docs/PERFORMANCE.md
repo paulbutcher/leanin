@@ -341,9 +341,43 @@ same-session ratioX      base  ~3.9–4.3×        current ~2.6–2.9×
 So the take path does not return to the base's same-session ratio. What it *was*: the take's spent-allowance
 arm (flush the LIFO slot to the shared list, then fetch it back) ran on **every** take after three, because
 nothing refreshed the allowance — the LIFO slot is otherwise dead for the rest of the run, which is also why
-the chain-shaped rows moved. Two repairs landed: the allowance now refreshes **inside the take's own
+the chain-shaped rows moved. Two repairs landed. The first had the allowance refresh **inside the take's own
 transaction** (so the spent-allowance arm runs once per allowance rather than on every take, and the extra
-section is not paid), and the hot take and push paths are `@[inline]` (the body's cost is one pool transaction,
+fetch is paid once per allowance) — **and it was taken back, because it made the allowance per-chain**: the
+slot was served for as long as its owner kept refilling it, which starved ring-resident work behind a spawn
+chain. The bound is now per-tick again, with `lifoPolls` counting *consecutive* slot polls and refreshed by any
+decision that is not a slot serve, folded into `Pool.takeReport` so both take spellings read one transaction.
+The three arms, re-measured interleaved against the plan's own definitions with the take path's refresh removed
+as arm C and the base as arm B (the earlier session's log is not on disk; these are the reviewer's independent
+run, same session, minima per §1):
+
+```
+arm A (fixed)              2346 ns                       435 ns
+arm B (base, f5e6c9d)      1851 ns                       333 ns
+arm C (refresh removed)    2510 ns                       705 ns
+```
+
+**A beats C on both** (−6.5% round trip, −38% spawn+take), which is criterion 1's direction and its instrument;
+**A is above B on both** (+27%, +31%), which is the bound's price and criterion 4's finding. The chain row's
+A-vs-C half is **unmeasured**: that pair first read at mismatched carrier counts (arm C at four, arm A at one),
+and the re-measurement labelled its "C" arm with a tree byte-identical to the base, so no figure is claimed for
+it — the row is recorded as measured against B, not C, and it carries no criterion.
+
+The historical note that follows — the W8-era repairs and their figures — stands as that milestone's record.
+What changed after it: the refresh **inside the take's own transaction** was taken back, because it made the
+allowance per-chain and starved ring-resident work behind a spawn chain. The bound is per-tick again, with
+`lifoPolls` counting consecutive slot polls and any non-slot decision refreshing it, folded into
+`Pool.takeReport`; the take row's own figures below are from the W8 window and are **not** re-taken here. What
+that change did to the two condition-2 instruments is in the table above: `--runtime-ops` puts the fixed build
+below the pre-repair shape (criterion 1's direction), and the `chain|` half is **unmeasured** — no figure is
+claimed for it.
+So the sentence below about the second condition not being met by the `--runtime-ops` instrument describes the
+pre-repair state, not this one; the honest current statement is criterion 3's recorded miss on the chain ratio
+**(A 8.07–8.52 against B's same-session 9.00–11.26)** with its attribution — the fixed build flushes 1001 times
+over the chain run against B's 1 and the pre-repair shape's 3997, one flush per two links — its native-pool
+advantage intact and three levers named for the user rather than pulled.
+
+What remains from it: the hot take and push paths are `@[inline]` (the body's cost is one pool transaction,
 and a call boundary there cost as much as the transaction outright — measured: the same body inlined is ~380 ns
 against ~760 ns called). Those repairs moved the take row from 555 ns to **92 ns** and `spawn+take`
 (steady) from 1407–1683 ns to **442 ns** — at or below the base's 488 ns — and the round trip from ~3524 to
@@ -609,7 +643,7 @@ record is not updated for it.
 | `nix develop -c lake exe controls --runtime-ops` | per-operation costs: enqueue, take, a spawn+await round trip, a critical section, a notification, a reference pair; plus the blocking pool's submit alone and a spawn-and-await round trip through it, over 20 000 jobs on 4 workers |
 | `nix develop -c lake exe controls --runtime-unit` | one transaction decomposed: plumbing, pool operations, and the ring's array sharing |
 | `nix develop -c lake exe controls --runtime-tail` | how late the last of 10 000 tasks starts, the stock pool's starvation shape, the same 8 × 300 ms workload in the blocking pool at two widths, and the dedicated-thread shape |
-| `nix develop -c lake exe controls --runtime-blocking` | the blocking pool at the executor boundary (SC12): four 25 ms pool jobs, the pool threads they ran on, the carrier's own resume tids, whether the stock-priority task finished before the jobs, the outstanding-work peak and its final zero, both workers exited, and the timing; plus a `blockctl\|` control counting two on two distinct tids, rejecting the blocking-shaped order and rejecting a record claiming the stock pool was taken. **This scenario's clause is failing as of `f5e6c9d`**: the jobs do run on two non-carrier pool threads, but the witness reads `carrierDuringFirstJob=no` and `pendingPeak=0`, so the row's assertion does not hold — see the W4 section's note |
+| `nix develop -c lake exe controls --runtime-blocking` | the blocking pool at the executor boundary (SC12): four 25 ms pool jobs on two threads that are not the carrier, a carrier step falling strictly between the first job's start and its completion, a stock-priority task finishing before the jobs, the outstanding-work peak of four and its final zero with both workers exited, and the timing; plus a `blockctl\|` control counting two on two distinct tids, rejecting the blocking-shaped order and rejecting a record claiming the stock pool was taken |
 | `nix develop -c lake exe controls --runtime-shared` | the same counter under each design's required discipline, and what the stock pool loses without its lock |
 | `nix develop -c lake exe controls --runtime-sleep` | four 50 ms libuv timers on one carrier — 51 ms, against 200 ms for a serial sleep path |
 | `nix develop -c lake exe controls --runtime-net` | 16 concurrent echo connections on one carrier: the connection count, the server's thread count, whether the client shares it, the byte-identical replies, and the pool alongside |

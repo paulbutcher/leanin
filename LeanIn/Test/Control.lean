@@ -1549,6 +1549,71 @@ def executorQueue : IO UInt32 := do
     ++ s!"|remaining={st.held}")
   return 0
 
+/-- The decision kind's own name in SC21's record: the LIFO slot served it, the spent slot was cleared for the
+shared list, or neither — the ring. -/
+private def servedName : Sched.Served → String
+  | Sched.Served.slot    => "slot"
+  | Sched.Served.flushed => "flushed"
+  | Sched.Served.queue   => "queue"
+
+/-- **SC21 — a chain that keeps the LIFO slot occupied is interrupted at the allowance.**
+
+The take's decision refreshes the allowance when it was not a slot serve, so `lifoPolls` counts *consecutive*
+slot polls: a chain that keeps the slot filled is interrupted at the cap, while a chain that yields is not
+demoted. This mode reads that schedule off one chain that never yields. The root is locally `spawn`ed, so it
+takes the slot, and every link a take delivers is continued by locally `spawn`ing its successor, so the slot is
+re-filled before the next decision; one marker is submitted to the ring before the chain starts, because a
+flush has to have something of the ring's to serve.
+
+Every value is read out of the executor's own take at its own decision: `served` is which way each decision
+went, `observed` is the slot's occupant as that decision read it (`-` when it found the slot empty),
+`delivered` is the item each take returned, in order, and `flushes` counts the decisions that cleared a spent
+slot. `links` is this mode's chain length; `cap` is read from the pool's own allowance rather than stated here,
+and `held`, `taken` and `pendingAfter` are the composition's accounting — work still held, work taken, and the
+shared list's own length — so a flush that lost its item would show up in them. This mode writes no ring, slot
+or counter, and reads no clock towards any relation: `runUs` is printed and never asserted.
+
+Diagnostic: `lake exe controls --executor-lifo-turns`. -/
+def executorLifoTurns : IO UInt32 := do
+  -- The drive path's three identities: the chain is `first .. first + links - 1`, and the ring marker is
+  -- submitted before the chain starts.
+  let links : Nat := 12
+  let first : Nat := 400
+  let marker : Nat := 300
+  let e ← Sched.Executor.new Nat 256 1
+  let served ← IO.mkRef ([] : List String)
+  let observed ← IO.mkRef ([] : List String)
+  let delivered ← IO.mkRef ([] : List Nat)
+  let mut flushes : Nat := 0
+  let t0 ← IO.monoNanosNow
+  e.submit marker
+  e.spawn first
+  let mut go := true
+  while go do
+    let r ← e.takeReport
+    match r.item with
+    | none => go := false
+    | some x =>
+      served.modify (· ++ [servedName r.served])
+      observed.modify (· ++ [match r.observed with
+        | some o => toString o
+        | none   => "-"])
+      delivered.modify (· ++ [x])
+      if r.served == Sched.Served.flushed then flushes := flushes + 1
+      -- The chain's step: the link this take delivered is continued by locally spawning its successor, which
+      -- takes the slot again before the next decision. The last link and the ring marker have no successor.
+      if first ≤ x && x < first + links - 1 then e.spawn (x + 1)
+  let t1 ← IO.monoNanosNow
+  let st ← e.snapshot
+  let allowance := (st.workers[0]?.map (·.lifoCap)).getD 0
+  IO.println (s!"lifoturn|cap={allowance}|links={links}"
+    ++ s!"|served=[{String.intercalate "," (← served.get)}]"
+    ++ s!"|observed=[{String.intercalate "," (← observed.get)}]"
+    ++ s!"|delivered=[{String.intercalate "," ((← delivered.get).map toString)}]"
+    ++ s!"|flushes={flushes}|held={st.held}|taken={st.taken}|pendingAfter={st.inject.length}"
+    ++ s!"|runUs={(t1 - t0) / 1000}")
+  return 0
+
 /-- **W3's evidence: timers on our carriers.**
 
 `n` sleepers and one late spawn, with the *order* of the events doing the work a clock would otherwise be asked
@@ -4616,6 +4681,7 @@ def main (args : List String) : IO UInt32 := do
   | "--executor-trace" :: _ => return ← executorTrace
   | "--executor-park" :: _ => return ← executorPark 256
   | "--executor-queue" :: _ => return ← executorQueue
+  | "--executor-lifo-turns" :: _ => return ← executorLifoTurns
   | "--runtime-threads" :: _ => return ← runtimeThreads
   | "--runtime-bench" :: _ => return ← runtimeBench
   | "--runtime-tail" :: _ => return ← runtimeTail

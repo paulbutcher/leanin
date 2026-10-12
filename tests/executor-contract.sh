@@ -3809,6 +3809,404 @@ check_sc18() {
     "$slotStolen" "$thiefSlotAfter" "$parkedBefore" "$readyBefore" "$ranTid" "$spawnTid" "$inFlightAfter" "$remaining"
 }
 
+# --- the LIFO-turns expectation the SC21 check reads, derived from the pool model ————————————————————————
+# Every shape here is the model's, not an invocation's. The mode `--executor-lifo-turns` keeps one chain in
+# worker 0's LIFO slot: the root is locally spawned, and every take that returned a chain link is continued
+# by locally spawning that link's successor before the next decision, so the slot is re-filled before every
+# decision; one marker is submitted to the ring before the chain starts, so the allowance's first flush has
+# something of the ring's to serve.
+#
+# `cap` is `Pool.lifoCap`'s default, 3 (`LeanIn/Model/Pool.lean:63`), and `Model.Pool.take` polls the LIFO
+# slot while the allowance lasts and clears a still-occupied slot once it is spent (`:127-149`). The refresh
+# the bound's repair folds into the decision — `Model.Pool.tick`, taken whenever the decision was not the
+# slot's (`Multi.tick`, `LeanIn/Model/Multi.lean:496`) — is what makes the allowance count *consecutive*
+# slot polls. Composed in the order `Multi.takeStep_returns_if_present` names them (`:1193-1204`), the
+# decisions are:
+#
+#   decision 0 .. cap-1     `slot`    — the allowance is unspent: the slot serves the chain's first `cap`
+#                                       links
+#   decision cap            `flushed` — the allowance is spent with a link in the slot, so the decision
+#                                       clears it for the shared list and serves the ring, which holds the
+#                                       marker
+#   decision cap+1          `queue`   — the shared list serves the link the flush cleared, which is why the
+#                                       slot is empty at this decision and `observed` reads `-`
+#   then, repeated          `slot` cap times, `flushed`
+#
+# Every decision serves exactly one item, so the run records `links + 1` decisions: the chain's `links` links
+# and the marker, each exactly once. Each `cap + 1` links of the chain past the first block cost one flush,
+# so the flush count is `⌈(links - cap) / (cap + 1)⌉`, which for this derivation is the same integer as
+# `links / (cap + 1)`: it is computed here from the record's own `cap` and `links`, never typed.
+#
+# The delivered order is the model's too — the chain's links in order with the marker at index `cap`, where
+# the flush served it — and `observed` is the chain's links in order with `-` at index `cap + 1`, the one
+# decision that finds the slot emptied by the flush and not yet re-filled, because the mode re-fills the slot
+# only with a delivered link's successor and the marker is not a link.
+#
+# The mode's own identities are its stated chain and its stated submission: `first` 400, `marker` 300 and
+# `links` 12, with `pushed = links + 1` because the mode submits the marker and locally spawns the chain's
+# root and every successor. `links` is read back from the record and checked against these values by the
+# check, so a run with another chain is the clause's own failure rather than a silent pass.
+sc21_expectation() {
+  local i k
+  sc21_cap=3
+  sc21_links=12
+  sc21_first=400
+  sc21_marker=300
+  sc21_pushed=$((sc21_links + 1))
+  # ⌈(links - cap) / (cap + 1)⌉, an integer ceiling written out: `cap + 1` is one block of `cap` slot serves
+  # and the flush that follows them, and the chain's first block is the one the marker is served in.
+  sc21_flushes=$(( (sc21_links - sc21_cap + (sc21_cap + 1) - 1) / (sc21_cap + 1) ))
+  sc21_served=()
+  for ((i = 0; i < sc21_cap; i++)); do sc21_served+=(slot); done
+  sc21_served+=(flushed queue)
+  for ((k = 1; k < sc21_flushes; k++)); do
+    for ((i = 0; i < sc21_cap; i++)); do sc21_served+=(slot); done
+    sc21_served+=(flushed)
+  done
+  sc21_observed=()
+  sc21_delivered=()
+  for ((i = 0; i < sc21_links; i++)); do
+    [ "$i" -eq "$sc21_cap" ] && sc21_delivered+=("$sc21_marker")
+    [ "$i" -eq "$((sc21_cap + 1))" ] && sc21_observed+=(-)
+    sc21_delivered+=("$((sc21_first + i))")
+    sc21_observed+=("$((sc21_first + i))")
+  done
+  [ "${#sc21_served[@]}" -eq "$((sc21_links + 1))" ] && [ "${#sc21_observed[@]}" -eq "$((sc21_links + 1))" ] ||
+    setup_error "the SC21 expectation is not the modelled run's length" \
+      "served=${#sc21_served[@]} observed=${#sc21_observed[@]} links=$sc21_links" \
+      "a fixture defect, not the SC21 Then"
+}
+
+# sc21_list <bracketed field> — the field's entries, one per line. Exits nonzero when the field is not a
+# bracketed comma-separated list or carries an empty entry, so a dropped, doubled or edge separator is
+# rejected before any entry is compared — the shape `id_sequence_is` and `id_multiset_is` read their own
+# fields with.
+sc21_list() {
+  local list="$1" inner e
+  case "$list" in
+  '['*']')
+    inner="${list#"["}"
+    inner="${inner%"]"}"
+    ;;
+  *) return 1 ;;
+  esac
+  case "$inner" in '' | ',' | ','* | *',' | *',,'*) return 1 ;; esac
+  local IFS=','
+  for e in $inner; do printf '%s\n' "$e"; done
+}
+
+# sc21_cap_ok <served> <observed> — SC21 clause one: **the cap bites.** Every maximal run of consecutive
+# `slot` decisions is exactly the record's `cap` long and is immediately followed by a `flushed`, a `queue`
+# never interrupts a run, and the sequence ends on a flush rather than on a run of polls. Every `flushed`
+# decision also reports, in `observed`, the occupant it cleared: a chain identity, never `-` (which is the
+# record's spelling of an empty slot, and an empty slot is a `queue` decision rather than a flush) and never
+# the ring's marker, which lives in the ring and not in the slot.
+sc21_cap_ok() {
+  local served="$1" observed="$2" sv_out obs_out
+  local -a sv obs
+  sv_out="$(sc21_list "$served")" || return 1
+  mapfile -t sv <<<"$sv_out"
+  obs_out="$(sc21_list "$observed")" || return 1
+  mapfile -t obs <<<"$obs_out"
+  [ "${#sv[@]}" -gt 0 ] || return 1
+  [ "${#sv[@]}" -eq "${#obs[@]}" ] || return 1
+  local i v run=0
+  for ((i = 0; i < ${#sv[@]}; i++)); do
+    v="${sv[$i]}"
+    case "$v" in
+    slot)
+      run=$((run + 1))
+      continue
+      ;;
+    flushed)
+      [ "$run" -eq "$sc21_cap" ] || return 1
+      run=0
+      case "${obs[$i]}" in '' | *[!0-9]*) return 1 ;; esac
+      [ "${obs[$i]}" -ge "$sc21_first" ] || return 1
+      [ "${obs[$i]}" -lt "$((sc21_first + sc21_links))" ] || return 1
+      ;;
+    queue) [ "$run" -eq 0 ] || return 1 ;;
+    *) return 1 ;;
+    esac
+  done
+  [ "$run" -eq 0 ]
+}
+
+# sc21_refresh_ok <served> <observed> — SC21 clause two: **the allowance is refreshed by any decision that
+# was not a slot serve.** After a `flushed`, the next decision that finds the slot occupied is a `slot`, not
+# a second flush of the same spent allowance. The slot's occupancy at each decision is the record's own
+# `observed`, so the relation is read from two named fields and not from a schedule the check assumes. This
+# is the conjunct that tells the repaired schedule from both spellings production has today: the driver's,
+# where the allowance is never refreshed inside the take and the flush repeats, and the carrier's, where it
+# is refreshed inside every take and no flush ever happens.
+sc21_refresh_ok() {
+  local served="$1" observed="$2" sv_out obs_out
+  local -a sv obs
+  sv_out="$(sc21_list "$served")" || return 1
+  mapfile -t sv <<<"$sv_out"
+  obs_out="$(sc21_list "$observed")" || return 1
+  mapfile -t obs <<<"$obs_out"
+  [ "${#sv[@]}" -eq "${#obs[@]}" ] || return 1
+  local i j
+  for ((i = 0; i < ${#sv[@]}; i++)); do
+    [ "${sv[$i]}" = "flushed" ] || continue
+    for ((j = i + 1; j < ${#sv[@]}; j++)); do
+      [ "${obs[$j]}" = "-" ] && continue
+      [ "${sv[$j]}" = "slot" ] || return 1
+      break
+    done
+  done
+  return 0
+}
+
+# sc21_move_ok <delivered> — SC21 clause three, first half: **the flush is a move, not a loss.** `delivered`
+# is read as a multiset, and must be exactly the chain's `links` links and the marker, each once: the link a
+# flush cleared is delivered — by that decision or by the shared list's next one — so a flush that dropped it,
+# or a run that served one identity twice, fails here.
+sc21_move_ok() {
+  local delivered="$1" i
+  local -a want=()
+  for ((i = 0; i < sc21_links; i++)); do want+=("$((sc21_first + i))"); done
+  want+=("$sc21_marker")
+  id_multiset_is "$delivered" "${want[@]}"
+}
+
+# sc21_accounting_ok <flushes> <held> <taken> <pendingAfter> — SC21 clause three, second half: the flush
+# count is the derived one, one flush per `cap + 1` links, and the composition's own accounting is intact —
+# nothing held and nothing left in the shared list once the chain has run, with the mode's `links + 1`
+# submissions held or taken. A run that cleared a spent slot more often than the bound allows, or that left
+# the cleared link behind in the shared list, fails here.
+sc21_accounting_ok() {
+  local flushes="$1" held="$2" taken="$3" pending="$4" v
+  for v in "$flushes" "$held" "$taken" "$pending"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  [ "$flushes" -eq "$sc21_flushes" ] || return 1
+  [ "$held" -eq 0 ] || return 1
+  [ "$pending" -eq 0 ] || return 1
+  [ "$((held + taken))" -eq "$sc21_pushed" ]
+}
+
+# sc21_ring_ok <served> <delivered> — SC21 clause four: **the flush serves the ring.** The marker submitted
+# before the chain started is served at index `cap` — the first flush — and the decision that reads `flushed`
+# there is the one that served it, so it is the allowance's clear that put the ring's own item on the wire
+# rather than a decision the chain's own links would have taken anyway.
+sc21_ring_ok() {
+  local served="$1" delivered="$2" sv_out dl_out
+  local -a sv dl
+  sv_out="$(sc21_list "$served")" || return 1
+  mapfile -t sv <<<"$sv_out"
+  dl_out="$(sc21_list "$delivered")" || return 1
+  mapfile -t dl <<<"$dl_out"
+  [ "${#sv[@]}" -eq "${#dl[@]}" ] || return 1
+  [ "${dl[$sc21_cap]:-}" = "$sc21_marker" ] || return 1
+  [ "${sv[$sc21_cap]:-}" = "flushed" ]
+}
+
+# sc21_ok <record> — SC21's four clauses as one detector, so the near-miss controls below exercise the same
+# assertions the check reads rather than lookalikes: the cap bites, the allowance is refreshed, the flush is
+# a move and the flush serves the ring. Every operand is read out of this record's own named field.
+sc21_ok() {
+  local rec="$1" sv obs dl fl hd tk pa
+  sv="$(field served "$rec")" || return 1
+  obs="$(field observed "$rec")" || return 1
+  dl="$(field delivered "$rec")" || return 1
+  fl="$(field flushes "$rec")" || return 1
+  hd="$(field held "$rec")" || return 1
+  tk="$(field taken "$rec")" || return 1
+  pa="$(field pendingAfter "$rec")" || return 1
+  sc21_cap_ok "$sv" "$obs" || return 1
+  sc21_refresh_ok "$sv" "$obs" || return 1
+  sc21_move_ok "$dl" || return 1
+  sc21_accounting_ok "$fl" "$hd" "$tk" "$pa" || return 1
+  sc21_ring_ok "$sv" "$dl"
+}
+
+# sc21_record <served> <observed> <delivered> <flushes> <held> <taken> <pendingAfter> — a `lifoturn|` record
+# in the mode's own field order, built from the expectation's values (and, for a control, from one field's near
+# miss), so every control record is written from the record syntax and the expectation alone.
+sc21_record() {
+  printf 'lifoturn|cap=%s|links=%s|served=%s|observed=%s|delivered=%s|flushes=%s|held=%s|taken=%s|pendingAfter=%s|runUs=1' \
+    "$sc21_cap" "$sc21_links" "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+}
+
+# --- the LIFO-turns detectors' own control, run inside the SC21 invocation ————————————————————————————————
+# The bound's clause is only as strong as the five detectors it is read through, so they are exercised here
+# on the expectation they were built from and on the near misses they must reject. The first two are the two
+# schedules production has today, both derived by driving the model with that schedule: the **driver's**
+# spelling, whose allowance is never refreshed inside the take, so every decision after the cap clears a slot
+# again and the flush repeats; and the **carrier's**, which refreshes inside every take, so the slot serves
+# the whole chain and no flush ever happens. Then a fourth poll in place of the flush, a flush that found the
+# slot empty, a flush whose cleared link is missing from `delivered`, a marker served by a decision that was
+# not the flush's, and one flush more than the chain's length allows. Every near miss is built from the record
+# syntax and the expectation alone, never from the executable's receipts, and a control that does not hold is
+# a fixture defect reported as a setup error, separately from the SC21 Then.
+check_lifo_turns_detector() {
+  local expected driver_flushes=0 i v
+  local -a names=() near=()
+  local -a driver_served=() carrier_served=() carrier_observed=() carrier_delivered=()
+  local -a fourth=() empty_slot=() dropped=() reshuffled=()
+
+  expected="$(sc21_record "$(bracketed "${sc21_served[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${sc21_delivered[@]}")" "$sc21_flushes" 0 "$sc21_pushed" 0)"
+  sc21_ok "$expected" ||
+    setup_error "SC21: the LIFO-turns detector rejected the derived bounded sequence it must accept" \
+      "record: [$expected]" \
+      "the detectors' own control, not the SC21 Then"
+  printf 'SC21 control: accepted the derived %d-decision bounded sequence served=%s\n' \
+    "${#sc21_served[@]}" "$(bracketed "${sc21_served[@]}")"
+
+  # The driver's spelling: the first block's decisions are the model's, and every decision after them clears
+  # the spent allowance again because nothing refreshed it.
+  driver_served=("${sc21_served[@]:0:$((sc21_cap + 2))}")
+  for ((i = 0; i < ${#sc21_served[@]} - sc21_cap - 2; i++)); do driver_served+=(flushed); done
+  for v in "${driver_served[@]}"; do
+    if [ "$v" = "flushed" ]; then driver_flushes=$((driver_flushes + 1)); fi
+  done
+  names+=("the pre-fix driver spelling, whose flush repeats because the allowance is never refreshed")
+  near+=("$(sc21_record "$(bracketed "${driver_served[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${sc21_delivered[@]}")" "$driver_flushes" 0 "$sc21_pushed" 0)")
+
+  # The carrier's spelling: the allowance is refreshed inside every take, so the slot serves the whole chain
+  # and the marker is served last, by the shared list, with no flush at all.
+  for ((i = 0; i < sc21_links; i++)); do
+    carrier_served+=(slot)
+    carrier_observed+=("$((sc21_first + i))")
+    carrier_delivered+=("$((sc21_first + i))")
+  done
+  carrier_served+=(queue)
+  carrier_observed+=(-)
+  carrier_delivered+=("$sc21_marker")
+  names+=("the pre-fix carrier spelling, which refreshes inside every take and never flushes")
+  near+=("$(sc21_record "$(bracketed "${carrier_served[@]}")" "$(bracketed "${carrier_observed[@]}")" \
+    "$(bracketed "${carrier_delivered[@]}")" 0 0 "$sc21_pushed" 0)")
+
+  fourth=("${sc21_served[@]}")
+  fourth[sc21_cap]=slot
+  names+=("a fourth slot poll in place of the flush")
+  near+=("$(sc21_record "$(bracketed "${fourth[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${sc21_delivered[@]}")" "$sc21_flushes" 0 "$sc21_pushed" 0)")
+
+  empty_slot=("${sc21_observed[@]}")
+  empty_slot[sc21_cap]='-'
+  names+=("a flush that reports an empty slot rather than the occupant it cleared")
+  near+=("$(sc21_record "$(bracketed "${sc21_served[@]}")" "$(bracketed "${empty_slot[@]}")" \
+    "$(bracketed "${sc21_delivered[@]}")" "$sc21_flushes" 0 "$sc21_pushed" 0)")
+
+  dropped=("${sc21_delivered[@]}")
+  dropped[$((sc21_cap + 1))]="$sc21_marker"
+  names+=("a flush whose cleared link is missing from delivered, the marker served twice instead")
+  near+=("$(sc21_record "$(bracketed "${sc21_served[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${dropped[@]}")" "$sc21_flushes" 0 "$sc21_pushed" 0)")
+
+  reshuffled=("${sc21_delivered[@]}")
+  reshuffled[0]="${sc21_delivered[$sc21_cap]}"
+  reshuffled[sc21_cap]="${sc21_delivered[0]}"
+  names+=("the ring's marker served by a decision that is not the flush's")
+  near+=("$(sc21_record "$(bracketed "${sc21_served[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${reshuffled[@]}")" "$sc21_flushes" 0 "$sc21_pushed" 0)")
+
+  names+=("one flush more than the chain's length allows")
+  near+=("$(sc21_record "$(bracketed "${sc21_served[@]}")" "$(bracketed "${sc21_observed[@]}")" \
+    "$(bracketed "${sc21_delivered[@]}")" "$((sc21_flushes + 1))" 0 "$sc21_pushed" 0)")
+
+  for i in "${!near[@]}"; do
+    if sc21_ok "${near[$i]}"; then
+      setup_error "SC21: the LIFO-turns detector accepted a near miss it must reject: ${names[$i]}" \
+        "record: [${near[$i]}]" \
+        "the detectors' own control, not the SC21 Then"
+    fi
+    printf 'SC21 control: rejected %s\n' "${names[$i]}"
+  done
+}
+
+# --- SC21 — a chain that keeps the LIFO slot occupied is interrupted at the allowance, and the allowance is
+# refreshed by the next decision that is not a slot serve ————————————————————————————————————————————————————
+check_sc21() {
+  local out status line
+  local cap links served observed delivered flushes held taken pending_after run_us l
+  local -a records=()
+  local -a then_lines=()
+
+  sc21_expectation
+  check_lifo_turns_detector
+
+  out="$(bounded lake exe controls --executor-lifo-turns)"
+  status=$?
+  check_status SC21 "$status" "lake exe controls --executor-lifo-turns"
+  require_header "$out"
+
+  mapfile -t records < <(grep '^lifoturn|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC21 Then: the LIFO slot's turns not observed exactly once" \
+      "expected exactly one lifoturn| record, saw ${#records[@]}"
+  line="${records[0]}"
+
+  record_is "${line#lifoturn|}" cap links served observed delivered flushes held taken pendingAfter runUs ||
+    fail "SC21 Then: the LIFO slot's turns not observed exactly once" \
+      "the record is not exactly cap/links/served/observed/delivered/flushes/held/taken/pendingAfter/runUs with nonempty values: [$line]"
+
+  bound_field cap cap "$line" "SC21 Then"
+  bound_field links links "$line" "SC21 Then"
+  bound_field served served "$line" "SC21 Then"
+  bound_field observed observed "$line" "SC21 Then"
+  bound_field delivered delivered "$line" "SC21 Then"
+  bound_field flushes flushes "$line" "SC21 Then"
+  bound_field held held "$line" "SC21 Then"
+  bound_field taken taken "$line" "SC21 Then"
+  bound_field pending_after pendingAfter "$line" "SC21 Then"
+  bound_field run_us runUs "$line" "SC21 Then"
+
+  # The mode's own stated reads, and the premise the clause is stated for: another allowance or another chain
+  # length is this clause's own failure rather than a silent pass, and a chain shorter than two blocks could
+  # not have been interrupted twice.
+  [ "$cap" = "$sc21_cap" ] ||
+    then_lines+=("SC21 Then: the run's allowance is not the mode's stated $sc21_cap
+  observed: cap=$cap")
+  [ "$links" = "$sc21_links" ] ||
+    then_lines+=("SC21 Then: the run's chain is not the mode's stated $sc21_links links
+  observed: links=$links")
+  [ "$links" -gt "$((2 * (cap + 1)))" ] ||
+    then_lines+=("SC21 Then: the chain is too short for the bound to bite twice
+  observed: links=$links cap=$cap")
+
+  # Clause one — the cap bites. Clause two — the allowance is refreshed by a decision that was not a slot
+  # serve. Clause three, first half — the flush is a move, not a loss; second half — the flush count is the
+  # derived one and the accounting is intact. Clause four — the flush serves the ring. Each is evaluated on
+  # its own named fields, in clause order, so the failing clause is named rather than described.
+  sc21_cap_ok "$served" "$observed" ||
+    then_lines+=("SC21 Then: the cap did not bite — the slot decisions are not runs of exactly cap=$cap followed by a flush
+  observed: served=$served observed=$observed
+  expected: served=$(bracketed "${sc21_served[@]}")")
+  sc21_refresh_ok "$served" "$observed" ||
+    then_lines+=("SC21 Then: the allowance was not refreshed by the decisions between — after a flush, the next decision that found the slot occupied flushed it again rather than polling it
+  observed: served=$served observed=$observed")
+  sc21_move_ok "$delivered" ||
+    then_lines+=("SC21 Then: a flush lost the link it cleared, or an identity was served twice
+  observed: delivered=$delivered
+  expected: $(bracketed "${sc21_delivered[@]}")")
+  sc21_accounting_ok "$flushes" "$held" "$taken" "$pending_after" ||
+    then_lines+=("SC21 Then: the flush count is not the derived one, or the accounting is not intact
+  observed: flushes=$flushes held=$held taken=$taken pendingAfter=$pending_after
+  expected: flushes=$sc21_flushes held=0 taken=$sc21_pushed pendingAfter=0")
+  [ "$flushes" -ge 2 ] ||
+    then_lines+=("SC21 Then: the run flushed fewer than twice, so the bound held vacuously
+  observed: flushes=$flushes links=$links cap=$cap")
+  sc21_ring_ok "$served" "$delivered" ||
+    then_lines+=("SC21 Then: the ring's marker was not served by the flush
+  observed: served=$served delivered=$delivered
+  expected: the marker $sc21_marker at index cap=$cap, served by a flushed decision
+  note: without this clause the allowance's clear would still be a schedule that never serves the ring")
+
+  if [ "${#then_lines[@]}" -ne 0 ]; then
+    for l in "${then_lines[@]}"; do printf '%s\n' "$l" >&2; done
+    exit 1
+  fi
+
+  printf 'SC21 ok: cap=%s links=%s served=%s observed=%s delivered=%s flushes=%s held=%s taken=%s pendingAfter=%s\n' \
+    "$cap" "$links" "$served" "$observed" "$delivered" "$flushes" "$held" "$taken" "$pending_after"
+}
+
 case "${1:-}" in
 SC1) check_sc1 ;;
 SC2) check_sc2 ;;
@@ -3830,8 +4228,9 @@ SC17) check_sc17 ;;
 SC18) check_sc18 ;;
 SC19) check_sc19 ;;
 SC20) check_sc20 ;;
+SC21) check_sc21 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21\n' >&2
   exit 2
   ;;
 esac

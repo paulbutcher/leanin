@@ -598,10 +598,24 @@ convention (D19). The three model obligations are re-discharged in `Model/Multi.
 (`reachable_live`/`reachable_consistent`/`reachable_bound`, each with a breaking control, the single-carrier
 statement a corollary through `toSched`), and their `#print axioms` lines name nothing beyond
 `propext`/`Quot.sound`. The queue's refinement is stated at the pair (`toModel_toRing`/`toModel_submit`/
-`toModel_spawn`). The rows and their reading are in `docs/PERFORMANCE.md` §3.5; **the second measurement
-condition fails against the criterion** — the chain-shaped round trip is ~1.4× the base's same-session figure
-where the criterion is parity or better — and the take path's repair and the residual are recorded there and in
-D19 rather than absorbed.
+`toModel_spawn`). The rows and their reading are in `docs/PERFORMANCE.md` §3.5. **The take path's repair, the
+regression it introduced, and the residual — the sequence, not a summary of it.** The chain-shaped round trip
+was ~1.4× the base's same-session figure where the criterion is parity or better, and the repair that bought it
+— refreshing the LIFO allowance inside the take — weakened the allowance to *per-chain*: a spawn chain kept the
+slot for as long as it refilled it. That regressed the blocking pool's isolation, where four jobs' submission
+steps sat in the ring behind a heartbeat chain, and **SC12 failed from `9a8386f`, red 3/3 through `f5e6c9d`**,
+on "a blocking job did not run off the carrier, on a blocking pool, without stalling the executor" — the
+witness reading `carrierDuringFirstJob=no` and `pendingPeak=0` while the jobs did run on two non-carrier pool
+threads. The fix restores the per-tick bound by folding the refresh into `Pool.takeReport` with `lifoPolls`
+counting consecutive slot polls; **SC12 is green again** and SC21 states the bound. On the two condition-2
+instruments, re-measured interleaved with the take path's refresh removed as arm C and the base as arm B:
+`--runtime-ops` puts the fixed build **below** the pre-repair shape (round trip 2346 against 2510 ns;
+spawn+take 435 against 705), which is the criterion-1 direction, while the chain row's A-vs-C half is
+**unmeasured** — its first pair read at mismatched carrier counts and its re-measurement's "C" arm was a tree
+byte-identical to the base, so no figure is claimed for it and the row is recorded as measured against B. The
+chain criterion itself is a recorded miss (A 8.07–8.52 against B's same-session 9.00–11.26, the fixed build
+flushing 1001 times over the run against B's 1), with its native-pool advantage intact and three levers named
+for the user rather than pulled; §3.5 carries the attribution.
 
 ### W17 — A bound on work admitted from outside the runtime
 

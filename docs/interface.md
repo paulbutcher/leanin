@@ -52,7 +52,8 @@ So the implementation-side structure is:
 ```
 WorkerQueue α  =  { ring : BoundedRing α   -- FIFO, capacity 256, overflow to inject
                   , lifo : Option α        -- owner-local, unsynchronised, checked first
-                  , lifoPolls : Nat        -- reset each tick, capped at 3
+                  , lifoPolls : Nat        -- reset by any decision that was not a slot serve,
+                                           --   capped at the slot's consecutive polls
                   }
 ```
 
@@ -138,7 +139,10 @@ Three obligations, each traceable to an axiom, and each re-discharged over this 
   before returning; `stealInto` moves an item without losing it from the count.
 - **Bounded work per tick** — the coop budget, so one task cannot monopolise a worker. Not a
   correctness property; it is a *policy* with a stated bound, and the LIFO cap is the same kind of
-  thing. The allowance is per worker, and a spent allowance's slot item is flushed rather than stranded.
+  thing. The allowance is per worker and bounds *consecutive* slot polls: after `lifoCap` slot serves
+  the next decision clears the slot for the shared inject and takes from the ring, and any decision
+  that was not a slot serve refreshes the allowance — so a chain that keeps the slot occupied cannot
+  keep the ring from being served, and a chain that yields is not demoted.
 
 Two details that are policy, not mechanism, and are separately testable: the LIFO cap of 3, and the
 inject check interval.
@@ -423,6 +427,7 @@ stated **at the pair** — a pool and the shared list together — because one p
 | `Model.Pool.spawn inj x` | `Sched.Pool.spawn x` | `toModel_spawn` — a free slot holds the new task and leaves the inject alone; an occupied slot displaces through `toRing` on both sides |
 | `Multi.pushLocal` / `pushShared` / `flushLocal` | `Executor.spawnLocalRaw` / `pushItems` / the take's flush arm | argued per operation; `pushLocal` is owner-only by construction (a worker writes only its own pool and parks only after finding it empty — `ZeroParked`); every off-owner push takes `pushShared`, whose unpark is inside the push's own section |
 | `Multi.stealInto i j` | `Executor.stealInto i j` | one element, ring only, `held` −1 and `taken` +1 — the thief's own queue is untouched, which is why the take holds one pool lock |
+| `Multi.takeLocal` / `Multi.tick` | `Sched.Pool.takeReport` (the decision, with the allowance's refresh folded in) | the take is the decision and the allowance's refresh in one pool section — `takeLocal` then `tick` unless the slot served, a schedule `Multi`'s transition set already admits (`Model/Multi.lean:780`); `takeReport_lifoPolls` and `takeReport_bounded` state the composed step's allowance, and the carrier fixes which schedule runs |
 | `Multi.reachable_live` / `reachable_consistent` / `reachable_bound` | the park/unpark protocol's one cell, the drain, the per-worker allowance | the model theorems' `#print axioms` lines name nothing beyond `propext`/`Quot.sound`; `reachable_live` rides on `ZeroParked` and `InjectWatched`, and its breaking control is the shared push without its unpark |
 
 `SC18` is the executable correspondence test for the composition (the carriers, the thief, a wake from a

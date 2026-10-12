@@ -412,10 +412,12 @@ def Executor.takeFor (e : Executor α cap) (i : Nat) : IO (Option α) := do
   let item ← (e.cell i).atomically do
     let p ← get
     set e.poolPlaceholder
-    -- A take is a turn, and the allowance is per turn: refresh it in this same transaction, so the LIFO slot
-    -- keeps serving the chain that lives in it rather than being disabled after three polls for the rest of
-    -- the run. Doing it here rather than in a separate `tick` section keeps the take at one pool section.
-    let rep := (Pool.tick p).takeReport
+    -- The pool's decision carries the allowance's refresh: a take the slot served spends it, and any other
+    -- decision — a flush, or a ring take — refreshes it, so the slot's *consecutive* polls are bounded at
+    -- `lifoCap` while a chain that yields is never demoted. Folding the refresh into `takeReport` rather than
+    -- ticking here is what makes this spelling and the driver's `takeReport` read one transaction, so the
+    -- two cannot disagree about the allowance.
+    let rep := p.takeReport
     set rep.pool
     if !rep.flushed.isEmpty then e.pushItems rep.flushed
     return rep.item
@@ -583,7 +585,8 @@ def Executor.tick (e : Executor α cap) : IO Unit := e.tickFor 0
 
 The driver's take is the carrier's: the pool's own decision first (slot, flush, ring) and then the shared
 list, so a `queue`-served item is whichever of the two held it. The record's `observed`/`served` come from
-the pool's decision, which is the only place the allowance is observable. -/
+the pool's decision, which is the only place the allowance is observable. The decision carries the allowance's
+refresh, so this spelling and the carrier's `takeFor` read one transaction and one bound. -/
 def Executor.takeReport (e : Executor α cap) : IO (TakeReport α cap) := do
   let rep ← (e.cell 0).atomically do
     let p ← get

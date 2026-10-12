@@ -2,8 +2,9 @@
 
 Settled decisions and the evidence each rests on. Evidence anchors are in
 [`lean-scheduler.md`](lean-scheduler.md) (the current runtime), [`tokio-map.md`](tokio-map.md) (what
-we are taking) and [`evidence.md`](evidence.md) (measurements). Two decisions are still open; they are
-at the bottom and nothing downstream should be treated as fixed until they close.
+we are taking), [`evidence.md`](evidence.md) (the claim-to-source register) and
+[`PERFORMANCE.md`](PERFORMANCE.md) (the measured rows the cost records cite). No decision is open: each
+entry states its own limits, and the ones D20 and D21 leave are named in them.
 
 ______________________________________________________________________
 
@@ -962,11 +963,15 @@ served take is the like-for-like row against the single-cell design. It also pay
 allowance is spent with the slot occupied: the flush moves the item to the shared list and the take fetches it
 back. Since nothing refreshed the allowance, that arm ran on *every* take after three (the LIFO slot is
 otherwise dead for the rest of the run), which is why the take row and the chain row regressed against the
-single-cell baseline; the repair refreshes the allowance **inside the take's own transaction**
-(`(Pool.tick p).takeReport`), so the spent-allowance arm runs once per allowance rather than on every take,
-and the extra section is not paid. The remaining gap to the D4-single-cell baseline is the split's own
-per-operation overhead, and the second measurement condition is recorded with that reading in
-[`PERFORMANCE.md`](PERFORMANCE.md) §3.5 rather than absorbed.
+single-cell baseline. The first repair refreshed the allowance **inside every take's own transaction**
+(`(Pool.tick p).takeReport`), which took that arm off the hot path but gave the allowance away: it reset on each
+decision, so a chain that re-filled the slot was served without bound and the cap never bit. **D21 replaces that
+repair** — the decision refreshes the allowance only when it did not serve the slot — so the spent-allowance arm
+runs once per *allowance of consecutive slot polls* rather than once per take, the cap bounds a chain again, and
+the extra section is not paid. The remaining gap to the D4-single-cell baseline is the split's own
+per-operation overhead, and the second measurement condition is recorded in
+[`PERFORMANCE.md`](PERFORMANCE.md) §3.5 as D21 leaves it — measured, with the price the bound adds stated there
+rather than absorbed.
 
 ### D20 — The service driver's read bound is per read and silent on expiry; a handler's failure is answered.
 
@@ -1039,6 +1044,64 @@ in the record without either becoming a claim about `withTimeout`.
 
 ______________________________________________________________________
 
+### D21 — The LIFO allowance bounds consecutive slot polls, and the take's own decision refreshes it.
+
+**Decision.** A carrier's take refreshes the allowance **unless the slot served it**: `Pool.takeReport`'s returned
+pool carries `lifoPolls := p.lifoPolls + 1` on a `.slot` decision and `lifoPolls := 0` on `.flushed` and `.queue`,
+so the allowance counts **consecutive slot polls** and the cap bounds a chain rather than a run. The refresh sits
+in the decision rather than at a call site because `Pool.takeReport` is the one function both take spellings call
+— the carrier's (`Executor.takeFor`) and the driver's record path (`Executor.takeReport`) — and the one place
+that knows which way the take went, so the two cannot disagree about the allowance. `Pool.tick` still means "the
+allowance refreshes", `Executor.tickFor`/`tick` are unchanged, and the three laws beside the count companions
+state the decision's own behaviour: `takeReport_lifoPolls` (the law above), `takeReport_flushes_when_spent` (a
+spent allowance with the slot occupied clears it for the shared inject and reports the occupant as the decision
+observed it) and `takeReport_bounded`.
+
+**What it restores, and what it does not promise.** `interface.md` §5's allowance is now what it says: per
+carrier, bounding *consecutive* slot polls, with a spent allowance's occupant flushed rather than stranded — so a
+chain that keeps the slot occupied cannot keep the ring from being served, and a chain that yields (a spawn/await
+round trip) is not demoted. The model is untouched, and that is the point: `Model.Pool.take` is the decision and
+`Model.Pool.tick` the refresh, the transition relation admits a tick at any point, and `reachable_bound` is an
+invariant over states — this decision fixes the *schedule* of the refresh, not the invariant. Nothing here
+promises that a task runs: §5's no-fairness bullet and A6 stand, and what is bounded is a sequence of decisions,
+not a step's duration or a wait.
+
+**The two shapes rejected.** (i) **No refresh at all** — the take never ticking, the state before `9a8386f`: the
+allowance accumulated against the whole run, the slot was dead after three polls, and the spent-allowance arm ran
+on every later take, moving an item to the shared list and fetching it back. D19's take-path paragraph records
+that regression. (ii) **Refresh on every take** — D19's first repair, `(Pool.tick p).takeReport`: the allowance
+reset on each decision, so a chain that re-filled the slot was served forever, the cap never bit, and a carrier
+could not reach its own ring; SC12 is the scenario that reads it, and this decision replaces that repair rather
+than adding to it.
+
+**What it costs, and the condition it misses.** The round trip against the take-refresh removal (the shape before
+`9a8386f`, a scratch export outside the repository) is **2346 ns against 2510** and, on `spawn+take`, **435 ns
+against 705** — the interleaved run that stands; an earlier session read 3114 against 4149 and 709 against 1249,
+and its raw log is no longer on disk, so those figures are quoted as reported rather than re-inspectable. Against
+the immediately preceding tree the price is real and paid deliberately: `--runtime-ops` reads it above that tree
+(+27% round trip, +31% `spawn+take`), and the chain row's ratio falls from the base's same-session **9.00–11.26**
+to **8.07–8.52**, both at `chainCarriers = 1`, with the flush counts over a 2000-link chain reading **1001**
+against **1** (and **3997** for the take-refresh removal) — one flush per two links, because a spawn/await link's
+continuation takes the same slot route as its spawn. **W8's second measurement condition, read as its definition
+reads, is therefore not met**, and it is recorded here rather than re-baselined: what survives is the advantage
+over the native pool (8.07–8.52 against the same session's native row, nowhere near the native band), and the
+chain row's ratio against the take-refresh removal is **unmeasured** — the session's third arm was byte-identical
+to the second, so no figure is claimed for it. The three levers a reader might reach for are each their own
+item, and this record takes none of them: raising the cap weakens the bound; bounding by *steps* rather than
+decisions is a different policy; and D19's route question — rebinding each item's route at fire time — would take
+an await continuation off the slot, at the cost this record's chain row now measures.
+
+**Evidence.** SC21, whose expectation is derived from the model and the schedule above, reads field for field the
+derived decision sequence (`slot, slot, slot, flushed, queue, slot, slot, slot, flushed, slot, slot, slot,
+flushed`, three flushes); SC5 is byte-identical, which is the guard that the explicit tick still refreshes; SC12
+is green where it read the cap's absence; the two take spellings read one transaction; `LeanIn/Model` is
+untouched; and the three laws' `#print axioms` lines name nothing beyond `propext`/`Quot.sound`.
+
+______________________________________________________________________
+
 ## Open
 
-None. All decisions are closed; D9's successor is D19.
+No decision is open: D19's successor is D20, and D21 is this register's last entry. The limits those records
+leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s uncancelled loser on
+either side, and the second measurement condition as D21 reads it — are stated in their own entries rather than
+here.

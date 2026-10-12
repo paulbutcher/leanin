@@ -41,13 +41,14 @@ structure Pool (α : Type) (cap : Nat) where
   ring      : Ring α cap
   /-- The one-slot LIFO buffer. Owner-local, never stolen. -/
   lifo      : Option α := none
-  /-- LIFO polls used in the current tick. -/
+  /-- LIFO polls used in the current tick: the *consecutive* slot polls since the allowance was last
+  refreshed. -/
   lifoPolls : Nat := 0
   /-- Total submitted. -/
   pushed    : Nat := 0
   /-- Total taken, by owner or thief. -/
   taken     : Nat := 0
-  /-- LIFO polls allowed per tick. 3 in Tokio. -/
+  /-- The most consecutive slot polls allowed; 3 in Tokio (`MAX_LIFO_POLLS_PER_TICK`). -/
   lifoCap   : Nat := 3
 deriving Inhabited, Repr
 
@@ -124,28 +125,42 @@ structure TakeReport (α : Type) (cap : Nat) where
   flush. -/
   flushed  : List α
 
-/-- The owner's take, with the decision it made.
+/-- A tick: the LIFO allowance refreshes. This is the executor's T4 operation and SC5's explicit refresh; the
+take's own refresh is folded into `takeReport` below, which uses this. -/
+def Pool.tick (p : Pool α cap) : Pool α cap := { p with lifoPolls := 0 }
 
-The LIFO slot is preferred while the tick's allowance lasts; **when the allowance runs out with a task still
-in the slot, the slot is cleared for the shared inject before the ring is consulted**, so the allowance cannot
-strand it. -/
+/-- The owner's take, with the decision it made — **and the allowance's refresh, which the decision
+carries**.
+
+The LIFO slot is preferred while its allowance lasts; **when the allowance runs out with a task still in the
+slot, the slot is cleared for the shared inject before the ring is consulted**, so the allowance cannot strand
+it. The allowance counts *consecutive* slot polls: a take the slot served spends it, and any other decision —
+a flush, or a ring take — refreshes it, so a chain that keeps the slot occupied is interrupted at `lifoCap`
+while a chain that yields is never demoted.
+
+The refresh is folded in here rather than left to a caller's `tick`, because this is the one place that knows
+which way the decision went, and both take spellings (`Pool.take`, and the executor's `takeFor`/`takeReport`)
+read this transaction — so no take escapes the bound. A caller's own `Pool.tick` still means "refresh", and is
+untouched. -/
 def Pool.takeReport (p : Pool α cap) : TakeReport α cap :=
-  if p.lifoPolls < p.lifoCap then
-    match p.lifo with
-    | some x => { observed := some x, served := .slot, item := some x, flushed := [],
-                  pool := { p with lifo := none, lifoPolls := p.lifoPolls + 1, taken := p.taken + 1 } }
-    | none   =>
-      let r := p.takeFromRing
-      { observed := none, served := .queue, item := r.1, pool := r.2, flushed := [] }
-  else
-    match p.lifo with
-    | some x =>
-      let cleared := { p with lifo := none }
-      let r := cleared.takeFromRing
-      { observed := some x, served := .flushed, item := r.1, pool := r.2, flushed := [x] }
-    | none   =>
-      let r := p.takeFromRing
-      { observed := none, served := .queue, item := r.1, pool := r.2, flushed := [] }
+  let r : TakeReport α cap :=
+    if p.lifoPolls < p.lifoCap then
+      match p.lifo with
+      | some x => { observed := some x, served := .slot, item := some x, flushed := [],
+                    pool := { p with lifo := none, lifoPolls := p.lifoPolls + 1, taken := p.taken + 1 } }
+      | none   =>
+        let q := p.takeFromRing
+        { observed := none, served := .queue, item := q.1, pool := q.2, flushed := [] }
+    else
+      match p.lifo with
+      | some x =>
+        let cleared := { p with lifo := none }
+        let q := cleared.takeFromRing
+        { observed := some x, served := .flushed, item := q.1, pool := q.2, flushed := [x] }
+      | none   =>
+        let q := p.takeFromRing
+        { observed := none, served := .queue, item := q.1, pool := q.2, flushed := [] }
+  { r with pool := if r.served = .slot then r.pool else r.pool.tick }
 
 /-- The slot's own take, without the report: what the allowance's polls read. -/
 def Pool.takeSlot (p : Pool α cap) : Option α × Pool α cap :=
@@ -163,13 +178,12 @@ def Pool.flushSlot (p : Pool α cap) : Option α × Pool α cap :=
   | none   => (none, p)
 
 /-- The owner's take: the decision without its report. One definition of the decision, so the two cannot
-drift — the report is what the record reads, and this is what the worker uses. -/
+drift — the report is what the record reads, and this is what the worker uses. It is `takeReport`'s pool that
+is kept, so this take carries the allowance's refresh too: a caller of `Pool.take` gets the same bounded
+transaction as the executor's spellings, and there is no take that escapes the bound. -/
 def Pool.take (p : Pool α cap) : Option α × Pool α cap :=
   let r := p.takeReport
   (r.item, r.pool)
-
-/-- A tick: the LIFO allowance refreshes. -/
-def Pool.tick (p : Pool α cap) : Pool α cap := { p with lifoPolls := 0 }
 
 /-- **Where a task goes when it joins the ring** — the implementation's `Model.Pool.toRing`. Append at the
 back if there is room. Otherwise the *newer* half leaves for the shared inject and the *older* half stays with
@@ -292,6 +306,11 @@ theorem flushSlot_inFlight {α : Type} {cap : Nat} {p : Pool α cap} {x : α} (h
     ({ p with lifo := none } : Pool α cap).inFlight + 1 = p.inFlight := by
   simp [Pool.inFlight, Pool.slotCount, hl]
 
+omit [Inhabited α] in
+/-- A tick changes only the allowance, so the pool's own count is untouched: the refresh in a take's
+transaction moves no item. -/
+theorem tick_inFlight (p : Pool α cap) : (p.tick).inFlight = p.inFlight := rfl
+
 /-- **A reported take holds one fewer item**, whichever way the decision went: the slot arm removes the
 slot's task, the queue arms remove one off the ring, and the flush clears the slot for the shared list —
 whose append is the caller's, and therefore counted beside this by `flushed`. -/
@@ -303,25 +322,62 @@ theorem takeReport_inFlight (p : Pool α cap) (hw : p.ring.WF) (h : (p.takeRepor
       simp [Pool.takeReport, Pool.inFlight, Pool.slotCount_none, Pool.slotCount_some, hpolls, hl]
     | none =>
       have h' : (p.takeFromRing).1.isSome := by simpa [Pool.takeReport, hpolls, hl] using h
-      simpa [Pool.takeReport, Pool.inFlight, hpolls, hl] using takeFromRing_inFlight p hw h'
+      simpa [Pool.takeReport, Pool.tick, Pool.inFlight, hpolls, hl] using takeFromRing_inFlight p hw h'
   · cases hl : p.lifo with
     | some x =>
       have h' : (({ p with lifo := none } : Pool α cap).takeFromRing).1.isSome := by
         simpa [Pool.takeReport, hpolls, hl] using h
       have hc := takeFromRing_inFlight ({ p with lifo := none } : Pool α cap) hw h'
       have hf := flushSlot_inFlight (p := p) hl
-      have hgoal : (p.takeReport).pool = ({ p with lifo := none } : Pool α cap).takeFromRing.2 := by
+      have hgoal : (p.takeReport).pool =
+          (({ p with lifo := none } : Pool α cap).takeFromRing.2).tick := by
         simp [Pool.takeReport, hpolls, hl]
       have hfl : (p.takeReport).flushed.length = 1 := by
         simp [Pool.takeReport, hpolls, hl]
-      rw [hgoal, hfl]
+      rw [hgoal, hfl, tick_inFlight]
       omega
     | none =>
       have h' : (p.takeFromRing).1.isSome := by simpa [Pool.takeReport, hpolls, hl] using h
-      have hgoal : (p.takeReport).pool = (p.takeFromRing).2 := by
-        simp [Pool.takeReport, hpolls, hl]
-      rw [hgoal]
-      simpa [Pool.takeReport, hpolls, hl] using takeFromRing_inFlight p hw h'
+      simpa [Pool.takeReport, Pool.tick, Pool.inFlight, hpolls, hl] using takeFromRing_inFlight p hw h'
+
+omit [Inhabited α] in
+/-- **The allowance's own law.** A take the slot served spends the allowance; any other decision — a flush or
+a ring take — refreshes it. So `lifoPolls` counts *consecutive* slot polls, and the count is per carrier
+because the pool is. -/
+theorem takeReport_lifoPolls (p : Pool α cap) :
+    (p.takeReport).pool.lifoPolls = if (p.takeReport).served = .slot then p.lifoPolls + 1 else 0 := by
+  by_cases hpolls : p.lifoPolls < p.lifoCap
+  · cases hl : p.lifo with
+    | some x => simp [Pool.takeReport, hpolls, hl]
+    | none => simp [Pool.takeReport, Pool.tick, hpolls, hl]
+  · cases hl : p.lifo with
+    | some x => simp [Pool.takeReport, Pool.tick, hpolls, hl]
+    | none => simp [Pool.takeReport, Pool.tick, hpolls, hl]
+
+omit [Inhabited α] in
+/-- **A spent allowance with the slot occupied flushes rather than polling again**, and reports the occupant
+as the decision observed it: the flush is the bound taking effect, and its item is the one it cleared for the
+shared inject. -/
+theorem takeReport_flushes_when_spent (p : Pool α cap) (h : ¬ p.lifoPolls < p.lifoCap) (hl : p.lifo ≠ none) :
+    (p.takeReport).served = .flushed ∧ (p.takeReport).observed = p.lifo := by
+  cases hsome : p.lifo with
+  | none => simp [hsome] at hl
+  | some x => simp [Pool.takeReport, h, hsome]
+
+omit [Inhabited α] in
+/-- **The allowance stays bounded by its cap**: a slot serve increments toward the cap, and every other
+decision refreshes to zero. -/
+theorem takeReport_bounded (p : Pool α cap) :
+    (p.takeReport).pool.lifoPolls ≤ (p.takeReport).pool.lifoCap := by
+  by_cases hpolls : p.lifoPolls < p.lifoCap
+  · cases hl : p.lifo with
+    | some x =>
+      simp [Pool.takeReport, hpolls, hl]
+      omega
+    | none => simp [Pool.takeReport, Pool.tick, hpolls, hl]
+  · cases hl : p.lifo with
+    | some x => simp [Pool.takeReport, Pool.tick, hpolls, hl]
+    | none => simp [Pool.takeReport, Pool.tick, hpolls, hl]
 
 /-- **A spawn holds one more item.** The slot is written either way, and the task it displaced is placed
 rather than dropped. -/
@@ -405,5 +461,17 @@ theorem toModel_spawn (p : Pool α cap) (inj : List α) (x : α) (hw : p.ring.WF
     dsimp only
     rw [toModel_toRing p inj y hw hcap]
     simp only [Pool.toModel]
+
+/-! ### The audit
+
+The take path's laws are stated over the pool alone and must rest on nothing beyond the standard axioms —
+the pool is *about* the primitives, so a proof that depended on a bridge axiom would be circular.
+`#print axioms` is the check. -/
+
+#print axioms LeanIn.Sched.takeReport_inFlight
+#print axioms LeanIn.Sched.tick_inFlight
+#print axioms LeanIn.Sched.takeReport_lifoPolls
+#print axioms LeanIn.Sched.takeReport_flushes_when_spent
+#print axioms LeanIn.Sched.takeReport_bounded
 
 end LeanIn.Sched

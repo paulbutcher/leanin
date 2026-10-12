@@ -1743,3 +1743,128 @@ without a fresh tick after the drain, would still deliver all 263 identities whi
 check names was never crossed. The `phase` stream binds that boundary to the client's own actions, so
 a run that staged `300` and `301` before the drain cannot pass on a correct-looking batch and identity
 set.
+
+______________________________________________________________________
+
+### SC21 — a chain that keeps the LIFO slot occupied is interrupted at the allowance, and the allowance is refreshed by the next decision that is not a slot serve
+
+**Actor.** A client of the executor's own take, on the mode's own thread: one carrier
+(`Sched.Executor.new Nat 256 1`), the driver's spelling standing in for worker `0`. The mode owns the loop —
+it locally `spawn`s the chain's root, and after each take that returned a chain link it locally `spawn`s that
+link's successor, so the slot is re-filled before the next decision. One marker is submitted to the ring
+before the chain starts, because a flush has to have something of the ring's to serve. Nothing here writes a
+ring, a slot or a counter: every value is read from a public operation, and each slot observation is the one
+the take reported at its own decision.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC21`, which invokes
+`lake exe controls --executor-lifo-turns`. No socket, no thread, no clock, no external service: the actor is
+the executor's own public take on the invocation's thread.
+
+**Given.** The mode's own identities: a chain of 12 links from 400, continued one successor per delivered
+link, and the marker 300 submitted to the ring before the chain starts. The allowance is the pool's own
+`lifoCap` — 3 (`LeanIn/Model/Pool.lean:63`) — read out of the record rather than stated by the check, and
+read back by the check against the mode's stated value.
+
+**When.** One invocation, one record. The mode takes until a take returns nothing, recording each decision's
+`served` and `observed`, the item it delivered, the flushes, and the composition's own accounting:
+
+`lifoturn|cap=<n>|links=<n>|served=[<slot|flushed|queue,…>]|observed=[<id|-,…>]|delivered=[<id,…>]|flushes=<n>|held=<n>|taken=<n>|pendingAfter=<n>|runUs=<n>`
+
+`served`, `observed` and `delivered` are bracketed comma-separated lists, read with the same shape
+`id_sequence_is` accepts. `observed` is the slot's occupant as each decision read it, `-` where it found the
+slot empty; `delivered` is the item each decision served, in order; `flushes` counts the decisions that
+cleared a spent slot; `held`, `taken` and `pendingAfter` are the composition's own numbers — work still held,
+work taken, and the shared list's length. `runUs` is printed and never asserted: no relation here reads a
+clock.
+
+**Then.** There is exactly one `lifoturn|` record, and its fields are exactly `cap`, `links`, `served`,
+`observed`, `delivered`, `flushes`, `held`, `taken`, `pendingAfter` and `runUs` in that order with nonempty
+values, so every value is bound from one parsed invocation. With `cap` the record's own allowance and `links`
+its own chain length the clause is four conjuncts, evaluated in this order and each on its own named fields:
+
+- **the cap bites.** The `served` sequence contains exactly `cap` consecutive `slot` decisions followed by a
+  `flushed`, repeating: every maximal run of consecutive `slot` decisions is `cap` long, each such run is
+  immediately followed by a `flushed`, a `queue` never interrupts a run, and the sequence ends on a flush
+  rather than on a run of polls. Every `flushed` decision reports, in `observed`, the occupant it cleared — a
+  chain identity, never `-` (an empty slot is a `queue` decision, not a flush) and never the ring's marker,
+  which lives in the ring and not in the slot.
+- **the allowance is refreshed by any decision that was not a slot serve.** After a `flushed`, the next
+  decision that finds the slot occupied is a `slot`, not a second clear of the same spent allowance. The
+  slot's occupancy at each decision is the record's own `observed`, so the relation is read from two named
+  fields rather than from a schedule the check assumes. This is the conjunct that tells the bounded schedule
+  from both spellings production has on the current tree: the driver's, where the allowance is never
+  refreshed inside the take and so the flush repeats, and the carrier's, where it is refreshed inside every
+  take and so no flush ever happens.
+- **the flush is a move, not a loss.** `delivered` is read as a multiset and must be exactly the chain's
+  `links` links and the marker, each once — the link a flush cleared is delivered, by that decision or by the
+  shared list's next one, so a flush that dropped it fails here. `flushes` must be the derived count below,
+  and the accounting must be intact: `held + taken` equals the mode's `links + 1` submissions, `held` is 0
+  and `pendingAfter` is 0, so nothing is left in the shared list either.
+- **the flush serves the ring.** The marker submitted before the chain started is served at index `cap` — the
+  first flush — and the decision that reads `flushed` there is the one that served it. Without this conjunct
+  the clear could be a schedule that never serves the ring at all, which is the fairness property the
+  allowance exists for (`docs/interface.md:139-143`).
+
+**The expectation is derived, not typed.** Every shape the four conjuncts read comes from the model, driven
+along the schedule the bound fixes — `Model.Pool.take`'s decision composed with `Model.Pool.tick` when the
+decision was not the slot's (`LeanIn/Model/Multi.lean:451,496`), in the order
+`Multi.takeStep_returns_if_present` names them (`:1193-1204`). For a chain of `links` links from `first`, a
+marker `marker` in the ring, and an allowance `cap`:
+
+| | derived |
+|---|---|
+| `served` | `slot` × `cap`, `flushed`, `queue`, then (`slot` × `cap`, `flushed`) repeated `flushes - 1` times |
+| `flushes` | `⌈(links - cap) / (cap + 1)⌉`, one flush per `cap + 1` links of the chain past the first block |
+| `observed` | the chain's links in order, with `-` at index `cap + 1` |
+| `delivered` | the chain's links in order, with the marker at index `cap` |
+| `held`, `taken`, `pendingAfter` | `0`, `links + 1`, `0` |
+
+For this mode's identities — `cap` 3, `links` 12, `first` 400, `marker` 300 — that is
+`served=[slot,slot,slot,flushed,queue,slot,slot,slot,flushed,slot,slot,slot,flushed]`,
+`observed=[400,401,402,403,-,404,405,406,407,408,409,410,411]`,
+`delivered=[400,401,402,300,403,404,405,406,407,408,409,410,411]`, `flushes=3`, `held=0`, `taken=13`,
+`pendingAfter=0`. The sequence was computed by driving the model — `Model.Pool` through `Model.Multi`, over
+the repository's own oleans — rather than written down here, and the check's expectation function carries the
+same rule rather than these values: `served` and `observed` are built by the rule above, and `flushes` is
+computed from the record's own `cap` and `links`. The derivation is a scratch program outside the repository,
+so no scaffold for it is checked in; the fixture's own expectation function is the checked-in statement of
+exactly what it computed.
+
+The `queue` decision at index `cap + 1` is part of the model's composition rather than an artefact: the flush
+clears the (cap+1)th link into the shared list and serves the ring, which holds the marker, so the link it
+cleared is what the *next* decision takes — and because the chain's own step re-fills the slot only from a
+delivered link, that decision finds the slot empty and reports `-` in `observed`.
+
+**Why it is not vacuous.** Five affirmative controls are in the same invocation. The mode's stated allowance
+and chain length are read out of the record and required to be the values the clause is stated for, so a run
+with another allowance is the clause's own failure rather than a silent pass; the chain length is required to
+exceed `2 * (cap + 1)`, so a run too short to have been interrupted twice cannot pass here; and `flushes` is
+required to be at least 2, so "the bound held" is not the statement that nothing happened. `delivered` is a
+multiset check with a count, so the flush arm cannot pass by dropping the item it cleared. And the four
+conjuncts are exercised — before the invocation, on the record syntax and the expectation alone — against the
+near misses they must reject: the **pre-fix driver spelling**, whose allowance is never refreshed inside the
+take so the flush repeats; the **pre-fix carrier spelling**, which refreshes inside every take so the slot
+serves the whole chain and no flush happens; a fourth slot poll in place of the flush; a flush reporting an
+empty slot; a flush whose cleared link is missing from `delivered`; the marker served by a decision that is
+not the flush's; and one flush more than the chain's length allows. Each of those shapes was itself derived
+by driving the model with that schedule. A control that does not hold is a fixture defect reported as a setup
+error, separately from the `Then`.
+
+**Why.** `Executor.takeFor` refreshed the allowance inside every take, so `lifoPolls` returned to zero on
+each decision and the spent-allowance arm could not run while a chain kept the slot occupied. The bound the
+interface documents (`docs/interface.md:139-143`) is per carrier and cannot strand the slot's occupant; what
+the refresh bought was the chain's locality. This scenario reads the restored schedule off one chain that
+never yields: the cap interrupts it, the link the interrupt cleared is the shared list's next item rather
+than a loss, the ring is served by the interrupt, and the allowance is refreshed by the decision that
+followed — which is what a chain that yields sees instead of a demotion.
+
+**Limits, stated.** (i) The derivation above holds for a chain length that is a whole number of `cap + 1`
+blocks, which is what makes the chain end on a flush; a chain that stopped mid-block would end on a run of
+polls, and the mode's 12 links at `cap` 3 are three such blocks. (ii) What is read is a sequence of
+*decisions*, not a liveness property: nothing here proves that a task runs, and no ordering or priority
+promise is added — `docs/interface.md:353-360` stands. Nothing is bounded in time either, and no clause reads
+a clock; `runUs` is printed and never asserted. (iii) The mode drives the driver's spelling of the take; the
+carrier's own consequence — a chain that holds the slot being interrupted on the carrier's path too — is
+SC12's green and the take-path measurement's flush count, not this scenario's. (iv) The bound is a property of
+a chain that holds the slot: a chain whose links are served from the ring or the shared list never reaches
+this rule, and its shape is unchanged by it.
