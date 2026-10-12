@@ -39,10 +39,17 @@ def main (args : List String) : IO UInt32 := do
   let addr ← Runtime.Listener.sockName l
   let workers := 1
   let e ← Sched.Executor.new LeanIn.Task.Item 256 workers
-  let cfg : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks }
+  let bigstall := args.contains "bigstall"
+  let cfg : Runtime.Http.Config :=
+    { h1 := {}, clock := Runtime.Clock.live hooks,
+      stallTimeout := if bigstall then 3600000 else 12000 }
+  let quiet := args.contains "quiet"
   let handler : Runtime.Http.Handler := fun head => do
-    let tid ← monadLift (IO.getTID : IO UInt64)
-    monadLift (IO.println s!"  {head.method} {head.uri} -> 200, on carrier {tid}")
+    if quiet then
+      pure ()
+    else
+      let tid ← monadLift (IO.getTID : IO UInt64)
+      monadLift (IO.println s!"  {head.method} {head.uri} -> 200, on carrier {tid}")
     return reply head
   IO.println s!"leanin server listening on {addr}"
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
