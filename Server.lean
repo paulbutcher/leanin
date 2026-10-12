@@ -29,6 +29,19 @@ def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :
       (Std.Http.Header.Value.ofString! (toString body.size))
   ({ status := .ok, version := .v11, headers }, body)
 
+/-- Report the counters the executor already keeps, every 20 000 requests. `taken` is cumulative items served —
+every worker's pool plus the shared cell's — so `taken / requests` is the number of scheduling round-trips one
+request costs. Nothing on the hot path is instrumented but one `IO.Ref` bump. -/
+def reportMetrics (e : Sched.Executor LeanIn.Task.Item 256) (hooks : Runtime.Hooks)
+    (served : IO.Ref Nat) (t0 : Nat) : IO Unit := do
+  let n ← served.modifyGet fun n => (n + 1, n + 1)
+  if n % 20000 == 0 then
+    let s ← e.snapshot
+    let fired := ((← e.metrics).getD []).map (fun (cc : Sched.CarrierCounters) => cc.fired) |>.sum
+    let pend ← Runtime.pending hooks
+    let t ← IO.monoNanosNow
+    IO.println s!"metrics|requests={n}|taken={s.taken}|takenMilliPerReq={(s.taken * 1000) / n}|fired={fired}|held={s.held}|pending={pend}|nsPerReq={(t - t0) / n}"
+
 def main (args : List String) : IO UInt32 := do
   let port : UInt16 :=
     match args with
@@ -44,6 +57,12 @@ def main (args : List String) : IO UInt32 := do
     { h1 := {}, clock := Runtime.Clock.live hooks,
       stallTimeout := if bigstall then 3600000 else 12000 }
   let quiet := args.contains "quiet"
+  -- `metrics` reports, every 20 000 requests, the counters the executor already keeps: `taken` is cumulative
+  -- items served (every worker's pool plus the shared cell), so `taken / requests` is the number of scheduling
+  -- round-trips one request costs. Nothing on the hot path is instrumented — one `IO.Ref` bump per request.
+  let metrics := args.contains "metrics"
+  let served ← IO.mkRef (0 : Nat)
+  let metricsT0 ← IO.monoNanosNow
   -- `static` answers with a response built once, so a measurement separates this runtime's cost from the cost of
   -- formatting the echoed body per request.
   let static := args.contains "static"
@@ -53,6 +72,8 @@ def main (args : List String) : IO UInt32 := do
       headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
         (Std.Http.Header.Value.ofString! (toString staticBody.size)) }
   let handler : Runtime.Http.Handler := fun head => do
+    if metrics then
+      monadLift (reportMetrics e hooks served metricsT0)
     if static then
       return (staticHead, staticBody)
     if quiet then
