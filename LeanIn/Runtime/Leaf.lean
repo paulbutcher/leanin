@@ -53,38 +53,58 @@ own job's promise and nothing else. The only entry that resolution can settle is
 registered, whose stock `Task` it drives to finished — the same fact the next carrier-side `Hooks.add` would
 record — and it never touches another computation's entry. A job thread resolving only its own promise is what
 keeps the registry's writers on the carrier. -/
-abbrev Hooks := IO.Ref (List (Task.Cancel × _root_.Task Unit))
+structure Hooks where
+  /-- The registrations: the token of the computation that awaits, and the stock `Task` whose completion
+  resumes it. -/
+  entries : IO.Ref (List (Task.Cancel × _root_.Task Unit))
+  /-- Registrations since the last compaction. See `Hooks.add`. -/
+  since   : IO.Ref Nat
 
-def Hooks.new : IO Hooks := IO.mkRef []
+def Hooks.new : IO Hooks := do
+  return { entries := ← IO.mkRef [], since := ← IO.mkRef 0 }
 
-/-- **Register a conversion's continuation**, dropping the entries that can no longer run.
+/-- How many registrations pass between compactions. A compaction costs one walk of the registry, so a period
+of `n` makes the walk's share of a registration `1/n` of the list's length: large enough that the sweep is
+noise beside the registration, small enough that the list tracks the registrations actually in flight. -/
+def Hooks.compactEvery : Nat := 256
 
-The registry used to grow for the runtime's whole life: every await appended and nothing was ever removed, so a
-server's list grew with the number of awaits it had ever performed. An entry is dropped here when its stock `Task`
-has finished — it holds nothing that can still run — or when its token is set, which means the computation that
-left it was cancelled and its continuation will be skipped. The list is then bounded by the registrations actually
-in flight. -/
-def Hooks.add (hooks : Hooks) (c : Task.Cancel) (t : _root_.Task Unit) : IO Unit := do
-  let ts ← hooks.get
-  let mut live := [(c, t)]
+/-- **Drop the entries that can no longer run.** An entry is dropped when its stock `Task` has finished — it
+holds nothing that can still run — or when its token is set, which means the computation that left it was
+cancelled and its continuation will be skipped. -/
+def Hooks.compact (hooks : Hooks) : IO Unit := do
+  let ts ← hooks.entries.get
+  let mut live := []
   for e in ts do
     if (← IO.getTaskState e.2) != .finished then
       unless ← e.1.isSet do live := e :: live
-  hooks.set live
+  hooks.entries.set live
+
+/-- **Register a conversion's continuation.** A registration appends and returns: the continuation is kept
+alive by the `bindTask` that produced it, so what the registry is *for* is the reading (`pending`, and a
+cancellation retiring its own work) rather than delivery, and a registration needs no sweep to be correct.
+
+It used to sweep on every registration — walking the whole list, calling `IO.getTaskState` on each entry — which
+is linear in the registrations in flight and therefore in the timers a service leaves parked. `compactEvery`
+registrations later the sweep runs once and the walk is amortised to `1/compactEvery` of the list. -/
+def Hooks.add (hooks : Hooks) (c : Task.Cancel) (t : _root_.Task Unit) : IO Unit := do
+  hooks.entries.modify fun ts => (c, t) :: ts
+  let n ← hooks.since.modifyGet fun n => (n + 1, n + 1)
+  if n % Hooks.compactEvery == 0 then
+    Hooks.compact hooks
 
 /-- **Retire every cancelled computation's registrations.** What `Runtime.cancel` calls, so that the count drops
 where the cancellation happens rather than at whatever the next await is: an entry whose token is set is work that
 will never run, and `pending` must not go on counting it as in flight. -/
 def Hooks.retire (hooks : Hooks) : IO Unit := do
-  let ts ← hooks.get
+  let ts ← hooks.entries.get
   let mut live := []
   for e in ts do
     unless ← e.1.isSet do live := e :: live
-  hooks.set live
+  hooks.entries.set live
 
 /-- **How many registrations the registry holds**, in flight or not: the list's own size. -/
 def Hooks.size (hooks : Hooks) : IO Nat := do
-  return (← hooks.get).length
+  return (← hooks.entries.get).length
 
 /-- **How many registrations one computation still holds.** Entries are attributable, so this can be asked about a
 particular computation instead of about the runtime: a cancellation is supposed to remove *the cancelled work's*
@@ -94,7 +114,7 @@ a step resumed from a leaf has itself just left a registration whose finished-ma
 Unlike `pending` it does not skip a set token. An entry whose computation has been cancelled and not yet retired is
 exactly the thing this exists to see, so skipping it would make the reading unable to show the difference. -/
 def pendingFor (hooks : Hooks) (c : Task.Cancel) : IO Nat := do
-  let ts ← hooks.get
+  let ts ← hooks.entries.get
   let mut n := 0
   for e in ts do
     if e.1.id == c.id then
@@ -107,7 +127,7 @@ is when the continuation it holds runs — so this is the part of "in flight" th
 see: a task parked on a leaf holds no pool item at all, and a driver that stopped there would abandon it. Reading
 it after a run returns is the conformance check that the model's invariants cannot state. -/
 def pending (hooks : Hooks) : IO Nat := do
-  let ts ← hooks.get
+  let ts ← hooks.entries.get
   let mut n := 0
   for e in ts do
     if (← IO.getTaskState e.2) != .finished then
