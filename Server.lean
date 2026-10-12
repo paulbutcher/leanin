@@ -44,7 +44,17 @@ def main (args : List String) : IO UInt32 := do
     { h1 := {}, clock := Runtime.Clock.live hooks,
       stallTimeout := if bigstall then 3600000 else 12000 }
   let quiet := args.contains "quiet"
+  -- `static` answers with a response built once, so a measurement separates this runtime's cost from the cost of
+  -- formatting the echoed body per request.
+  let static := args.contains "static"
+  let staticBody : ByteArray := "hello from leanin\nmethod=GET path=/bench version=HTTP/1.1\n".toUTF8
+  let staticHead : Std.Http.Response.Head :=
+    { status := .ok, version := .v11,
+      headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
+        (Std.Http.Header.Value.ofString! (toString staticBody.size)) }
   let handler : Runtime.Http.Handler := fun head => do
+    if static then
+      return (staticHead, staticBody)
     if quiet then
       pure ()
     else
