@@ -123,6 +123,74 @@ record_is() {
   [ "$n" -eq "${#want[@]}" ]
 }
 
+# field_may_be_empty <key> <record> — the value of the record's single `key=` field, which may be the empty
+# string. `field` and `record_is` reject an empty value deliberately, so this pair is that same binding stated
+# for the fields whose *expected* value can be nothing at all — the second response of a connection that closed
+# after the first, and the bytes a client reads from a peer that answered nothing. Exactly one occurrence is
+# still required, so the value is still bound from its own field and never from a neighbour or a longer key.
+field_may_be_empty() {
+  local key="$1" rec="$2" tok n=0 val=""
+  while IFS= read -r tok; do
+    case "$tok" in
+    "$key="*)
+      n=$((n + 1))
+      val="${tok#"$key="}"
+      ;;
+    esac
+  done < <(tokens "$rec")
+  [ "$n" -eq 1 ] || return 1
+  printf '%s' "$val"
+}
+
+# record_is_may_be_empty <record> <field>... — `record_is` with named exceptions: a field written with a trailing
+# `?` may carry the empty value, and every other field must still be nonempty. The fields SC20 expects to be able
+# to see empty are exactly the byte readings of a clause that read nothing, so a record whose `handled` or
+# `stall` came through empty is still rejected as malformed — by this check, which the check reports as its own
+# assertion rather than as a setup error.
+record_is_may_be_empty() {
+  local rec="$1"
+  shift
+  local -a want=("$@")
+  local tok n=0 k key opt
+  while IFS= read -r tok; do
+    k="${want[$n]:-}"
+    [ -n "$k" ] || return 1
+    key="$k"
+    opt=0
+    case "$k" in
+    *'?')
+      key="${k%?}"
+      opt=1
+      ;;
+    esac
+    case "$tok" in
+    "$key="?*) : ;;
+    "$key=") [ "$opt" -eq 1 ] || return 1 ;;
+    *) return 1 ;;
+    esac
+    n=$((n + 1))
+  done < <(tokens "$rec")
+  [ "$n" -eq "${#want[@]}" ]
+}
+
+# bound_field_may_be_empty <variable> <key> <record> <what> — as `bound_field`, for a field whose expected
+# value may be the empty string. It writes through `printf -v` for the same reason.
+bound_field_may_be_empty() {
+  local var="$1" key="$2" rec="$3" what="$4" val
+  val="$(field_may_be_empty "$key" "$rec")" ||
+    setup_error "$what has no single $key field" "record: [$rec]"
+  printf -v "$var" '%s' "$val"
+}
+
+# diff_field <variable> <key> <observed> <expected> — append a `key=observed (expected expected)` note to
+# <variable> when the two differ. A clause's Then prints the notes it collected, so the conjunct that failed is
+# named in the output rather than left for a reader to find by comparing two long lines.
+diff_field() {
+  local var="$1" key="$2" got="$3" want="$4"
+  [ "$got" = "$want" ] ||
+    printf -v "$var" '%s  %s=%s (expected %s)\n' "${!var}" "$key" "$got" "$want"
+}
+
 # canonical_ok <record> — a canonical operation record is exactly
 # `op=<name>|pos=<natural>|task=<identity>|out=<outcome>`: four fields, in that order, each nonempty,
 # nothing else.
@@ -1428,16 +1496,18 @@ http_carrier_ok() {
   [ "$cam" = "false" ]
 }
 
-# http_idle_ok <record> — SC19-O3: nothing is held or outstanding afterwards, and the observer that says so
-# could see work before the run (heldBefore ≠ 0).
+# http_idle_ok <record> — SC19-O3: nothing the connection owed is held afterwards, and the observer that says so
+# could see work before the run (heldBefore ≠ 0). `pendingHooks` is bound by its own named field — so a record
+# whose shape lost it is rejected — and its value is compared in no clause: the read that won the bounded race
+# leaves `Runtime.withTimeout`'s loser timer registered until it fires with nobody waiting, one timer per read
+# that won, so a leftover count is the race's relic rather than this driver's behaviour.
 http_idle_ok() {
   local rec="$1" hb ifa ph
   hb="$(field heldBefore "$rec")" || return 1
   ifa="$(field inFlightAfter "$rec")" || return 1
   ph="$(field pendingHooks "$rec")" || return 1
   [ "$hb" != "0" ] || return 1
-  [ "$ifa" = "0" ] || return 1
-  [ "$ph" = "0" ]
+  [ "$ifa" = "0" ]
 }
 
 # http_ok <record> <expected> — the three clauses as one detector.
@@ -1536,6 +1606,299 @@ check_sc19() {
 
   printf 'SC19 ok: method=%s uri=%s status=%s got=%s carrierThreads=%s clientAmongServer=%s heldBefore=%s inFlightAfter=%s pendingHooks=%s\n' \
     "$method" "$uri" "$st" "$got" "$carrier_threads" "$client_among" "$held_before" "$in_flight_after" "$pending_hooks"
+}
+
+# The SC20 detectors, one per clause, each a pure function of a record so the near-miss controls below exercise
+# the same detector the check asserts through rather than three lookalikes.
+#
+# ka_ok <record> <expected> — SC20-O1: one connection served two exchanges, both byte-exact, on one thread that
+# is not the client's, with nothing held afterwards and an observer that could see work before the run.
+#
+# `pendingHooks` is bound by its own named field — so a record whose shape lost it is rejected here — and its
+# value is compared in no clause: it counts `Runtime.withTimeout`'s leftover timers, one registration per read
+# that won, rather than this driver's behaviour, and even that count is a reading of the instant it is taken
+# rather than a quantity a clause can assert (clause two read 2 once in 60 runs of the mode, 1 in every other).
+ka_ok() {
+  local rec="$1" want="$2" h f s ct cam hb ifa ph
+  h="$(field handled "$rec")" || return 1
+  f="$(field_may_be_empty first "$rec")" || return 1
+  s="$(field_may_be_empty second "$rec")" || return 1
+  ct="$(field carrierThreads "$rec")" || return 1
+  cam="$(field clientAmongServer "$rec")" || return 1
+  hb="$(field heldBefore "$rec")" || return 1
+  ifa="$(field inFlightAfter "$rec")" || return 1
+  ph="$(field pendingHooks "$rec")" || return 1
+  [ "$h" = "2" ] || return 1
+  [ "$f" = "$want" ] || return 1
+  [ "$s" = "$want" ] || return 1
+  [ "$ct" = "1" ] || return 1
+  [ "$cam" = "false" ] || return 1
+  [ "$hb" != "0" ] || return 1
+  [ "$ifa" = "0" ]
+}
+
+# fa_ok <record> <expected> — SC20-O2: a handler that returned `error` was answered on the wire, and the
+# connection then ended, with nothing held.
+#
+# `pendingHooks` is bound by its own named field and compared nowhere — the same rule as clause one's, and the
+# one read that won here leaves one deadline timer registered.
+fa_ok() {
+  local rec="$1" want="$2" st got ct hb ifa ph
+  st="$(field status "$rec")" || return 1
+  got="$(field_may_be_empty got "$rec")" || return 1
+  ct="$(field carrierThreads "$rec")" || return 1
+  hb="$(field heldBefore "$rec")" || return 1
+  ifa="$(field inFlightAfter "$rec")" || return 1
+  ph="$(field pendingHooks "$rec")" || return 1
+  [ "$st" = "500" ] || return 1
+  [ "$got" = "$want" ] || return 1
+  [ "$ct" = "1" ] || return 1
+  [ "$hb" != "0" ] || return 1
+  [ "$ifa" = "0" ]
+}
+
+# idle_ok <record> — SC20-O3: the run ended at the mode's own stated instant with no other timer outstanding,
+# the client read nothing, and the client's own bound did not fire first.
+#
+# `inFlightAfter` is asserted here, against the reading the mode takes *after* it has driven its executor once
+# past the run: the deadline beat the read, so the losing read arm's step is still queued once the run has
+# returned, and firing that one step — its own `resolveFirst`, which the race has already decided — leaves the
+# queue empty. `pendingHooks` is bound by its own named field and compared nowhere: here it counts nothing of
+# this driver's at all, because the timer that resolved the read is the harness clock's and registers no hook.
+idle_ok() {
+  local rec="$1" stall at pa got bounded ct cam hb ifa ph
+  stall="$(field stall "$rec")" || return 1
+  at="$(field at "$rec")" || return 1
+  pa="$(field pendingAfter "$rec")" || return 1
+  got="$(field_may_be_empty clientGot "$rec")" || return 1
+  bounded="$(field bounded "$rec")" || return 1
+  ct="$(field carrierThreads "$rec")" || return 1
+  cam="$(field clientAmongServer "$rec")" || return 1
+  hb="$(field heldBefore "$rec")" || return 1
+  ifa="$(field inFlightAfter "$rec")" || return 1
+  ph="$(field pendingHooks "$rec")" || return 1
+  [ "$stall" != "0" ] || return 1
+  [ "$at" = "$stall" ] || return 1
+  [ -z "$got" ] || return 1
+  [ "$bounded" = "no" ] || return 1
+  [ "$pa" = "0" ] || return 1
+  [ "$ct" = "1" ] || return 1
+  [ "$cam" = "false" ] || return 1
+  [ "$hb" != "0" ] || return 1
+  [ "$ifa" = "0" ]
+}
+
+# --- SC20 — a connection serves more than one request, a failing handler is answered on the wire, and a
+# stalled peer ends the connection at a stated instant ————————————————————————————————————————————————————————
+check_sc20() {
+  local out status line fa_line idle_line ctl
+  local handled first second carrier_threads client_among held_before in_flight_after pending_hooks run_us
+  local fa_status fa_got fa_carrier fa_held fa_in_flight fa_hooks fa_run
+  local stall at pending_after client_got bounded idle_carrier idle_among idle_held idle_in_flight idle_hooks idle_run
+  local ctl_threads_two ctl_threads_repeat
+  local sc19_response base near ka_bad fa_bad idle_bad note
+  local -a records=() then_lines=()
+
+  # The two pinned responses, derived rather than typed: a fresh `H1.Machine .receiving` driven in memory with
+  # this request and this response head, escaped the way the executable escapes the bytes a client read —
+  # `\`→`\\`, CR→`\r`, LF→`\n`. Clause one's carries no `Connection` header, because nothing asked for a close,
+  # which is what distinguishes it from SC19's; clause two's is the machine's own
+  # `closeWithError .internalServerError` shape.
+  SC20_RESPONSE='HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello'
+  SC20_FAILURE='HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+  # SC19's response, for the near miss that must not pass as clause one's second exchange: a connection that
+  # closed after the first exchange answering the second with the close-shaped response.
+  sc19_response='HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello'
+
+  # --- the detectors' own controls, each clause's before its record is read: accept a record written from the
+  # record syntax and the expectation, reject the near misses that clause is built to tell apart. A control
+  # that does not hold is a fixture defect, reported separately from the SC20 Then. ---
+  base="handled=2|first=$SC20_RESPONSE|second=$SC20_RESPONSE|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=3"
+  ka_ok "$base" "$SC20_RESPONSE" ||
+    setup_error "SC20: the keep-alive detector rejected a well-formed record" \
+      "the detectors' own control, not the SC20 Then"
+  for near in \
+    "handled=1|first=$SC20_RESPONSE|second=$SC20_RESPONSE|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=3" \
+    "handled=2|first=$SC20_RESPONSE|second=$sc19_response|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=3" \
+    "handled=2|first=${SC20_RESPONSE}x|second=$SC20_RESPONSE|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=3" \
+    "handled=2|first=$SC20_RESPONSE|second=$SC20_RESPONSE|carrierThreads=1|clientAmongServer=true|heldBefore=3|inFlightAfter=0|pendingHooks=3" \
+    "handled=2|first=$SC20_RESPONSE|second=$SC20_RESPONSE|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=1|pendingHooks=3"; do
+    if ka_ok "$near" "$SC20_RESPONSE"; then
+      setup_error "SC20: the keep-alive detector accepted a near miss" \
+        "record: [$near]" \
+        "the detectors' own control, not the SC20 Then"
+    fi
+  done
+  printf 'SC20 control: ka rejected one served exchange, a second response that asked for a close, a response with a byte appended, a client on the server thread and a task left in flight\n'
+
+  base="status=500|got=$SC20_FAILURE|carrierThreads=1|heldBefore=3|inFlightAfter=0|pendingHooks=1"
+  fa_ok "$base" "$SC20_FAILURE" ||
+    setup_error "SC20: the failure-response detector rejected a well-formed record" \
+      "the detectors' own control, not the SC20 Then"
+  for near in \
+    "status=200|got=$SC20_FAILURE|carrierThreads=1|heldBefore=3|inFlightAfter=0|pendingHooks=1" \
+    "status=500|got=${SC20_FAILURE}x|carrierThreads=1|heldBefore=3|inFlightAfter=0|pendingHooks=1" \
+    "status=500|got=${SC20_FAILURE//\\r\\n/\\n}|carrierThreads=1|heldBefore=3|inFlightAfter=0|pendingHooks=1" \
+    "status=500|got=$SC20_FAILURE|carrierThreads=1|heldBefore=3|inFlightAfter=1|pendingHooks=1"; do
+    if fa_ok "$near" "$SC20_FAILURE"; then
+      setup_error "SC20: the failure-response detector accepted a near miss" \
+        "record: [$near]" \
+        "the detectors' own control, not the SC20 Then"
+    fi
+  done
+  printf 'SC20 control: fa rejected a 200, a response with a byte appended, a response whose CRLF was rewritten to LF, and a task left in flight\n'
+
+  base="stall=30|at=30|pendingAfter=0|clientGot=|bounded=no|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0"
+  idle_ok "$base" ||
+    setup_error "SC20: the stalled-peer detector rejected a well-formed record" \
+      "the detectors' own control, not the SC20 Then"
+  for near in \
+    "stall=30|at=0|pendingAfter=0|clientGot=|bounded=no|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "stall=30|at=30|pendingAfter=0|clientGot=x|bounded=no|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "stall=30|at=30|pendingAfter=0|clientGot=|bounded=yes|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0" \
+    "stall=30|at=30|pendingAfter=1|clientGot=|bounded=no|carrierThreads=1|clientAmongServer=false|heldBefore=3|inFlightAfter=0|pendingHooks=0"; do
+    if idle_ok "$near"; then
+      setup_error "SC20: the stalled-peer detector accepted a near miss" \
+        "record: [$near]" \
+        "the detectors' own control, not the SC20 Then"
+    fi
+  done
+  printf 'SC20 control: idle rejected a run that never reached the stated instant, a client that read a byte, a client that gave up first, and a timer left outstanding\n'
+
+  out="$(bounded lake exe controls --runtime-http-service)"
+  status=$?
+  check_status SC20 "$status" "lake exe controls --runtime-http-service"
+  require_header "$out"
+
+  # --- clause one: one connection, two exchanges ---
+  mapfile -t records < <(grep '^ka|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC20 Then (O1): one connection serving two requests was not observed exactly once" \
+      "expected exactly one ka| record, saw ${#records[@]}"
+  line="${records[0]}"
+  record_is_may_be_empty "${line#ka|}" handled 'first?' 'second?' carrierThreads clientAmongServer heldBefore \
+    inFlightAfter pendingHooks runUs ||
+    fail "SC20 Then (O1): one connection serving two requests was not observed exactly once" \
+      "the record is not exactly handled/first/second/carrierThreads/clientAmongServer/heldBefore/inFlightAfter/pendingHooks/runUs, with first and second allowed empty: [$line]"
+  bound_field handled handled "$line" "SC20 Then"
+  bound_field_may_be_empty first first "$line" "SC20 Then"
+  bound_field_may_be_empty second second "$line" "SC20 Then"
+  bound_field carrier_threads carrierThreads "$line" "SC20 Then"
+  bound_field client_among clientAmongServer "$line" "SC20 Then"
+  bound_field held_before heldBefore "$line" "SC20 Then"
+  bound_field in_flight_after inFlightAfter "$line" "SC20 Then"
+  bound_field pending_hooks pendingHooks "$line" "SC20 Then"
+  bound_field run_us runUs "$line" "SC20 Then"
+
+  # --- clause two: a handler that returned `error` ---
+  mapfile -t records < <(grep '^fa|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC20 Then (O2): the answered failure was not observed exactly once" \
+      "expected exactly one fa| record, saw ${#records[@]}"
+  fa_line="${records[0]}"
+  record_is_may_be_empty "${fa_line#fa|}" status 'got?' carrierThreads heldBefore inFlightAfter pendingHooks \
+    runUs ||
+    fail "SC20 Then (O2): the answered failure was not observed exactly once" \
+      "the record is not exactly status/got/carrierThreads/heldBefore/inFlightAfter/pendingHooks/runUs, with got allowed empty: [$fa_line]"
+  bound_field fa_status status "$fa_line" "SC20 Then"
+  bound_field_may_be_empty fa_got got "$fa_line" "SC20 Then"
+  bound_field fa_carrier carrierThreads "$fa_line" "SC20 Then"
+  bound_field fa_held heldBefore "$fa_line" "SC20 Then"
+  bound_field fa_in_flight inFlightAfter "$fa_line" "SC20 Then"
+  bound_field fa_hooks pendingHooks "$fa_line" "SC20 Then"
+  bound_field fa_run runUs "$fa_line" "SC20 Then"
+
+  # --- clause three: a peer that never sent a byte ---
+  mapfile -t records < <(grep '^idle|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC20 Then (O3): the stalled peer was not observed exactly once" \
+      "expected exactly one idle| record, saw ${#records[@]}"
+  idle_line="${records[0]}"
+  record_is_may_be_empty "${idle_line#idle|}" stall at pendingAfter 'clientGot?' bounded carrierThreads \
+    clientAmongServer heldBefore inFlightAfter pendingHooks runUs ||
+    fail "SC20 Then (O3): the stalled peer was not observed exactly once" \
+      "the record is not exactly stall/at/pendingAfter/clientGot/bounded/carrierThreads/clientAmongServer/heldBefore/inFlightAfter/pendingHooks/runUs, with clientGot allowed empty: [$idle_line]"
+  bound_field stall stall "$idle_line" "SC20 Then"
+  bound_field at at "$idle_line" "SC20 Then"
+  bound_field pending_after pendingAfter "$idle_line" "SC20 Then"
+  bound_field_may_be_empty client_got clientGot "$idle_line" "SC20 Then"
+  bound_field bounded bounded "$idle_line" "SC20 Then"
+  bound_field idle_carrier carrierThreads "$idle_line" "SC20 Then"
+  bound_field idle_among clientAmongServer "$idle_line" "SC20 Then"
+  bound_field idle_held heldBefore "$idle_line" "SC20 Then"
+  bound_field idle_in_flight inFlightAfter "$idle_line" "SC20 Then"
+  bound_field idle_hooks pendingHooks "$idle_line" "SC20 Then"
+
+  # The three clauses are evaluated first, in clause order O1, O2, O3 — and the record's own detector-control
+  # reading after them — so the first assertion a run reports is never interleaving-dependent. All three are
+  # evaluated before any of them fails, so the ones that hold are observed to hold. Each clause's Then names the
+  # conjuncts that failed, with what they observed and what they expected.
+  ka_bad=0 fa_bad=0 idle_bad=0
+  ka_ok "${line#ka|}" "$SC20_RESPONSE" || ka_bad=1
+  fa_ok "${fa_line#fa|}" "$SC20_FAILURE" || fa_bad=1
+  idle_ok "${idle_line#idle|}" || idle_bad=1
+
+  if [ "$ka_bad" -ne 0 ]; then
+    note=""
+    diff_field note handled "$handled" 2
+    diff_field note first "$first" "$SC20_RESPONSE"
+    diff_field note second "$second" "$SC20_RESPONSE"
+    diff_field note carrierThreads "$carrier_threads" 1
+    diff_field note clientAmongServer "$client_among" false
+    [ "$held_before" != "0" ] || note="$note  heldBefore=$held_before (expected nonzero)"$'\n'
+    diff_field note inFlightAfter "$in_flight_after" 0
+    then_lines+=("SC20 Then (O1): one connection did not serve two requests byte-exactly on one carrier
+${note%$'\n'}")
+  fi
+  if [ "$fa_bad" -ne 0 ]; then
+    note=""
+    diff_field note status "$fa_status" 500
+    diff_field note got "$fa_got" "$SC20_FAILURE"
+    diff_field note carrierThreads "$fa_carrier" 1
+    [ "$fa_held" != "0" ] || note="$note  heldBefore=$fa_held (expected nonzero)"$'\n'
+    diff_field note inFlightAfter "$fa_in_flight" 0
+    then_lines+=("SC20 Then (O2): a handler that returned an error was not answered on the wire
+${note%$'\n'}")
+  fi
+  if [ "$idle_bad" -ne 0 ]; then
+    note=""
+    [ "$stall" != "0" ] || note="$note  stall=$stall (expected the mode's own nonzero stated instant)"$'\n'
+    diff_field note at "$at" "$stall"
+    [ -z "$client_got" ] || note="$note  clientGot=$client_got (expected nothing read)"$'\n'
+    diff_field note bounded "$bounded" no
+    diff_field note pendingAfter "$pending_after" 0
+    diff_field note carrierThreads "$idle_carrier" 1
+    diff_field note clientAmongServer "$idle_among" false
+    [ "$idle_held" != "0" ] || note="$note  heldBefore=$idle_held (expected nonzero)"$'\n'
+    diff_field note inFlightAfter "$idle_in_flight" 0
+    then_lines+=("SC20 Then (O3): the stalled peer was not ended at the mode's stated instant
+${note%$'\n'}")
+  fi
+  if [ "${#then_lines[@]}" -ne 0 ]; then
+    for note in "${then_lines[@]}"; do printf '%s\n' "$note" >&2; done
+    exit 1
+  fi
+
+  # The executable's own tid-detector control, read after the clauses: the distinct-thread detector that reads
+  # every `carrierThreads` above counts two on a two-distinct sample and collapses a repeat.
+  ctl="$(grep '^connctl|' <<<"$out" | head -1)"
+  [ -n "$ctl" ] ||
+    setup_error "SC20: the detector controls are missing" "no connctl record in the invocation"
+  record_is "${ctl#connctl|}" threadsOnTwo threadsOnRepeat ||
+    setup_error "SC20: the detector-control record is not the expected shape" "control: [$ctl]"
+  bound_field ctl_threads_two threadsOnTwo "$ctl" "SC20 control"
+  bound_field ctl_threads_repeat threadsOnRepeat "$ctl" "SC20 control"
+  [ "$ctl_threads_two" = "2" ] ||
+    setup_error "SC20: the distinct-thread detector did not count two on a two-distinct sample" \
+      "threadsOnTwo=$ctl_threads_two"
+  [ "$ctl_threads_repeat" = "1" ] ||
+    setup_error "SC20: the distinct-thread detector did not collapse a repeat" \
+      "threadsOnRepeat=$ctl_threads_repeat"
+
+  printf 'SC20 ok: O1 handled=%s first=%s second=%s carrierThreads=%s clientAmongServer=%s inFlightAfter=%s pendingHooks=%s | O2 status=%s got=%s carrierThreads=%s inFlightAfter=%s pendingHooks=%s | O3 stall=%s at=%s pendingAfter=%s clientGot=%s bounded=%s carrierThreads=%s inFlightAfter=%s pendingHooks=%s\n' \
+    "$handled" "$first" "$second" "$carrier_threads" "$client_among" "$in_flight_after" "$pending_hooks" \
+    "$fa_status" "$fa_got" "$fa_carrier" "$fa_in_flight" "$fa_hooks" \
+    "$stall" "$at" "$pending_after" "$client_got" "$bounded" "$idle_carrier" "$idle_in_flight" "$idle_hooks"
 }
 
 # time_ok <record> — W3's observations as a detector, so its own control can reuse it rather than a lookalike:
@@ -3466,8 +3829,9 @@ SC16) check_sc16 ;;
 SC17) check_sc17 ;;
 SC18) check_sc18 ;;
 SC19) check_sc19 ;;
+SC20) check_sc20 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20\n' >&2
   exit 2
   ;;
 esac

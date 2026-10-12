@@ -968,6 +968,75 @@ and the extra section is not paid. The remaining gap to the D4-single-cell basel
 per-operation overhead, and the second measurement condition is recorded with that reading in
 [`PERFORMANCE.md`](PERFORMANCE.md) §3.5 rather than absorbed.
 
+### D20 — The service driver's read bound is per read and silent on expiry; a handler's failure is answered.
+
+**Decision.** The driver bounds each wait for request bytes and nothing else: `Config.stallTimeout` wraps
+`Conn.recv` through `Runtime.withTimeout` with an injected `Clock`, so the interval between asking the socket for
+bytes and bytes-or-EOF arriving on that request is bounded. The three cases the service item names — a
+connection that sends nothing at all, one that stops mid-head, and one that idles between requests — are one
+case: the socket gave us no byte within the bound.
+
+**On expiry the connection ends with nothing written.** The shipped server separates a keep-alive timeout (a
+silent close) from a per-head timeout (`408`); this driver carries the first and not the second. The peer has
+sent nothing within the bound, so a status line would be a claim about a request that may not have arrived at
+all, and one exercised outcome beats two with one untested branch.
+
+**The cumulative per-head deadline is not carried, and the reason is the harness.** The shipped `headerTimeout`
+measures elapsed time from a request's first byte, which on our carrier is a `Clock.now` subtraction; the only
+way to exercise that at a stated instant is the harness clock, and under `runVirtual` the clock advances whenever
+the executor's queues empty — which is exactly while our read leaf is parked — so a virtual timer always beats a
+real socket read when both are outstanding. A clause whose point is "the peer's bytes arrive, and then it stalls"
+would be decided by scheduling rather than by the driver. The per-read bound needs no `Clock.now` at all, which
+is the second reason it is the one carried: the clock is read by `withTimeout` and by nothing else, so no clock
+value reaches the machine or a response head.
+
+**The relic reaches the scenario that came before this one.** The per-read bound wraps *every* read, so `SC19`'s
+single-request scenario moved with it: its read wins the bounded race and its connection then halts, which is
+why `pendingHooks` was `0` there while the read was unbounded and reads `1` now — the same losing timer,
+registered until it fires with nobody waiting (it does fire later under a live clock, and the record is read
+before that). Nothing of the connection is left: that scenario's `inFlightAfter = 0` with `heldBefore ≠ 0` is the
+account that says so, and it is unchanged. So `SC19`'s assertion set is narrowed **with this paragraph as its
+record**: `pendingHooks` is bound by its own named field — the record's shape still requires it — and compared
+nowhere, and its section's prose is corrected with it. The detector that scenario and the stalled clause share is
+narrowed once for both, for this reason rather than as a patch to a frozen scenario, and every other
+`pendingHooks` reading in the tree (`docs/tokio-workplan.md`'s `SC10` and `SC17` evidence lines,
+`docs/proof-strategy.md`'s conservation claim for `SC10`) is re-read against the current records and left with its
+reason or narrowed the same way.
+
+**A handler's failure is answered, not re-raised.** A handler that returns `error` gets the machine's own
+`closeWithError .internalServerError` — `500` with `Connection: close` and `Content-Length: 0` — and the caught
+`IO.Error` is dropped. The accept loops discard per-connection results (`Registry.joinAll` awaits with
+`let _ ← Async.await h`), and the shipped `onFailure` notification has no carrier in a plain-function handler, so
+re-raising would cost the loop a failure channel nothing reads; the response the peer gets is the observable.
+
+**What remains open, and its limits.** (i) A peer that sends one byte before each deadline keeps a connection
+alive indefinitely: the total time to a complete head is unbounded. (ii) The bound is on reads, not on a handler
+or on `accept`: a handler that never returns is unbounded — cancellation is W5's and W7's item — and the accept
+leaf belongs to the accept loop. (iii) `withTimeout` does not cancel its loser, and it leaves a relic on
+**either** side. When the read wins, the timer stays pending until it fires with nobody waiting: one timer
+registration per read that won, which the SC20 records read as `pendingHooks` 3 in the keep-alive clause (its two
+request reads and the end-of-stream read), 1 in the failure clause (its single request read), and 0 in the
+stalled clause, whose read lost. When the **timer** wins, the losing read arm is left as its own queued step —
+one held item, identified by that arm's cancel token, appearing as that arm's socket registration finishes after
+the run returns, and consumed by the next drive, which takes the count from 1 to 0 with no timer, no
+registration and no second step. It is the race's loss and not connection work: nothing the connection owed is
+left unrun. **Because both are the race's relics and not this driver's behaviour, no scenario asserts a leftover
+count**: `pendingHooks` is printed in all three SC20 records and asserted in none; `inFlightAfter == 0` is
+asserted in the two clauses whose read won, and in the stalled clause after the drive that consumes the losing
+arm; and `pendingAfter == 0` is asserted only where the timer itself resolved the read. Cancelling the loser is
+W5's and W7's subject and is not done here: it would change the timer machinery rather than the driver.
+(iv) A failed *socket* operation still ends the connection past
+`Conn.shutdown`; the handler-failure path no longer reaches that short-circuit, because the failure is answered
+inside the loop.
+
+**Evidence.** SC20 (`nix develop -c bash tests/executor-contract.sh SC20`): the stalled peer's clause asserts the
+harness clock's own stated instant (`at == stall` with `stall = 30`, `clientGot` empty and `bounded == no`), and
+the failure clause binds the client's bytes to the derived `500` literal. The relics above are read rather than
+asserted: `pendingHooks` prints 3 / 1 / 0 across the three clauses — one timer per read that won, and none where
+the read lost — and the stalled
+clause's `inFlightAfter` is read after the drive that consumes the losing read arm — so both relics' identity is
+in the record without either becoming a claim about `withTimeout`.
+
 ______________________________________________________________________
 
 ## Open

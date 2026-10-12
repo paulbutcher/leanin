@@ -1054,9 +1054,10 @@ def runtimeHttp : IO UInt32 := do
   let statusRef ← IO.mkRef (0 : Nat)
   let request : ByteArray := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".toUTF8
   let pinnedBody : ByteArray := "hello".toUTF8
-  -- The machine's own configuration: no `Server` agent, and no clock is ever read into the machine, so the
-  -- response the client reads is a function of the request and the pinned head alone.
-  let cfg : Std.Http.Protocol.H1.Config := {}
+  -- The driver's own configuration: the protocol's limits, the clock the read deadline is read from, and the
+  -- deadline. The machine still sees `h1` alone, so no `Server` agent and no clock value can enter the encoder,
+  -- and the response the client reads is a function of the request and the pinned head alone.
+  let cfg : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks }
   let respHead : Std.Http.Response.Head :=
     { status := .ok, version := .v11,
       headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
@@ -1105,6 +1106,277 @@ def runtimeHttp : IO UInt32 := do
     IO.println s!"http|method={← methodRef.get}|uri={← uriRef.get}|status={← statusRef.get}|got={escBytes got}|carrierThreads={distinct.length}|clientAmongServer={distinct.contains clientTid}|heldBefore={heldBefore}|inFlightAfter={inFlightAfter}|pendingHooks={pendingAfter}"
     IO.println s!"httpctl|threadsOnTwo={(distinctOf [0, 1]).length}|threadsOnRepeat={(distinctOf [7, 7]).length}"
     return 0
+
+/-- The bytes a fresh `H1.Machine .receiving` produces for `request` and this response head and body, driven in
+memory: the scenario's pinned literal comes from this same drive, and the mode reads the result's length so its
+client stops at the end of a response rather than at a close. Nothing here is retyped from the fixture. -/
+private def encodedResponse (request : ByteArray) (head : Std.Http.Response.Head) (body : ByteArray) :
+    ByteArray :=
+  Id.run do
+    let mut m : Std.Http.Protocol.H1.Machine .receiving := { config := {} }
+    m := m.feed request
+    let mut out : ByteArray := ByteArray.empty
+    let mut answered := false
+    for _ in List.range 8 do
+      if m.halted then break
+      let (m', step) := m.step
+      m := m'
+      out := out ++ step.output.data.foldl (fun a x => a ++ x) ByteArray.empty
+      if !answered && step.events.any (fun e => match e with
+          | .endHeaders _ => true
+          | _ => false) then
+        answered := true
+        m := m.send head |>.sendData #[Std.Http.Chunk.ofByteArray body] |>.userClosedBody
+    return out
+
+/-- The status code the client parsed out of the peer's first response line, or `0` when no status line arrived
+at all. The client reads the bytes that came back over the socket rather than the head the mode handed the
+handler, so `status` is the wire's own reading. -/
+private def parsedStatus (bytes : ByteArray) : Nat :=
+  let s := (String.fromUTF8? bytes).getD ""
+  let line := (s.splitOn "\r\n").head?.getD ""
+  match (line.splitOn " ").drop 1 |>.head? with
+  | some code => code.toNat?.getD 0
+  | none => 0
+
+/-- **Read a clause's client socket until `want` bytes have arrived, the peer closes, or the bound fires.**
+
+`want = some n` stops as soon as `n` bytes have accumulated, which is how clause one reads one response at a
+time; `want = none` reads to end of stream, which is what clauses two and three need. The second component says
+whether the bound fired. The bound is the invocation's own live-time bound — an invocation bound, never a
+relation: it exists so a clause whose peer never answers cannot hang, and what it produced is recorded so a
+bound-caused reading cannot pass as a peer-caused one. The same helper reads clause one's two responses and
+clause three's silence, so clause three's empty reading is an absence read by the path that reported two
+nonempty responses in the same run. -/
+private def clientRead (c : Std.Async.TCP.Socket.Client) (want : Option Nat)
+    (bound : Std.Time.Millisecond.Offset) : Std.Async.Async (ByteArray × Bool) := do
+  let readLoop : Std.Async.Async (ByteArray × Bool) := do
+    let mut acc : ByteArray := ByteArray.empty
+    let mut more := true
+    while more do
+      match ← c.recv? 65536 with
+      | none => more := false
+      | some bs =>
+        acc := acc ++ bs
+        match want with
+        | some n => if acc.size ≥ n then more := false
+        | none => pure ()
+    return (acc, false)
+  Std.Async.Async.race readLoop (do Std.Async.sleep bound; return (ByteArray.empty, true))
+
+/-- **W9's second milestone: the driver as a service — keep-alive, an answered failure, and a bounded peer.**
+
+Three clauses, each with a listener bound by this invocation and a run of its own, in one invocation: one client
+socket carries two request/response exchanges; a handler that returns `error` puts a failure response on the
+wire; and a peer that never sends a byte ends the connection at the mode's stated instant, read from the harness
+clock. The client is deliberately `Std.Async`'s, driven by `Async.block` on this thread — a client that is not
+ours is what makes the thread identities mean anything — and the server side is `Runtime.Http.serveConn` under
+`Runtime.serveNJoin`, the accept loop of ours.
+
+Records: `ka|` (clause one), `fa|` (clause two), `idle|` (clause three), plus the tid detector's own control in
+`connctl|`. Each clause reports the bytes its client actually read, escaped so the field stays one token
+(`\`→`\\`, CR→`\r`, LF→`\n`), the thread the server-side work ran on, and the executor's holdings before and
+after — `heldBefore` being the same `e.observe` reader as `inFlightAfter`, read while three items are
+deliberately queued.
+
+The client's reads are bounded in **live time**. That bound is an invocation bound so that no clause can hang,
+and it is never the relation a clause asserts: clause three asserts the harness clock's own stated instant
+(`stall`), which is why it alone records `bounded=`. When the bound fires, the client closes its write side —
+which is what ends the peer's read — and this mode then drives its loop in bounded rounds until the peer's run
+returns, so the clause reports the peer's behaviour rather than a hang.
+
+The drive path is ours: `Runtime.serveNJoin` is the accept loop and `Runtime.Http.serveConn` the per-connection
+body, driving an `H1` machine built from `H1.Config` alone. The records the mode prints are the ones the frozen
+fixture reads, so a red here is about the connection's behaviour rather than about a missing binding.
+
+Beside the drive path, and the mode's own rather than the driver's, clause three drives its executor once past
+its run: it waits for the one step the race's losing read arm leaves queued there and fires it, so the holding it records is
+taken after that step rather than with it still in the queue.
+
+Diagnostic: `lake exe controls --runtime-http-service`. -/
+def runtimeHttpService : IO UInt32 := do
+  let request : ByteArray := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".toUTF8
+  let pinnedBody : ByteArray := "hello".toUTF8
+  let respHead : Std.Http.Response.Head :=
+    { status := .ok, version := .v11,
+      headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
+        (Std.Http.Header.Value.ofString! "5") }
+  let expected := encodedResponse request respHead pinnedBody
+  let clientBound : Std.Time.Millisecond.Offset := 5000
+  let clientTid ← IO.getTID
+
+  -- ================= clause one: keep-alive — one connection, two exchanges =================
+  let kaStart ← IO.monoNanosNow
+  let hooks1 ← Runtime.Hooks.new
+  let l1 ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep1 ← IO.mkRef l1
+  let addr1 ← Runtime.Listener.sockName l1
+  let e1 ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids1 ← IO.mkRef ([] : List UInt64)
+  let handled1 ← IO.mkRef (0 : Nat)
+  let handler1 : Runtime.Http.Handler := fun _ => do
+    let tid ← monadLift (IO.getTID : IO UInt64)
+    monadLift (srvTids1.modify (· ++ [tid]) : IO Unit)
+    monadLift (handled1.modify (· + 1) : IO Unit)
+    return (respHead, pinnedBody)
+  for _ in List.range 3 do e1.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore1, _) ← e1.observe
+  let cfg1 : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks1 }
+  let server1 : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids1.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    Runtime.serveNJoin hooks1 l1 1 (Runtime.Http.serveConn hooks1 cfg1 · handler1)
+  let server1T ← IO.asTask (Runtime.run e1 server1) _root_.Task.Priority.dedicated
+  -- The client: two exchanges on one socket. The second send is guarded because a peer that has already closed
+  -- is an ordinary case for this clause, and what the clause records is the bytes, which the guard cannot change.
+  let kaClient ←
+    try
+      Except.ok <$> Std.Async.Async.block (do
+        let c ← Std.Async.TCP.Socket.Client.mk
+        c.connect addr1
+        c.send request
+        let (first, _) ← clientRead c (some expected.size) clientBound
+        let _ ← try c.send request catch _ => pure ()
+        let (second, _) ← clientRead c (some expected.size) clientBound
+        c.shutdown
+        return (first, second))
+    catch e => pure (Except.error e)
+  let (first, second) := match kaClient with
+    | .ok fs => fs
+    | .error _ => (ByteArray.empty, ByteArray.empty)
+  let kaOutcome ← IO.wait server1T
+  let _ ← Runtime.Listener.sockName (← keep1.get)
+  let kaUs := ((← IO.monoNanosNow) - kaStart) / 1000
+  let tids1 ← srvTids1.get
+  let distinct1 := distinctOf tids1
+  let (inFlightAfter1, _) ← e1.observe
+  let pendingAfter1 ← Runtime.pending hooks1
+  match kaOutcome with
+  | .error err => IO.println s!"ka|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"ka|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"ka|handled={← handled1.get}|first={escBytes first}|second={escBytes second}|carrierThreads={distinct1.length}|clientAmongServer={distinct1.contains clientTid}|heldBefore={heldBefore1}|inFlightAfter={inFlightAfter1}|pendingHooks={pendingAfter1}|runUs={kaUs}"
+
+  -- ================= clause two: a failing handler — the failure is answered on the wire =================
+  let faStart ← IO.monoNanosNow
+  let hooks2 ← Runtime.Hooks.new
+  let l2 ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep2 ← IO.mkRef l2
+  let addr2 ← Runtime.Listener.sockName l2
+  let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids2 ← IO.mkRef ([] : List UInt64)
+  let handler2 : Runtime.Http.Handler := fun _ => do
+    let tid ← monadLift (IO.getTID : IO UInt64)
+    monadLift (srvTids2.modify (· ++ [tid]) : IO Unit)
+    throw (IO.userError "sc20 clause two: this handler answers every request with a failure")
+  for _ in List.range 3 do e2.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore2, _) ← e2.observe
+  let cfg2 : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
+  let server2 : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids2.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    Runtime.serveNJoin hooks2 l2 1 (Runtime.Http.serveConn hooks2 cfg2 · handler2)
+  let server2T ← IO.asTask (Runtime.run e2 server2) _root_.Task.Priority.dedicated
+  let faClient ←
+    try
+      Except.ok <$> Std.Async.Async.block (do
+        let c ← Std.Async.TCP.Socket.Client.mk
+        c.connect addr2
+        c.send request
+        let (got, _) ← clientRead c none clientBound
+        let _ ← try c.shutdown catch _ => pure ()
+        return got)
+    catch e => pure (Except.error e)
+  let got := match faClient with
+    | .ok bs => bs
+    | .error _ => ByteArray.empty
+  let faOutcome ← IO.wait server2T
+  let _ ← Runtime.Listener.sockName (← keep2.get)
+  let faUs := ((← IO.monoNanosNow) - faStart) / 1000
+  let tids2 ← srvTids2.get
+  let distinct2 := distinctOf tids2
+  let (inFlightAfter2, _) ← e2.observe
+  let pendingAfter2 ← Runtime.pending hooks2
+  match faOutcome with
+  | .error err => IO.println s!"fa|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"fa|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"fa|status={parsedStatus got}|got={escBytes got}|carrierThreads={distinct2.length}|heldBefore={heldBefore2}|inFlightAfter={inFlightAfter2}|pendingHooks={pendingAfter2}|runUs={faUs}"
+
+  -- ================= clause three: a stalled peer — bounded at the mode's stated instant =================
+  let stall : Std.Time.Millisecond.Offset := 30
+  let stallMs : Nat := stall.val.toNat
+  let idleStart ← IO.monoNanosNow
+  let hooks3 ← Runtime.Hooks.new
+  let l3 ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep3 ← IO.mkRef l3
+  let addr3 ← Runtime.Listener.sockName l3
+  let e3 ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids3 ← IO.mkRef ([] : List UInt64)
+  let handler3 : Runtime.Http.Handler := fun _ => return (respHead, pinnedBody)
+  for _ in List.range 3 do e3.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore3, _) ← e3.observe
+  let hc ← Runtime.HarnessClock.new
+  let cfg3 : Runtime.Http.Config :=
+    { h1 := {}, clock := Runtime.HarnessClock.clock hc, stallTimeout := stall }
+  let server3 : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids3.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    Runtime.serveNJoin hooks3 l3 1 (Runtime.Http.serveConn hooks3 cfg3 · handler3)
+  let server3T ← IO.asTask (Runtime.runVirtual hc e3 server3) _root_.Task.Priority.dedicated
+  -- The client connects and sends nothing, which is what leaves the driver's read to the deadline. If the
+  -- invocation's bound fires first, the client closes its write side, which is what ends the peer's read.
+  let idleClient ←
+    try
+      Except.ok <$> Std.Async.Async.block (do
+        let c ← Std.Async.TCP.Socket.Client.mk
+        c.connect addr3
+        let (bytes, bounded) ← clientRead c none clientBound
+        if bounded then
+          let _ ← try c.shutdown catch _ => pure ()
+        return (bytes, bounded))
+    catch e => pure (Except.error e)
+  let (clientGot, bounded) := match idleClient with
+    | .ok rb => rb
+    | .error _ => (ByteArray.empty, false)
+  -- The bound fired, so the peer's run is still parked on a read that only the socket's own completions can
+  -- resume: drive this loop in bounded rounds until that run returns, so the clause records the peer's behaviour
+  -- rather than hanging. A round bound, not a clock read, and it changes nothing on the path where the peer's own
+  -- deadline ended the connection.
+  if bounded then
+    let mut rounds := 0
+    while (← IO.getTaskState server3T) != .finished && rounds < 500 do
+      let _ ← Std.Async.Async.block (Std.Async.sleep 20)
+      rounds := rounds + 1
+  let idleOutcome ← IO.wait server3T
+  let _ ← Runtime.Listener.sockName (← keep3.get)
+  let atMs ← Runtime.HarnessClock.now hc
+  let pendingAfter3 ← Runtime.HarnessClock.pending hc
+  let tids3 ← srvTids3.get
+  let distinct3 := distinctOf tids3
+  -- **Drive once more, then read.** `Runtime.withTimeout` never cancels its loser, so the read arm the
+  -- deadline beat is still a step of this executor after the peer's run has returned: the peer's socket
+  -- closing completes that read on the loop's own thread, which enqueues the losing arm's continuation here
+  -- and nothing takes it. Wait for that one step (a bounded live-time wait, because the socket's completion
+  -- lands after the run returns rather than during it) and fire it, so what this clause reads below is the
+  -- queue *after* the leftover has run. Firing it performs the losing arm's own tail — a `resolveFirst` the
+  -- race has already decided — and enqueues nothing; a step the run had dropped that was *not* this loser
+  -- would still be held afterwards, and a step that resumed the connection loop would write to the wire and
+  -- queue again.
+  let driveStart ← IO.monoNanosNow
+  let mut leftover? ← e3.takeFor 0
+  while leftover?.isNone && (← IO.monoNanosNow) - driveStart < 200000000 do
+    IO.sleep 1
+    leftover? ← e3.takeFor 0
+  if let some leftover := leftover? then leftover.fire
+  let (inFlightAfter3, _) ← e3.observe
+  let pendingHooks3 ← Runtime.pending hooks3
+  let idleUs := ((← IO.monoNanosNow) - idleStart) / 1000
+  match idleOutcome with
+  | .error err => IO.println s!"idle|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"idle|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"idle|stall={stallMs}|at={atMs}|pendingAfter={pendingAfter3}|clientGot={escBytes clientGot}|bounded={if bounded then "yes" else "no"}|carrierThreads={distinct3.length}|clientAmongServer={distinct3.contains clientTid}|heldBefore={heldBefore3}|inFlightAfter={inFlightAfter3}|pendingHooks={pendingHooks3}|runUs={idleUs}"
+
+  IO.println s!"connctl|threadsOnTwo={(distinctOf [0, 1]).length}|threadsOnRepeat={(distinctOf [7, 7]).length}"
+  return 0
 
 
 
@@ -4355,6 +4627,7 @@ def main (args : List String) : IO UInt32 := do
   | "--runtime-chan" :: _ => return ← runtimeChan
   | "--runtime-net" :: _ => return ← runtimeNet
   | "--runtime-http" :: _ => return ← runtimeHttp
+  | "--runtime-http-service" :: _ => return ← runtimeHttpService
   | "--runtime-time" :: _ => return ← runtimeTime
   | "--runtime-connect" :: _ => return ← runtimeConnect
   | "--runtime-drain" :: _ => return ← runtimeDrain

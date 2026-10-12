@@ -1398,9 +1398,13 @@ pinned too.
 `carrierThreads` is `1`: the server-side work ran on one thread — the single-carrier claim, measured where the
 work happened rather than inferred from the configuration. `clientAmongServer` is `false`: that thread is not the
 client's, so what is asserted is where *our* work ran rather than that only one thread existed. `inFlightAfter`
-is `0` and `pendingHooks` is `0`: nothing is held, and no leaf registration is outstanding, once the connection
-has been served. `heldBefore` is non-zero — the affirmative control for that last reading, since the observer is
-the same one on both sides and a reader that cannot see work would report zero either way.
+is `0`: nothing the connection owed is held once it has been served. `pendingHooks` is bound by its own named
+field — so a record whose shape lost it is rejected — and compared nowhere: the read that won this request's
+bytes leaves `withTimeout`'s loser timer registered until it fires with nobody waiting, one timer per read that
+won, so its value is the race's relic rather than this driver's behaviour; it reads `1` here, and the timer
+retires later on the live clock, after the record is taken. `heldBefore` is non-zero — the affirmative control
+for the held-work reading, since the observer is the same one on both sides and a reader that cannot see work
+would report zero either way.
 
 The detector reading those conditions is exercised inside the same invocation. It accepts a well-formed record
 and rejects five near misses — `got` with one byte appended, `got` with its `\r\n` rewritten to `\n`, `status=404`,
@@ -1416,7 +1420,138 @@ from outside are the bytes the peer read and *where* the work ran, and a thread 
 the second. The byte comparison is what keeps the first honest — a runtime that answered from another protocol
 version, another framing or another body could still report a plausible status line. The limits are this
 milestone's: one request per connection, no request or response body beyond the `Content-Length`-framed literal,
-no TLS, no routing, and keep-alive only as `H1.Config` gives it.
+no TLS, no routing, and keep-alive only as `H1.Config` gives it. The driver bounds each wait for request bytes
+with `Config.stallTimeout` through `Runtime.withTimeout` (D20), so this scenario's single read is bounded like every
+other read, and the losing timer that bound leaves is the relic noted above.
+
+______________________________________________________________________
+
+### SC20 — a connection serves more than one request, a failing handler is answered, and a stalled peer ends at a stated instant
+
+**Actor.** A client that this invocation binds a listener for and connects to three times — deliberately **not**
+ours: `Std.Async`'s TCP client, driven by `Std.Async.Async.block` on the mode's own thread, as SC19's is. The
+server side is `Runtime.Http.serveConn` under `Runtime.serveNJoin`, the accept loop of ours.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC20`, which invokes
+`lake exe controls --runtime-http-service`. The listener is bound by the invocation itself
+(`Runtime.loopback 0`), so the socket is inside the boundary rather than an external service. No fake transport,
+no faked clock reading and no network service is involved: the sockets are real, the accepted connections are
+real, the machine is the protocol's own, and the only non-production device is `HarnessClock` in clause three,
+which SC17's clause three already uses.
+
+**When.** One invocation runs three clauses, each with its own listener and its own run.
+
+1. **Clause one — keep-alive (`ka|`).** One client socket: connect, send
+   `GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n` — **no** `Connection` header, so the machine's own `enableKeepAlive`
+   stands — read until the accumulated bytes equal the pinned keep-alive response, send the *same* request again on
+   the same socket, read until they equal it again, then shut the socket down. The record is
+   `ka|handled=<the requests the handler answered>|first=<escaped response 1>|second=<escaped response 2>|carrierThreads=<n>|clientAmongServer=<b>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
+2. **Clause two — a failing handler (`fa|`).** A second listener and run in the same invocation, whose handler
+   returns `error` for every request. The client sends the same request and reads until end of stream. The record is
+   `fa|status=<the code the client parsed out of the status line>|got=<escaped bytes read>|carrierThreads=<n>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
+3. **Clause three — a stalled peer (`idle|`).** A third listener and run, driven by
+   `IO.asTask (Runtime.runVirtual hc e prog)` on its own thread, with `cfg.clock := HarnessClock.clock hc` and
+   `cfg.stallTimeout := 30` — the mode's stated instant, `stall`. The client connects and **never sends a byte**,
+   then reads under the invocation bound and closes if it fires. Once that run has returned the mode waits for one
+   queued step, bounded in live time, and fires it before it reads its executor, so the holding in the record is
+   taken after the losing read arm's own step has run. The record is
+   `idle|stall=<stated ms>|at=<hc.now after the run>|pendingAfter=<hc.pending>|clientGot=<escaped bytes, empty>|bounded=<yes|no>|carrierThreads=<n>|clientAmongServer=<b>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
+
+**Then.** Each clause has its own record, its own detector and its own `Then`, evaluated in the order O1, O2, O3,
+and the tid control's `connctl|` reading after them, so the first assertion a run reports is never
+interleaving-dependent. A clause's record is bound by its own named fields; `first`, `second`, `got` and `clientGot`
+are bound by the same rule with the empty string allowed, because a clause that reads nothing is one of the
+outcomes this scenario must be able to observe.
+
+- **SC20-O1.** `handled == 2`; `first == SC20_RESPONSE` and `second == SC20_RESPONSE`, where `SC20_RESPONSE` is
+  the fixture-owned literal derived by driving a fresh `H1.Machine .receiving` with this request and the pinned
+  `200`/`Content-Length: 5`/`hello` head, escaped the way the executable escapes a client's bytes (`\`→`\\`,
+  CR→`\r`, LF→`\n`) — it carries **no** `Connection` header, unlike SC19's, because nothing asked for a close;
+  `carrierThreads == 1` and `clientAmongServer == false`; `inFlightAfter == 0` and `heldBefore != 0`. `pendingHooks`
+  is printed in the record and asserted in no clause — it counts `Runtime.withTimeout`'s leftover timers rather
+  than this driver's behaviour, and this clause's own reading of it is 3 (the two request reads and the end-of-stream
+  read that ends the clause, one registration each). The second exchange is the discriminator: a connection closed
+  after the first response cannot produce a second one.
+- **SC20-O2.** `status == 500` and `got == SC20_FAILURE`, the derived literal of the machine's own
+  `closeWithError .internalServerError` shape; `carrierThreads == 1`; `inFlightAfter == 0` and `heldBefore != 0`,
+  with `pendingHooks` printed and asserted in no clause (this clause's reading of it is 1 — the one request read
+  that won — and once in 60 runs of the mode it read 2, which is why the field is a reading and not an assertion).
+  The failure response is followed by the write side shutting down, which is what ends the client's read.
+- **SC20-O3.** `at == stall` with `stall != 0` — a relation between two stated values, not a constant compared
+  against a literal — `clientGot` empty and `bounded == no`, so the end the client read came from the server's own
+  deadline and not from the client giving up; `pendingAfter == 0` (the timer fired, and no other is outstanding in
+  the timer list — the clause where the timer itself resolved the read); `carrierThreads == 1` and
+  `clientAmongServer == false`; `heldBefore != 0`; and `inFlightAfter == 0`, read **after** the mode has driven its
+  executor once past the run — the deadline beat the read, so the losing read arm's step is still queued once the
+  run has returned, and the mode waits for that one step (bounded in live time) and fires it before reading. The
+  leftovers are set out below. This clause is also the only evidence that the loop reached its read and
+  parked there: a loop that spun instead would schedule no timer, so the harness clock would never advance and `at`
+  would read `0`.
+
+**Why it is not vacuous.** Four affirmative controls are in the same run. The distinct-thread detector that reads
+every `carrierThreads` is shown, in `connctl|`, counting two on a two-distinct sample and collapsing a repeat, so a
+`1` is a reading rather than a stuck counter — and a control that does not hold is reported as a fixture defect,
+separately from the `Then`. Clause one's `first` and `second` are read by the same client helper and the same read
+path that clause three uses and finds empty, so clause three's emptiness is an absence with a positive control in
+the same run. Clause three's `stall`/`at` pair is a relation between two stated harness instants, with `at = 0` as
+the near miss the detector must reject. And each clause's `heldBefore != 0` shows that the observer reporting
+nothing held was itself holding three items when it was read. Each detector is exercised before its record is read:
+it accepts a record written from the record syntax and the expectation, and rejects the near misses its clause is
+built to tell apart — for O1 one served exchange, a second response that asked for a close (SC19's response), a
+response with one byte appended, a client on the server thread, a task left in flight; for O2 a `200`, a response
+with one byte appended, a response whose `\r\n` was rewritten to `\n`, a task left in flight; for O3 a run that never
+reached the stated instant, a client that read a byte, a client that gave up first, a timer left outstanding.
+
+**The two leftovers, and why no clause asserts the count of them.** `Runtime.withTimeout` never cancels its loser,
+on either side, and this milestone does not change that: cancelling a raced loser is a cancellation decision over
+`Runtime/Time.lean` — a primitive's own item, and one that would make these clauses assert the timer machinery
+rather than the driver. What the race leaves is a relic on whichever side lost, and the records read it:
+
+- **Where the read won, the timer stays registered.** A `withTimeout` whose read won leaves its sleep arm's timer
+  registered until it fires with nobody waiting, so `pendingHooks` reads one registration per read that won: clause
+  one 3 — the two request reads and the end-of-stream read that ends the clause, one registration each — clause two 1
+  (the one request read; the failure answer halts the machine, so there is no end-of-stream read), and clause three
+  0, because the timer that resolved *that* read is the harness clock's, whose sleep registers no hook at all. The
+  count is a reading of the instant it is taken rather than a quantity a clause can assert — clause two read 2 once
+  in 60 runs of the mode and 1 in the other 59, because the connection's own last await can still be in flight when
+  the record is read — so `pendingHooks` is printed in all three records and compared in none.
+- **Where the timer won, the read arm's step is left queued.** The deadline beats the read in clause three, so the
+  losing read arm is still parked on its socket leaf when the run returns; the peer's socket closing then completes
+  that read on the loop's own thread, which enqueues the arm's continuation — the item's own token is the losing
+  arm's — and nothing takes it, because the run has already returned. That queued step is what `inFlightAfter` reads
+  as 1 while it is there. The mode now waits for one queued step past the run (bounded in live time, because that
+  socket completion lands after the run returns) and fires it before reading, so the value this clause asserts is 0;
+  firing it runs the losing arm's own tail — a `resolveFirst` the race has already decided — and enqueues nothing.
+- **What that establishes, and the guard it keeps.** The step left behind is the race's loser and not live
+  connection work: it is attributed to the losing arm's own token, the connection loop's own continuation is a
+  different computation — the connection body's token — which has already been consumed, and firing the leftover
+  writes nothing, schedules no timer and queues no second step. Live connection work left queued by a run's exit
+  would be work dropped against `Service.NoDrop`, and that is a defect this clause must report rather than a reading
+  it may print away; the assertion is kept only because the leftover is the loser's own step.
+
+**The bound, and what it does not bound.** One deadline, in one place: it wraps the read for request bytes, so a
+peer that sends nothing, one that stops mid-head and one that idles between requests are the same case — the socket
+gave no byte within the bound. On expiry the connection ends with **nothing written**: the peer may not have sent a
+request at all, so answering `408` would be a claim about a request we may not have received. The residual limit is
+stated rather than hidden: a peer that sends one byte before each deadline keeps a connection alive indefinitely,
+because the total time to a complete head is not bounded, and the shipped server's cumulative per-head deadline is
+deliberately **not** carried — under `runVirtual` the harness advances while our read leaf is parked, so a virtual
+timer always beats a real socket read, and a clause whose point was "the peer's bytes arrive, then it stalls" would
+be decided by scheduling rather than by the code. The bound is not a deadline for the handler or for the accept
+either: a handler that never returns is unbounded, and `Listener.accept` is the accept loop's leaf.
+
+**Two further limits, stated.** A handler's failure is **answered, not re-raised**: the accept loop discards each
+connection's result (`Task.Registry.joinAll` awaits with `let _ ← Async.await h`), so the observable is the bytes
+the peer gets, and a caller that needs the exception records it in its own handler. And pipelining — a request whose
+bytes are already buffered when the next read would have happened — is a **consequence** of the connection loop and
+not a claim of this scenario: SC20's client is sequential and asserts nothing about it. The client's own reads are
+bounded in live time; that bound is an invocation bound so that no clause can hang, and it is never the relation a
+clause asserts — which is exactly why clause three, and only clause three, records whether it fired. When it fires
+the client closes its write side, which is what ends the peer's read, and the mode then drives its own loop in
+bounded rounds until that run returns, so the clause records the peer's behaviour rather than hanging on it. That
+drive ends a *bounded* clause; the drive the leftovers paragraph describes runs after the run has already returned,
+in every clause-three run, and exists so that the holding the clause reads is taken past the losing read arm's
+queued step rather than with it still in the queue.
 
 ______________________________________________________________________
 

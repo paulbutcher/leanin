@@ -654,12 +654,49 @@ nor a `Date` header can enter the encoder.
 
 **Evidence.** `nix develop -c bash tests/executor-contract.sh SC19` — `check_sc19` binds the client's bytes to
 the pinned literal `HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello`, requires
-`carrierThreads=1` with `clientAmongServer=false`, and `inFlightAfter=0`/`pendingHooks=0` with `heldBefore≠0`,
-against the detector's own near-miss controls in the same invocation; SC7 and SC14 remain green.
+`carrierThreads=1` with `clientAmongServer=false`, and `inFlightAfter=0` with `heldBefore≠0`. `pendingHooks` is
+printed and no longer asserted: it read 0 while the read was unbounded and reads **1** now that milestone 2
+wraps each read in `withTimeout`, whose losing timer stays registered until it fires with nobody waiting — the
+same race relic the SC20 clauses print, recorded under `docs/decisions.md` D20. The account the clause asserts
+is unchanged and is the connection's own: `inFlightAfter=0` with a non-zero `heldBefore`, against the detector's
+own near-miss controls in the same invocation. SC10 and SC17 still read `pendingHooks=0` and keep that
+assertion, their reads being unbounded; SC7 and SC14 remain green.
+
+**Milestone 2, landed: the driver is a service.** `LeanIn/Runtime/Http.lean` keeps one accepted connection for as
+many request/response exchanges as the peer asks for, until the peer closes or stops sending; a read that gets no
+byte within `Config.stallTimeout` ends the connection **with nothing written**; and a handler that returns `error`
+is answered `500` + `Connection: close` + `Content-Length: 0` instead of ending the connection in silence.
+`serveConn` takes the driver's own `Config` — the protocol's `H1.Config`, the `Clock` the deadline is read from,
+and the deadline — because a `Clock` cannot travel inside the stdlib's config; the machine is still built from
+`h1` alone, so `agentName` and `instant` keep their `none` defaults and the clock is read by
+`Runtime.withTimeout` and by nothing else, reaching neither the machine nor a response head. Keep-alive is the
+machine's own reset (`resetForNextMessage` is private, so it cannot be called into being), reached by stopping to
+suppress it: the loop **steps again** only when a step wrote bytes or handled an event other than
+`needMoreData` — which the machine re-emits on every starved step — and otherwise **reads**, so the read is the
+default branch and no iteration repeats a machine state without writing or reading. The dispositions that mapped
+`close`/`failed`/`closeBody` to `closeReader` are gone: each means "this message's body is done" — for a
+body-less request the normal path — and not "input is over", so mapping them wrote an EOF the peer never sent.
+
+**What this milestone removes, stated as it was measured.** A sequential client already reached the second
+exchange through the previous gate: the old loop read whenever the writer was `.pending`, and after a one-step
+flush plus the machine's own reset that is exactly the state it was in, so the second request's bytes were in the
+reader before any step ran with an empty buffer, and the EOF the `.closeBody` mapping wrote was never consulted.
+What the handling above removes is that latent EOF, not the absence of reuse — with the gate landed and the
+dispositions not, the same connection serves one request and closes, which SC20's keep-alive clause records as
+`handled=1`. The scenario states that pre-existing green as what it is rather than as a red.
+
+**Evidence.** `nix develop -c bash tests/executor-contract.sh SC20` — three clauses in one invocation: one
+connection serving two exchanges against the pinned literal `HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello`
+(no `Connection` header, because nothing asked for a close); a failing handler whose client reads
+`HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n` and parses `500` from it;
+and a peer that never sends a byte, whose connection ends at the harness clock's stated instant with nothing
+read (`at == stall`, `stall = 30`, `clientGot` empty and `bounded == no`). Each clause's detector is exercised
+against its own near misses in the same invocation, and SC19, SC7 and SC14 remain green.
 
 **Still out of scope (this milestone does not close W9).** Streaming request bodies (so `pullBody` is not yet
-exercised by the driver); streaming or chunked response bodies; keep-alive reuse across requests beyond what
-`H1.Config` gives free; TLS; routing; and W16's benchmark.
+exercised by the driver); streaming or chunked response bodies; a cumulative per-head deadline — the bound is
+per read, so a peer that sends one byte before each deadline keeps a connection alive and the time to a complete
+head is unbounded; cancellation of a handler that never returns; TLS; routing; and W16's benchmark.
 
 ### W14 — The service's own refinement statement
 
