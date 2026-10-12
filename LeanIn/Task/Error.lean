@@ -22,25 +22,25 @@ namespace EAsync
 
 /-- A computation that cannot fail, lifted. -/
 def ofAsync (a : Async α) : EAsync ε α :=
-  ⟨fun k ctx => a.step (fun v => k (.ok v)) ctx⟩
+  ⟨fun k ctx => a.step (fun v ctx' => k (.ok v) ctx') ctx⟩
 
 /-- Fail now. -/
 def fail (e : ε) : EAsync ε α :=
-  ⟨fun k _ => k (.error e)⟩
+  ⟨fun k ctx => k (.error e) ctx⟩
 
 /-- Sequencing short-circuits on `error`; nothing runs after a failure. -/
 instance : Monad (EAsync ε) where
-  pure v := ⟨fun k _ => k (.ok v)⟩
-  bind a f := ⟨fun k ctx => a.step (fun r => match r with
-    | .ok v    => (f v).step k ctx
-    | .error e => k (.error e)) ctx⟩
+  pure v := ⟨fun k ctx => k (.ok v) ctx⟩
+  bind a f := ⟨fun k ctx => a.step (fun r ctx' => match r with
+    | .ok v    => (f v).step k ctx'
+    | .error e => k (.error e) ctx') ctx⟩
 
 /-- The channel itself: `throw` fails a computation, `tryCatch` handles one. -/
 instance : MonadExcept ε (EAsync ε) where
   throw e := fail e
-  tryCatch a h := ⟨fun k ctx => a.step (fun r => match r with
-    | .ok v    => k (.ok v)
-    | .error e => (h e).step k ctx) ctx⟩
+  tryCatch a h := ⟨fun k ctx => a.step (fun r ctx' => match r with
+    | .ok v    => k (.ok v) ctx'
+    | .error e => (h e).step k ctx') ctx⟩
 
 /-- An `IO` action in this layer: its error is the failure. -/
 instance : MonadLift IO (EAsync IO.Error) where
@@ -58,7 +58,7 @@ instance : MonadAwait (EAsync ε) where
 
 /-- Starting a computation cannot itself fail, so the handle arrives as `ok`. -/
 instance : MonadAsync (EAsync ε) where
-  spawn a := ⟨fun k ctx => (Async.spawn a).step (fun h => k (.ok h)) ctx⟩
+  spawn a := ⟨fun k ctx => (Async.spawn a).step (fun h ctx' => k (.ok h) ctx') ctx⟩
 
 end EAsync
 

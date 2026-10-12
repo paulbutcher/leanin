@@ -587,7 +587,10 @@ Rule 2 covers two of three off-owner sites.** The two seam completions take `res
 the task layer — `Async.await`/`select`'s `Join`-cell continuation runs on whichever carrier resolved the cell,
 so a shared-list child can land in another parked worker's queue; the per-worker `poked` flag and the broadcast
 are therefore the standing mechanism at this boundary, and the bit's removal belongs to a following item that
-rebinds each item's route at fire time (D19). The gate caught it as a hang in `runCarriers` (`exit 124` at a
+rebinds each item's route at fire time (D19). **That item is scheduled as W18 below, and it has landed**: a
+step's re-enqueue takes the route of the worker that fires it, a deferred continuation is delivered as an item
+on the resolver's own queue, non-step resumes take the shared route, and the flag and its broadcast are gone
+(SC22; `decisions.md` D22). The gate caught it as a hang in `runCarriers` (`exit 124` at a
 30–60s bound for a spawn-and-await program), and SC2/SC3's earlier timeout was the same lost wake.
 `Runtime.runCarriers` starts `p` dedicated carriers
 (`IO.asTask … Task.Priority.dedicated`) and the caller only waits; SC18-O1 reads `carriers = 4`,
@@ -834,18 +837,20 @@ CPS indirection, which is P1.
 | 11 | **W7** selection, racing, priority | met (SC16) | racing a request against its deadline |
 | 12 | **W13** handle, metrics, deterministic time | met (SC17) | operating it, capacity, timeout tests |
 | 13 | **W8** multi-carrier and stealing (O2 first) | met (SC18) | more than one core |
-| 14 | **W17** a bound on work admitted from outside the runtime | | operability: a caller can be refused rather than queueing without bound |
-| 15 | **W15** parameterise the async surface upstream (parallel, gates nothing) | | W9's shape |
-| 16 | **W9** the HTTP surface | | a web server |
-| 17 | **W16** the HTTP workload on both backends (needs W9 and the copy) | | the server row |
-| 18 | **P1** allocation and CPS (P2 landed) | | the benchmark rows |
+| 14 | **W18** the route rebinding: a step's re-enqueue takes the firing worker's route, and a deferred continuation is an item on the resolver's own queue — the per-worker wake flag and its broadcast are gone | met (SC22) | multi-carrier chains; W16's workload |
+| 15 | **W17** a bound on work admitted from outside the runtime | | operability: a caller can be refused rather than queueing without bound |
+| 16 | **W15** parameterise the async surface upstream (parallel, gates nothing) | | W9's shape |
+| 17 | **W9** the HTTP surface | | a web server |
+| 18 | **W16** the HTTP workload on both backends (needs W9 and the copy) | | the server row |
+| 19 | **P1** allocation and CPS (P2 landed) | | the benchmark rows |
 
 W1 is met, so the order starts at W10 and W2. W10 is read-only and can run beside W2; W2 and W3 give a service
 that answers a request; W11 gives it framing; W5 makes it operable (disconnect, failure, signal); W4 unblocks any
 handler that must touch a file or a CPU; W6 covers shared state and limits; W14 states what the service promises;
 W12 makes it observable and drainable; W7 races a request against its deadline; W13 makes it operable and its
-timeouts testable; W8 is the largest single piece and gated on O2; W9 is mostly someone else's code, which is the
-point; P1 is what the last measurement row is for.
+timeouts testable; W8 is the largest single piece and gated on O2; W18 is the W8 note's following item, taken
+once the rebinding was the only thing left between the local route and its owner-only premise; W9 is mostly
+someone else's code, which is the point; P1 is what the last measurement row is for.
 
 ## 4. What stays absent
 

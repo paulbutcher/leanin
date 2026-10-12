@@ -80,11 +80,14 @@ structure Waiter where
   token : Cancel
 
 /-- **Resolve every taken waiter, outside the state lock.** The list has already been cleared from the
-primitive's state, so a resolution here only *schedules* a step — running a continuation while holding the
-state lock would nest locks. `resolveFirst` because a wake is a hint and a second one for the same cell is not a
-defect. -/
-private def wakeAll (ws : List Waiter) : IO Unit :=
-  for w in ws do Join.resolveFirst w.wake ()
+primitive's state, so a resolution here only *delivers* — running a continuation while holding the state lock
+would nest locks. `resolveFirst` because a wake is a hint and a second one for the same cell is not a defect.
+
+`push` is the **delivering step's own route**, and it is why the operations that call this take one: a delivery
+is an item on the route of the worker that runs the step that delivers it, so the push is owner-made and a
+parked waiter is not written to from another thread. -/
+private def wakeAll (push : Item → BaseIO Unit) (ws : List Waiter) : IO Unit :=
+  for w in ws do Join.resolveFirst w.wake push ()
 
 /-- **The semaphore's state**: the permits available, and the computations parked for one.
 
@@ -199,7 +202,7 @@ def new (permits : Nat) : IO Semaphore :=
 none is available the second registers a fresh `Join` and the computation parks on it. A wake only re-enters
 this step, which re-reads the state: a wake is a hint, so nothing is transferred and a skipped wake costs
 nothing. -/
-private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ctx) : IO Unit := do
+private partial def acquireStep (s : Semaphore) (k : Unit → Ctx → IO Unit) (ctx : Ctx) : IO Unit := do
   let ready ← s.state.atomically do
     let st0 ← get
     let swept ← sweep st0.waiters st0.waitersLen st0.waitersScanned
@@ -213,7 +216,7 @@ private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ct
       set st
       return false
   if ready then
-    k ()
+    k () ctx
   else
     -- The `Join` is made before the lock, so no lock is taken while holding another.
     let j : Join Unit ← Join.new
@@ -226,9 +229,9 @@ private partial def acquireStep (s : Semaphore) (k : Unit → IO Unit) (ctx : Ct
         set { st with waiters := Waiter.mk j ctx.cancel :: st.waiters, waitersLen := st.waitersLen + 1 }
         return true
     if parked then
-      Join.onReady j (fun () => ctx.resume (Item.ofAction (acquireStep s k ctx)))
+      Join.onReady j ctx (fun () ctx' => acquireStep s k ctx')
     else
-      k ()
+      k () ctx
 
 /-- Request a permit, parking the computation while none is available. -/
 def acquire (s : Semaphore) : Task.Async Unit :=
@@ -250,14 +253,15 @@ def tryAcquire (s : Semaphore) : IO Bool :=
       return false
 
 /-- **Return a permit, and wake the whole waiter list as a hint.** The list is taken and cleared inside the
-lock and resolved outside it; each woken waiter re-checks the count, and a woken waiter that was cancelled
-consumes nothing. -/
-def release (s : Semaphore) : IO Unit := do
+lock and delivered outside it; each woken waiter re-checks the count, and a woken waiter that was cancelled
+consumes nothing. `push` is the *releasing step's* own route — the caller's `Async.push` — so the retries this
+delivers land on the queue that step is running on, which is what makes the push owner-made. -/
+def release (s : Semaphore) (push : Item → BaseIO Unit) : IO Unit := do
   let ws ← s.state.atomically do
     let st ← get
     set { st with permits := st.permits + 1, waiters := [], waitersLen := 0, waitersScanned := 0 }
     return st.waiters
-  wakeAll ws
+  wakeAll push ws
 
 end Semaphore
 
@@ -271,9 +275,10 @@ def new : IO Mutex :=
 def lock (m : Mutex) : Task.Async Unit :=
   m.sem.acquire
 
-/-- Release the mutex. Explicit, because there is no drop hook that could do it. -/
-def unlock (m : Mutex) : IO Unit :=
-  m.sem.release
+/-- Release the mutex, delivering its waiters on `push` — the releasing step's own route. Explicit, because
+there is no drop hook that could do it. -/
+def unlock (m : Mutex) (push : Item → BaseIO Unit) : IO Unit :=
+  m.sem.release push
 
 /-- Take the mutex if it is free, without parking. -/
 def tryLock (m : Mutex) : IO Bool :=
@@ -324,7 +329,7 @@ private def dequeue (st : ChanState α) : Option (α × ChanState α) :=
 /-- **The send step**, and the retry a wake schedules. The value is enqueued only inside this step — in the
 served case it never parks; in the parked case a wake re-enters the step, which re-checks the room. A cancelled
 sender's retry is skipped, so it enqueues nothing and consumes no slot. -/
-private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (ctx : Ctx) : IO Unit := do
+private partial def sendStep (c : Channel α) (v : α) (k : Unit → Ctx → IO Unit) (ctx : Ctx) : IO Unit := do
   let ready ← c.state.atomically do
     let st ← prune (← get)
     if st.size < c.cap then
@@ -334,7 +339,7 @@ private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (c
       set st
       return none
   match ready with
-  | some ws => wakeAll ws; k ()
+  | some ws => wakeAll ctx.resume ws; k () ctx
   | none    =>
     let j : Join Unit ← Join.new
     let parked ← c.state.atomically do
@@ -346,16 +351,17 @@ private partial def sendStep (c : Channel α) (v : α) (k : Unit → IO Unit) (c
         set { st with senders := Waiter.mk j ctx.cancel :: st.senders, sendersLen := st.sendersLen + 1 }
         return none
     match parked with
-    | some ws => wakeAll ws; k ()
-    | none    => Join.onReady j (fun () => ctx.resume (Item.ofAction (sendStep c v k ctx)))
+    | some ws => wakeAll ctx.resume ws; k () ctx
+    | none    => Join.onReady j ctx (fun () ctx' => sendStep c v k ctx')
 
 /-- Send a value, parking the computation while the channel is full. -/
 def send (c : Channel α) (v : α) : Task.Async Unit :=
   ⟨fun k ctx => sendStep c v k ctx⟩
 
 /-- Send a value if there is room, without parking. A send that finds room enqueues and wakes the receivers as
-a hint; one that finds none returns `false` and wakes no one. -/
-def trySend (c : Channel α) (v : α) : IO Bool := do
+a hint; one that finds none returns `false` and wakes no one. `push` is the sending step's own route — the
+caller's `Async.push` — so the receivers it wakes are delivered on the queue that step is running on. -/
+def trySend (c : Channel α) (v : α) (push : Item → BaseIO Unit) : IO Bool := do
   let r ← c.state.atomically do
     let st ← prune (← get)
     if st.size < c.cap then
@@ -365,12 +371,12 @@ def trySend (c : Channel α) (v : α) : IO Bool := do
       set st
       return none
   match r with
-  | some ws => wakeAll ws; return true
+  | some ws => wakeAll push ws; return true
   | none    => return false
 
 /-- **The receive step**, and the retry a wake schedules. The dequeue happens only inside this step, so a
 cancelled receiver's retry is skipped and the message stays in the queue or goes to another receiver. -/
-private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) : IO Unit := do
+private partial def recvStep (c : Channel α) (k : α → Ctx → IO Unit) (ctx : Ctx) : IO Unit := do
   let ready ← c.state.atomically do
     let st ← prune (← get)
     match dequeue st with
@@ -381,7 +387,7 @@ private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) :
       set st
       return none
   match ready with
-  | some (v, ws) => wakeAll ws; k v
+  | some (v, ws) => wakeAll ctx.resume ws; k v ctx
   | none         =>
     let j : Join Unit ← Join.new
     let parked ← c.state.atomically do
@@ -394,15 +400,16 @@ private partial def recvStep (c : Channel α) (k : α → IO Unit) (ctx : Ctx) :
         set { st with receivers := Waiter.mk j ctx.cancel :: st.receivers, receiversLen := st.receiversLen + 1 }
         return none
     match parked with
-    | some (v, ws) => wakeAll ws; k v
-    | none         => Join.onReady j (fun () => ctx.resume (Item.ofAction (recvStep c k ctx)))
+    | some (v, ws) => wakeAll ctx.resume ws; k v ctx
+    | none         => Join.onReady j ctx (fun () ctx' => recvStep c k ctx')
 
 /-- Receive a value, parking the computation while the channel is empty. -/
 def recv (c : Channel α) : Task.Async α :=
   ⟨fun k ctx => recvStep c k ctx⟩
 
-/-- Take a value if one is waiting, without parking. A dequeue frees room, so the senders are woken as a hint. -/
-def tryRecv (c : Channel α) : IO (Option α) := do
+/-- Take a value if one is waiting, without parking. A dequeue frees room, so the senders are woken as a hint
+on `push`, the receiving step's own route (the caller's `Async.push`). -/
+def tryRecv (c : Channel α) (push : Item → BaseIO Unit) : IO (Option α) := do
   let r ← c.state.atomically do
     let st ← prune (← get)
     match dequeue st with
@@ -413,7 +420,7 @@ def tryRecv (c : Channel α) : IO (Option α) := do
       set st
       return none
   match r with
-  | some (v, ws) => wakeAll ws; return some v
+  | some (v, ws) => wakeAll push ws; return some v
   | none         => return none
 
 end Channel

@@ -3527,8 +3527,12 @@ list_ids() {
 # carriers_ok <record> — SC18-O1 as a detector: the work was spread over more than one of the *started*
 # carriers (`distinctCarriers ≥ 2`) and every tid the work recorded is one of the carriers' own
 # (`ranTids ⊆ carrierTids`), the same detector's `P = 1` control read exactly one carrier
-# (`carrierCount1 = 1`), and the chain stayed on one carrier (`chainCarriers = 1`). Every operand is read
-# from its own named field. The record's `carriers` field (how many carriers the entry actually started) is
+# (`carrierCount1 = 1`). `chainCarriers` is bound by its own named field — so a record whose shape lost it is
+# rejected — and its value is compared in no clause, the same treatment SC19's `pendingHooks` received under
+# D20: after W18's route rebinding the count is a consequence of the scheduler's choice (a chain follows the
+# worker that fires each link), so `= 1` would assert the captured route and any other value a particular
+# interleaving. Every operand is read from its own named field. The record's `carriers` field (how many
+# carriers the entry actually started) is
 # shape-checked but is **not** asserted here: O1's red is the relation `ranTids ⊆ carrierTids`, so with the
 # staged entry's `carriers = 0` the caller's tid is in `ranTids` and `carrierTids` is empty, and the red stays
 # the relation rather than this count.
@@ -3547,7 +3551,6 @@ carriers_ok() {
   [ "$p" -ge 1 ] || return 1
   [ "$dc" -ge 2 ] || return 1
   [ "$cc1" -eq 1 ] || return 1
-  [ "$chain" -eq 1 ] || return 1
   local -a ran=() car=()
   mapfile -t ran < <(list_ids "$ranTids") || return 1
   mapfile -t car < <(list_ids "$carrierTids") || return 1
@@ -3651,7 +3654,9 @@ check_sc18() {
   local o1bad o2bad o3bad
   local cfg bound
   local -a records=()
-  local variant_count=4
+  # The mode's own self-check exercises three near-miss variants now that the crossed-chain record is an
+  # acceptance: the calling thread, clause two's batch, and the slot-cleared record.
+  local variant_count=3
 
   # The invocation runs first, so the detectors' exercises below read the bound the mode printed rather than a
   # literal: the bound lives in the mode's own configuration line, and a wake detector comparing `wokeRounds`
@@ -3672,11 +3677,16 @@ check_sc18() {
 
   # The detectors' own control, from the record syntax and the expectation alone: each must accept a
   # well-formed record and reject the near miss its clause would produce on the staged tree — the work on
-  # the calling thread, a thief that kept a batch, a chain across carriers, and a slot-cleared victim. The
-  # near misses are written here rather than taken from the mode, because the detectors' contract is shaped
-  # by the record syntax and the expectation.
+  # the calling thread, a thief that kept a batch, and a slot-cleared victim. A well-formed record carrying
+  # `chainCarriers = 2` is an *acceptance* control rather than a near miss: after W18's route rebinding a
+  # chain follows the worker that fires each link, so a crossing is the correct reading, and the field is
+  # compared in no clause. The near misses are written here rather than taken from the mode, because the
+  # detectors' contract is shaped by the record syntax and the expectation.
   carriers_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=1|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1' ||
     setup_error "SC18: the carrier detector rejected a well-formed record" \
+      "the detectors' own control, not the SC18 Then"
+  carriers_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=2|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1' ||
+    setup_error "SC18: the carrier detector rejected a well-formed record carrying chainCarriers = 2" \
       "the detectors' own control, not the SC18 Then"
   steal_ok 'victimRingBefore=200|victimSlotBefore=-|stolen=1|victimRingAfter=199|victimSlotAfter=-|stolenFromEmpty=0|emptyVictimRingBefore=0|slotStolen=no|slotVictimSlotBefore=some|thiefRingAfter=0|thiefSlotAfter=-|thiefTid=9|victimTid=9' ||
     setup_error "SC18: the steal detector rejected a well-formed record" \
@@ -3694,17 +3704,12 @@ check_sc18() {
       "record: [a thief that took two from the ring]" \
       "the detectors' own control, not the SC18 Then"
   fi
-  if carriers_ok 'carriers=4|p=4|carrierTids=[10,11,12,13]|ranTids=[10,11]|distinctCarriers=2|carrierCount1=1|chainCarriers=2|parkedBefore=4|readyBefore=0|ranTid=10|spawnTid=9|inWorkerTids=yes|wokeRounds=3|ran1=yes|ran2=yes|parkedAfter=0|readyAfter=0|inFlightAfter=0|pendingHooks=0|scaleN=100000|remaining=0|runUs=1'; then
-    setup_error "SC18: the carrier detector accepted a near miss — the chain half" \
-      "record: [a chain observed across carriers]" \
-      "the detectors' own control, not the SC18 Then"
-  fi
   if steal_ok 'victimRingBefore=200|victimSlotBefore=-|stolen=1|victimRingAfter=199|victimSlotAfter=-|stolenFromEmpty=0|emptyVictimRingBefore=0|slotStolen=yes|slotVictimSlotBefore=some|thiefRingAfter=0|thiefSlotAfter=-|thiefTid=9|victimTid=9'; then
     setup_error "SC18: the steal detector accepted a near miss — the slot-cleared record" \
       "record: [the slot-only victim's slot was taken]" \
       "the detectors' own control, not the SC18 Then"
   fi
-  printf 'SC18 control: rejected the work on the calling thread, a thief that kept a batch, a chain across carriers, and a slot-cleared victim\n'
+  printf 'SC18 control: accepted a well-formed record carrying chainCarriers = 2; rejected the work on the calling thread, a thief that kept a batch, and a slot-cleared victim\n'
 
   mapfile -t records < <(grep '^carriers|' <<<"$out" || true)
   [ "${#records[@]}" -eq 1 ] ||
@@ -4207,6 +4212,405 @@ check_sc21() {
     "$cap" "$links" "$served" "$observed" "$delivered" "$flushes" "$held" "$taken" "$pending_after"
 }
 
+# --- SC22's identities, derived from the two arms' own construction ————————————————————————————————————————
+# The route arm keeps its two roles on two workers: the creator's step is fired on worker 0 with worker 0's
+# routes, and the resolving step is fired by worker 1's own carrier thread, so the clause's premise is that the
+# two workers are distinct and that the fire which defers comes from a peer thread. `Async.await` leaves one
+# continuation on the awaited cell, so exactly one item is deferred, and the clause reads the two workers' own
+# pools: both empty before the resolving step, the item in the *firing* worker's pool after it and not in the
+# creator's, and nothing on the shared list. The completion arm's chain is one link delivered through the
+# shared route plus the creator's continuation, each run exactly once on a carrier, with the creator's carrier
+# parked when the completion arrives. The controls below are built from these values rather than from the
+# invocation's receipts, so no detector can agree with the mode by construction.
+sc22_expectation() {
+  sc22_p=2
+  sc22_creator=0
+  sc22_firer=1
+  sc22_deferred=1
+  sc22_pool_before=0
+  sc22_creator_pool_after=0
+  sc22_firer_pool_after=$sc22_deferred
+  sc22_pending_after=0
+  sc22_chain_links=1
+  # the control records' own two thread identities: any two distinct values do, and they are never the
+  # invocation's, so no control is built from a receipt
+  sc22_tid_creator=9
+  sc22_tid_firer=8
+}
+
+# sc22_route_record <creator> <firer> <creatorPoolBefore> <creatorPoolAfter> <firerPoolBefore> <firerPoolAfter>
+# <pendingAfter> <creatorTid> <firerTid> <continuationTid> <continuationRuns> <resolverRounds> — a `route|`
+# record in the mode's own field order, built from the record syntax and the expectation alone.
+sc22_route_record() {
+  printf 'route|creator=%s|firer=%s|p=%s|creatorPoolBefore=%s|creatorPoolAfter=%s|firerPoolBefore=%s|firerPoolAfter=%s|pendingAfter=%s|creatorTid=%s|firerTid=%s|continuationTid=%s|continuationRuns=%s|resolverRounds=%s|bound=%s|runUs=1' \
+    "$1" "$2" "$sc22_p" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "$sc22_bound"
+}
+
+# sc22_route_good — the record the route clause's conjuncts must accept, built from the expectation alone: the
+# deferred item on the firing worker's own pool, the firing worker's thread running it, and nothing on the
+# shared list.
+sc22_route_good() {
+  sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" "$sc22_creator_pool_after" \
+    "$sc22_pool_before" "$sc22_firer_pool_after" "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" \
+    "$sc22_tid_firer" 1 3
+}
+
+# sc22_route_ok <record> <bound> — SC22-O1 as one detector: the item the firing worker's step deferred arrived
+# on that worker's **own** pool, not on the creator's and not on the shared list, and the firing worker's thread
+# ran it — with the two roles on distinct workers, the peer's identity the counters' own tid rather than the
+# creator's, one run, and the resolve observed inside the mode's own declared round count. Every operand is read
+# out of this record's own named field; <bound> is the round count the mode printed in its configuration line,
+# so a wait that hit its bound is rejected rather than read as a resolve.
+sc22_route_ok() {
+  local rec="$1" bound="$2"
+  local creator firer p cpb cpa fpb fpa pending ctid ftid ktid kruns rr rbound v
+  creator="$(field creator "$rec")" || return 1
+  firer="$(field firer "$rec")" || return 1
+  p="$(field p "$rec")" || return 1
+  cpb="$(field creatorPoolBefore "$rec")" || return 1
+  cpa="$(field creatorPoolAfter "$rec")" || return 1
+  fpb="$(field firerPoolBefore "$rec")" || return 1
+  fpa="$(field firerPoolAfter "$rec")" || return 1
+  pending="$(field pendingAfter "$rec")" || return 1
+  ctid="$(field creatorTid "$rec")" || return 1
+  ftid="$(field firerTid "$rec")" || return 1
+  ktid="$(field continuationTid "$rec")" || return 1
+  kruns="$(field continuationRuns "$rec")" || return 1
+  rr="$(field resolverRounds "$rec")" || return 1
+  rbound="$(field bound "$rec")" || return 1
+  for v in "$creator" "$firer" "$p" "$cpb" "$cpa" "$fpb" "$fpa" "$pending" "$kruns" "$rr" "$rbound"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  for v in "$ctid" "$ftid" "$ktid"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  # the two roles name two distinct workers, and the peer's identity is not the creator's
+  [ "$creator" -eq "$sc22_creator" ] || return 1
+  [ "$firer" -eq "$sc22_firer" ] || return 1
+  [ "$creator" -ne "$firer" ] || return 1
+  [ "$ctid" -ne "$ftid" ] || return 1
+  # both pools empty before the step that defers, and the arrival itself: the item is in the firing worker's
+  # pool and not in the creator's, and not on the shared list
+  [ "$cpb" -eq "$sc22_pool_before" ] || return 1
+  [ "$fpb" -eq "$sc22_pool_before" ] || return 1
+  [ "$cpa" -eq "$sc22_creator_pool_after" ] || return 1
+  [ "$fpa" -eq "$sc22_firer_pool_after" ] || return 1
+  [ "$pending" -eq "$sc22_pending_after" ] || return 1
+  # the firing worker ran it, exactly once, and the creator did not
+  [ "$kruns" -eq 1 ] || return 1
+  [ "$ktid" -eq "$ftid" ] || return 1
+  [ "$ktid" -ne "$ctid" ] || return 1
+  [ "$rr" -lt "$bound" ] || return 1
+  [ "$rbound" -eq "$bound" ]
+}
+
+# sc22_crossing_record <completed> <creatorRuns> <childRuns> <continuationRuns> <crossed> <waiterParked>
+# <completionRounds> <heldAfterStop> — a `crossing|` record in the mode's own field order, likewise built from
+# the record syntax and the expectation alone.
+sc22_crossing_record() {
+  printf 'crossing|p=%s|completed=%s|creatorRuns=%s|childRuns=%s|continuationRuns=%s|crossed=%s|waiterParked=%s|creatorTid=%s|childTid=%s|continuationTid=%s|completionRounds=%s|bound=%s|heldAfterStop=%s|runUs=1' \
+    "$sc22_p" "$1" "$2" "$3" "$4" "$5" "$6" "$sc22_tid_creator" "$sc22_tid_firer" "$sc22_tid_firer" \
+    "$7" "$sc22_bound" "$8"
+}
+
+# sc22_crossing_good — the record the completion clause's conjuncts must accept: the chain completed, each of
+# its links ran once on a carrier, the crossing is observed, the completion arrived at a parked wait, and the
+# drain left nothing behind.
+sc22_crossing_good() {
+  sc22_crossing_record 1 1 "$sc22_chain_links" 1 1 1 3 0
+}
+
+# sc22_completion_ok <record> <bound> — SC22-O2 as one detector: the chain across carriers **completed**, every
+# link ran exactly once, the crossing is observed (the link's carrier is not the creator's, so "it completed on
+# one carrier" cannot pass as "it completed"), the completion arrived at a wait that was parked, and it arrived
+# inside the mode's own declared round count rather than by a drain. Every operand is read from its own named
+# field. `continuationTid` names the thread the deferred continuation ran on — the route clause's subject, read
+# in the route record above — and is bound by the check's shape so a record that lost it is rejected, but no
+# conjunct here compares it: this clause is about the chain's completion, and the route's reading is O1's.
+sc22_completion_ok() {
+  local rec="$1" bound="$2"
+  local p completed cruns chruns kruns crossed wp ctid chid ktid crounds rbound held v
+  p="$(field p "$rec")" || return 1
+  completed="$(field completed "$rec")" || return 1
+  cruns="$(field creatorRuns "$rec")" || return 1
+  chruns="$(field childRuns "$rec")" || return 1
+  kruns="$(field continuationRuns "$rec")" || return 1
+  crossed="$(field crossed "$rec")" || return 1
+  wp="$(field waiterParked "$rec")" || return 1
+  ctid="$(field creatorTid "$rec")" || return 1
+  chid="$(field childTid "$rec")" || return 1
+  ktid="$(field continuationTid "$rec")" || return 1
+  crounds="$(field completionRounds "$rec")" || return 1
+  rbound="$(field bound "$rec")" || return 1
+  held="$(field heldAfterStop "$rec")" || return 1
+  for v in "$p" "$completed" "$cruns" "$chruns" "$kruns" "$crossed" "$wp" "$crounds" "$rbound" "$held"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  for v in "$ctid" "$chid" "$ktid"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  [ "$p" -eq "$sc22_p" ] || return 1
+  [ "$completed" -eq 1 ] || return 1
+  [ "$cruns" -eq 1 ] || return 1
+  [ "$chruns" -eq "$sc22_chain_links" ] || return 1
+  [ "$kruns" -eq 1 ] || return 1
+  [ "$crossed" -eq 1 ] || return 1
+  [ "$ctid" -ne 0 ] || return 1
+  [ "$chid" -ne 0 ] || return 1
+  [ "$ctid" -ne "$chid" ] || return 1
+  [ "$wp" -eq 1 ] || return 1
+  [ "$crounds" -lt "$bound" ] || return 1
+  [ "$rbound" -eq "$bound" ] || return 1
+  [ "$held" -eq 0 ]
+}
+
+# --- SC22's detectors' own control, run inside the SC22 invocation ——————————————————————————————————————————
+# The two clauses are only as strong as the detectors they are read through, so each is exercised here on the
+# record it was built from and on the near misses it must reject. A control that does not hold is a fixture
+# defect reported as a setup error, separately from the SC22 Then. `sc22_bound` is the mode's own printed round
+# count, read by the check before this runs, so the controls are stated at the mode's own cost.
+check_sc22_route_detector() {
+  local good i
+  local -a names=() near=()
+  good="$(sc22_route_good)"
+  sc22_route_ok "$good" "$sc22_bound" ||
+    setup_error "SC22: the route detector rejected the well-formed record it must accept" \
+      "record: [$good]" \
+      "the detectors' own control, not the SC22 Then"
+  printf 'SC22 control: accepted the deferred item on the firing worker'"'"'s own pool as %s\n' "$good"
+
+  # The route the tree implements today: the continuation holds the creator's route, so the item the peer
+  # thread defers lands in the creator's pool and the creator runs it.
+  names+=("the pre-fix spelling, where the deferred item lands in the creator's pool and the creator runs it")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" 1 "$sc22_pool_before" 0 \
+    "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" "$sc22_tid_creator" 1 3)")
+
+  # The rejected alternative: the continuation delivered on the shared list instead of a worker's own queue.
+  names+=("the shared route, where the deferred item goes to the shared list rather than a worker's own pool")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" 0 "$sc22_pool_before" 0 \
+    1 "$sc22_tid_creator" "$sc22_tid_firer" "$sc22_tid_firer" 1 3)")
+
+  # One enqueue counted in both pools: a record that cannot be one arrival.
+  names+=("the same item read in both pools")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" 1 "$sc22_pool_before" 1 \
+    "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" "$sc22_tid_firer" 1 3)")
+
+  # An item that reached no pool and never ran: the clause must not accept a deferred continuation as
+  # delivered because nothing says otherwise.
+  names+=("an item that reached no pool and never ran")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" 0 "$sc22_pool_before" 0 \
+    "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" "$sc22_tid_firer" 0 3)")
+
+  # The continuation run by a thread that is neither role: the fire that deferred and the run are not the same
+  # worker's.
+  names+=("the deferred continuation run by a thread that is neither the creator nor the firing worker")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" "$sc22_creator_pool_after" \
+    "$sc22_pool_before" "$sc22_firer_pool_after" "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" \
+    7 1 3)")
+
+  # The two roles collapsed onto one worker: nothing defers from a peer, so the clause's premise is gone.
+  names+=("the two roles collapsed onto one worker")
+  near+=("$(sc22_route_record "$sc22_firer" "$sc22_firer" "$sc22_pool_before" "$sc22_creator_pool_after" \
+    "$sc22_pool_before" "$sc22_firer_pool_after" "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" \
+    "$sc22_tid_firer" 1 3)")
+
+  # A resolve that hit the mode's own round count: the reading is of an enqueue, so a wait that expired is not
+  # a resolve that happened.
+  names+=("a resolve that hit the mode's own round count")
+  near+=("$(sc22_route_record "$sc22_creator" "$sc22_firer" "$sc22_pool_before" "$sc22_creator_pool_after" \
+    "$sc22_pool_before" "$sc22_firer_pool_after" "$sc22_pending_after" "$sc22_tid_creator" "$sc22_tid_firer" \
+    "$sc22_tid_firer" 1 "$sc22_bound")")
+
+  for i in "${!near[@]}"; do
+    if sc22_route_ok "${near[$i]}" "$sc22_bound"; then
+      setup_error "SC22: the route detector accepted a near miss it must reject: ${names[$i]}" \
+        "record: [${near[$i]}]" \
+        "the detectors' own control, not the SC22 Then"
+    fi
+    printf 'SC22 control: rejected %s\n' "${names[$i]}"
+  done
+}
+
+check_sc22_completion_detector() {
+  local good i
+  local -a names=() near=()
+  good="$(sc22_crossing_good)"
+  sc22_completion_ok "$good" "$sc22_bound" ||
+    setup_error "SC22: the completion detector rejected the well-formed record it must accept" \
+      "record: [$good]" \
+      "the detectors' own control, not the SC22 Then"
+  printf 'SC22 control: accepted the completed crossing as %s\n' "$good"
+
+  # The chain that never completed, with its continuation's run count missing: the shape a lost wake leaves.
+  names+=("a chain that never completed, its deferred continuation never run")
+  near+=("$(sc22_crossing_record 0 1 "$sc22_chain_links" 0 1 1 "$sc22_bound" 0)")
+
+  # Completed-looking, but read from a cell rather than from the work: nothing ran.
+  names+=("a completion whose continuation never ran")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 0 1 1 3 0)")
+
+  # A link short: the creator ran and the chain claims to have completed.
+  names+=("a completed chain with its link short")
+  near+=("$(sc22_crossing_record 1 1 0 1 1 1 3 0)")
+
+  # Every link on one carrier: the crossing the clause requires was not observed.
+  names+=("a completion on one carrier where a crossing was required")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 1 0 1 3 0)")
+
+  # A completion that arrived at nothing parked: the wake the parked count is about never happened.
+  names+=("a completion that arrived at no parked wait")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 1 1 0 3 0)")
+
+  # A completion read after the mode's own round count expired: a drain, not a completion.
+  names+=("a completion read after the mode's own round count expired")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 1 1 1 "$sc22_bound" 0)")
+
+  # A link run twice.
+  names+=("a link run twice")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 2 1 1 3 0)")
+
+  # Work the drain left behind.
+  names+=("a drain that left the deferred item behind")
+  near+=("$(sc22_crossing_record 1 1 "$sc22_chain_links" 1 1 1 3 1)")
+
+  for i in "${!near[@]}"; do
+    if sc22_completion_ok "${near[$i]}" "$sc22_bound"; then
+      setup_error "SC22: the completion detector accepted a near miss it must reject: ${names[$i]}" \
+        "record: [${near[$i]}]" \
+        "the detectors' own control, not the SC22 Then"
+    fi
+    printf 'SC22 control: rejected %s\n' "${names[$i]}"
+  done
+}
+
+# --- SC22 — a step's deferred enqueue takes the route of the worker that fires it: the item a peer thread's
+# resolving step defers arrives on that worker's own pool, and a chain across carriers completes ——————————————————
+check_sc22() {
+  local out status cfg bound cfg_p
+  local r_creator r_firer r_p r_cpb r_cpa r_fpb r_fpa r_pending r_ctid r_ftid r_ktid r_kruns r_rr r_bound r_runus
+  local x_p x_completed x_cruns x_chruns x_kruns x_crossed x_wp x_ctid x_chid x_ktid x_crounds x_bound x_held x_runus
+  local line crossing_line l
+  local -a records=() crossings=() then_lines=()
+
+  sc22_expectation
+
+  out="$(bounded lake exe controls --executor-route)"
+  status=$?
+  check_status SC22 "$status" "lake exe controls --executor-route"
+  require_header "$out"
+
+  # The mode's own configuration: its round count is read from there rather than typed here, and the detectors'
+  # controls are stated at that bound.
+  cfg="$(grep '^sc22cfg|' <<<"$out" | head -1)"
+  [ -n "$cfg" ] ||
+    setup_error "SC22: the configuration record is missing" "no sc22cfg record in the invocation"
+  bound_field bound bound "${cfg#sc22cfg|}" "SC22 config"
+  bound_field cfg_p p "${cfg#sc22cfg|}" "SC22 config"
+  sc22_bound="$bound"
+  [ "$bound" -gt 0 ] ||
+    setup_error "SC22: the mode declares no round count" "observed: bound=$bound" "a fixture defect, not the SC22 Then"
+  [ "$cfg_p" = "$sc22_p" ] ||
+    then_lines+=("SC22 Then: the invocation is not the mode's stated $sc22_p carriers
+  observed: p=$cfg_p")
+
+  check_sc22_route_detector
+  check_sc22_completion_detector
+
+  # The route record: the arrival of the item the firing worker's step deferred.
+  mapfile -t records < <(grep '^route|' <<<"$out" || true)
+  [ "${#records[@]}" -eq 1 ] ||
+    fail "SC22 Then (O1): the deferred item's arrival was not reported exactly once" \
+      "expected exactly one route| record, saw ${#records[@]}"
+  line="${records[0]}"
+  record_is "${line#route|}" creator firer p creatorPoolBefore creatorPoolAfter firerPoolBefore firerPoolAfter \
+    pendingAfter creatorTid firerTid continuationTid continuationRuns resolverRounds bound runUs ||
+    fail "SC22 Then (O1): the deferred item's arrival was not reported exactly once" \
+      "the record is not exactly creator/firer/p/creatorPoolBefore/creatorPoolAfter/firerPoolBefore/firerPoolAfter/pendingAfter/creatorTid/firerTid/continuationTid/continuationRuns/resolverRounds/bound/runUs with nonempty values: [$line]"
+
+  bound_field r_creator creator "$line" "SC22 Then (O1)"
+  bound_field r_firer firer "$line" "SC22 Then (O1)"
+  bound_field r_p p "$line" "SC22 Then (O1)"
+  bound_field r_cpb creatorPoolBefore "$line" "SC22 Then (O1)"
+  bound_field r_cpa creatorPoolAfter "$line" "SC22 Then (O1)"
+  bound_field r_fpb firerPoolBefore "$line" "SC22 Then (O1)"
+  bound_field r_fpa firerPoolAfter "$line" "SC22 Then (O1)"
+  bound_field r_pending pendingAfter "$line" "SC22 Then (O1)"
+  bound_field r_ctid creatorTid "$line" "SC22 Then (O1)"
+  bound_field r_ftid firerTid "$line" "SC22 Then (O1)"
+  bound_field r_ktid continuationTid "$line" "SC22 Then (O1)"
+  bound_field r_kruns continuationRuns "$line" "SC22 Then (O1)"
+  bound_field r_rr resolverRounds "$line" "SC22 Then (O1)"
+  bound_field r_bound bound "$line" "SC22 Then (O1)"
+  bound_field r_runus runUs "$line" "SC22 Then (O1)"
+
+  # The mode's own stated identities, checked against the derived ones: another pair of roles, or another
+  # carrier count, is this clause's own failure rather than a silent pass.
+  [ "$r_p" = "$sc22_p" ] ||
+    then_lines+=("SC22 Then (O1): the run's carrier count is not the mode's stated $sc22_p
+  observed: p=$r_p")
+  [ "$r_creator" = "$sc22_creator" ] ||
+    then_lines+=("SC22 Then (O1): the creator's worker is not the mode's stated $sc22_creator
+  observed: creator=$r_creator")
+  [ "$r_firer" = "$sc22_firer" ] ||
+    then_lines+=("SC22 Then (O1): the firing worker is not the mode's stated $sc22_firer
+  observed: firer=$r_firer")
+  [ "$r_bound" = "$bound" ] ||
+    then_lines+=("SC22 Then (O1): the record's round count is not the one the mode printed
+  observed: bound=$r_bound printed=$bound")
+
+  sc22_route_ok "$line" "$bound" ||
+    then_lines+=("SC22 Then (O1): the item the peer thread's step deferred did not arrive on the firing worker's own pool — it landed in the creator's pool, or on the shared list, and the creator ran it rather than the firing worker
+  observed: creator=$r_creator firer=$r_firer p=$r_p creatorPoolBefore=$r_cpb creatorPoolAfter=$r_cpa firerPoolBefore=$r_fpb firerPoolAfter=$r_fpa pendingAfter=$r_pending creatorTid=$r_ctid firerTid=$r_ftid continuationTid=$r_ktid continuationRuns=$r_kruns resolverRounds=$r_rr bound=$r_bound
+  expected: creatorPoolAfter=$sc22_creator_pool_after firerPoolAfter=$sc22_firer_pool_after pendingAfter=$sc22_pending_after continuationRuns=1 continuationTid=$r_ftid resolverRounds<bound
+  note: the fire is the resolving step, fired with the firing worker's own routes, and the continuation it defers holds the route the awaiting step was given")
+
+  # The crossing record: the chain's completion across carriers, read from the work's own run counts.
+  mapfile -t crossings < <(grep '^crossing|' <<<"$out" || true)
+  [ "${#crossings[@]}" -eq 1 ] ||
+    fail "SC22 Then (O2): the chain's completion was not reported exactly once" \
+      "expected exactly one crossing| record, saw ${#crossings[@]}"
+  crossing_line="${crossings[0]}"
+  record_is "${crossing_line#crossing|}" p completed creatorRuns childRuns continuationRuns crossed waiterParked \
+    creatorTid childTid continuationTid completionRounds bound heldAfterStop runUs ||
+    fail "SC22 Then (O2): the chain's completion was not reported exactly once" \
+      "the record is not exactly p/completed/creatorRuns/childRuns/continuationRuns/crossed/waiterParked/creatorTid/childTid/continuationTid/completionRounds/bound/heldAfterStop/runUs with nonempty values: [$crossing_line]"
+
+  bound_field x_p p "$crossing_line" "SC22 Then (O2)"
+  bound_field x_completed completed "$crossing_line" "SC22 Then (O2)"
+  bound_field x_cruns creatorRuns "$crossing_line" "SC22 Then (O2)"
+  bound_field x_chruns childRuns "$crossing_line" "SC22 Then (O2)"
+  bound_field x_kruns continuationRuns "$crossing_line" "SC22 Then (O2)"
+  bound_field x_crossed crossed "$crossing_line" "SC22 Then (O2)"
+  bound_field x_wp waiterParked "$crossing_line" "SC22 Then (O2)"
+  bound_field x_ctid creatorTid "$crossing_line" "SC22 Then (O2)"
+  bound_field x_chid childTid "$crossing_line" "SC22 Then (O2)"
+  bound_field x_ktid continuationTid "$crossing_line" "SC22 Then (O2)"
+  bound_field x_crounds completionRounds "$crossing_line" "SC22 Then (O2)"
+  bound_field x_bound bound "$crossing_line" "SC22 Then (O2)"
+  bound_field x_held heldAfterStop "$crossing_line" "SC22 Then (O2)"
+  bound_field x_runus runUs "$crossing_line" "SC22 Then (O2)"
+
+  [ "$x_bound" = "$bound" ] ||
+    then_lines+=("SC22 Then (O2): the crossing record's round count is not the one the mode printed
+  observed: bound=$x_bound printed=$bound")
+
+  sc22_completion_ok "$crossing_line" "$bound" ||
+    then_lines+=("SC22 Then (O2): the chain across carriers did not complete on the work's own reading — a link did not run, the crossing was not observed, or the completion was not the work's
+  observed: p=$x_p completed=$x_completed creatorRuns=$x_cruns childRuns=$x_chruns continuationRuns=$x_kruns crossed=$x_crossed waiterParked=$x_wp creatorTid=$x_ctid childTid=$x_chid continuationTid=$x_ktid completionRounds=$x_crounds bound=$x_bound heldAfterStop=$x_held
+  expected: completed=1 creatorRuns=1 childRuns=$sc22_chain_links continuationRuns=1 crossed=1 waiterParked=1 creatorTid≠childTid completionRounds<bound heldAfterStop=$sc22_pending_after
+  note: 'completed' is resolved by the chain's own last step, so a completion read from a cell the fixture wrote is not this reading; and a drain after the mode's round count is not a completion")
+
+  if [ "${#then_lines[@]}" -ne 0 ]; then
+    for l in "${then_lines[@]}"; do printf '%s\n' "$l" >&2; done
+    exit 1
+  fi
+
+  printf 'SC22 ok: route creator=%s firer=%s p=%s creatorPoolBefore=%s creatorPoolAfter=%s firerPoolBefore=%s firerPoolAfter=%s pendingAfter=%s creatorTid=%s firerTid=%s continuationTid=%s continuationRuns=%s resolverRounds=%s | crossing p=%s completed=%s creatorRuns=%s childRuns=%s continuationRuns=%s crossed=%s waiterParked=%s childTid=%s completionRounds=%s heldAfterStop=%s bound=%s\n' \
+    "$r_creator" "$r_firer" "$r_p" "$r_cpb" "$r_cpa" "$r_fpb" "$r_fpa" "$r_pending" "$r_ctid" "$r_ftid" \
+    "$r_ktid" "$r_kruns" "$r_rr" "$x_p" "$x_completed" "$x_cruns" "$x_chruns" "$x_kruns" "$x_crossed" \
+    "$x_wp" "$x_chid" "$x_crounds" "$x_held" "$bound"
+}
+
 case "${1:-}" in
 SC1) check_sc1 ;;
 SC2) check_sc2 ;;
@@ -4229,8 +4633,9 @@ SC18) check_sc18 ;;
 SC19) check_sc19 ;;
 SC20) check_sc20 ;;
 SC21) check_sc21 ;;
+SC22) check_sc22 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22\n' >&2
   exit 2
   ;;
 esac

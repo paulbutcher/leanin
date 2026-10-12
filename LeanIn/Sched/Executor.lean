@@ -42,30 +42,26 @@ through the same operations, which is why no existing scenario's driver changed.
 operations: the calling thread stands in for worker `0`, so a single-carrier path takes the same critical
 sections a carrier does.
 
-## The local route, and why a local push must still wake
+## The local route, and why a local push owes no wake
 
 A push a step makes on its own worker is the owner's, and the owner is running the step that makes it, so it
-owes no wake. That is not every local push. `LeanIn/Task/Basic.lean`'s `Async.await` and `select` register
-`ctx.resume` on a `Join` cell, and the thread that *runs* that continuation is whichever carrier resolved the
-cell — which, for a child delivered through the shared list, is not the awaiting worker. So an off-owner item
-can land in a worker's own queue, and the waiting predicate cannot see it: it re-checks the shared cell, and
-reading the owner's pool there would invert the total lock order. The audit that named the two seam completions
-(`Runtime/Leaf.lean`'s leaf continuations and `Runtime/Blocking.lean`'s blocking completion) therefore had a
-**third** site on the task layer, and it is why `Executor.wakeIfParked` records a per-worker flag and wakes every
-waiter from `submitLocalRaw`/`spawnLocalRaw` — an off-owner local push is visible to the shared cell and the
-owner is among the woken. A local push that *is* owner-made pays that section for nothing; with one condvar and
-a `notifyOne` a wake can reach a waiter other than the owner, which is why the wake is a broadcast.
+owes no wake — and after the route rebinding it is the *only* kind of local push there is. A step's own
+re-enqueue takes the route of the worker firing it (`Ctx.resume`), and every resume that is not a step's own —
+the two seam completions (`Runtime/Leaf.lean`'s leaf continuations and `Runtime/Blocking.lean`'s blocking
+completion), the harness clock's fire, `Runtime.Handle.spawn`, the root pushes — takes the **shared** route,
+whose push appends to the inject and unparks a parked waiter *inside that section* (`Executor.pushItems`). So
+nothing outside a worker's own step writes that worker's queue, which is the model's `pushLocal` premise
+(`docs/interface.md`'s obligation table) as an implementation fact rather than a convention.
 
-**This is the standing mechanism, not a staging stand-in.** Its removal belongs to a following item that
-rebinds each item's `Ctx.resume` at fire time to the firing worker's route — the shape `Item.act : Nat → IO Unit`
-already models for roots — because that makes the continuation's route the *resolver's* and the local route
-owner-only again. Routing this site through `resumeShared` instead was rejected: the route on the cell is the
-awaiter's but the continuation runs on the resolver, so a shared route would send every await continuation
-through the shared list and let a chain cross a carrier on a tree where nothing was stolen.
-
-**Every off-owner push that is not one of those three sites takes the shared route**: the external spawn, a
-local overflow and the flush arrive at `Executor.pushItems`, which appends and, inside the same section, unparks
-one waiter. The two seam completions take `Ctx.resumeShared` for the same reason.
+**This section is history, kept because it is what the code used to do.** The third off-owner local push —
+`LeanIn/Task/Basic.lean`'s `Async.await` and `select`, which registered `ctx.resume` on a `Join` cell and had
+it run on whichever carrier resolved the cell — was covered by a per-worker wake flag recorded in the shared
+cell plus a broadcast, so the owner was among the woken. It is gone with the rebinding, and the per-push
+section that local pushes paid for it went with it (`spawnLocalRaw`/`submitLocalRaw` now make one pool
+transaction and nothing else). `docs/decisions.md`'s D22 records the mechanism by name. Routing that site
+through `resumeShared` instead was rejected then and stays rejected: the route on the cell is the awaiter's but
+the continuation runs on the resolver, so a shared route would send every await continuation through the shared
+list and let a chain cross a carrier on a tree where nothing was stolen.
 
 The parallel entry starts `p` dedicated carriers and submits the program's root to the shared list, and the
 caller **only waits** on the program's completion (`Runtime.runCarriers`, `Executor.waitFinished`); it does
@@ -140,28 +136,7 @@ driver's predicate reads it in the same section as the shared list — one cell,
 and so no second order. A *further refusal* on a park cannot lose a wakeup (`Live` is monotone in refusals),
 so the model's `park` premise is untouched. One driver per executor, so one flag. -/
   finished : Bool := false
-  /-- **A push into worker `i`'s own queue has happened**, one flag per worker.
-
-The local route is *meant* to be owner-only (`spawnLocal` notifies nobody), and it is for every push a step
-makes on its own worker. It is **not** owner-only for a `Join`-cell continuation: `Async.await` and `select`
-register `ctx.resume`, and the thread that *runs* that continuation is whichever one resolved the cell — the
-carrier that ran the awaited task's last step — which for a child delivered through the shared list is not the
-awaiting worker. So an off-owner item can land in a worker's own queue, and the waiting predicate cannot see it
-(it re-checks the shared cell, and reading the owner's pool there would invert the lock order). This flag
-carries that push's visibility into the shared cell: recorded under this cell's lock after the pool's, it is
-what a waiter can see, and `wakeIfParked` wakes every waiter so the owner is among them. One flag per worker,
-because a cell-wide flag is consumed by whichever waiter evaluates a predicate first, which need not be the
-owner. -/
-  poked    : List Bool := []
 deriving Inhabited
-
-/-- **Set or clear worker `i`'s poke flag**, leaving a list that is too short alone, as `countersAt` does for
-the per-carrier counters: the list is indexed by worker number, so a partial list must not be a defect. -/
-private def pokedAt (i : Nat) (v : Bool) : List Bool → List Bool
-  | [] => []
-  | b :: rest => match i with
-    | 0 => v :: rest
-    | n + 1 => b :: pokedAt n v rest
 
 /-- The composition's own accounting, as one reading: every worker's pool, the shared list, and the two
 counters that say what has left. `held` is the same sum the model's `Multi.held` is, which is what makes a
@@ -252,8 +227,7 @@ def Executor.new (α : Type) (cap : Nat) (workers : Nat) : IO (Executor α cap) 
     ws := ws.push (← Std.Mutex.new (emptyPool α cap))
   return { workers           := ws
            inject            := ← Std.Mutex.new
-             { items := {}, parked := 0, total := n, stopping := false, served := 0
-               poked := List.replicate n false }
+             { items := {}, parked := 0, total := n, stopping := false, served := 0 }
            cv                := ← Std.Condvar.new
            metered           := false
            counters          := ← Std.Mutex.new ((List.range n).map (fun _ => ({} : CarrierCounters)))
@@ -300,19 +274,6 @@ def Executor.pushItems (e : Executor α cap) (xs : List α) : BaseIO Unit :=
 def Executor.pushInjectRaw (e : Executor α cap) (x : α) : BaseIO Unit :=
   e.pushItems [x]
 
-/-- **Record that worker `i`'s own queue got a push, and wake every parked waiter.**
-
-A local push into the owner's own queue owes no wake *when the owner makes it*, and that is every push a step
-makes on its own worker. It is not every local push: a `Join`-cell continuation (`Async.await`, `select`) runs
-on whichever carrier resolved the cell, so it can push onto a worker that is parked. This records the push in
-the shared cell — the only place a waiting predicate can see it under the lock order — and wakes every waiter,
-so the owner is among the woken; a spurious wake is what `A4` allows. -/
-def Executor.wakeIfParked (e : Executor α cap) (i : Nat) : BaseIO Unit := do
-  e.inject.atomically do
-    let st ← get
-    set { st with poked := pokedAt i true st.poked }
-    if 0 < st.parked then e.cv.notifyAll else pure ()
-
 /-- Pop one item off the front of the shared list. -/
 def Executor.popInject (e : Executor α cap) : IO (Option α) :=
   e.inject.atomically do
@@ -355,6 +316,9 @@ def Executor.stop (e : Executor α cap) : IO Unit :=
 /-- **T3, the local submit**: worker `i`'s ring, and the placement rule's overflow appended to the shared
 list in the same path. The shared section is taken after this pool's, which is the only lock order here.
 
+The push is owner-made — a step's own re-enqueue takes the route of the worker firing it — so it owes no wake
+and takes no second section; the overflow, if any, unparks through `pushItems` as every shared push does.
+
 `@[inline]`: a per-item hot path, like `takeFor` — the body is one pool transaction. -/
 @[inline]
 def Executor.submitLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Unit :=
@@ -364,10 +328,9 @@ def Executor.submitLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Un
     let r := p.submit x
     set r.2
     if !r.1.isEmpty then e.pushItems r.1
-    e.wakeIfParked i
 
 /-- **T2, the local spawn**: worker `i`'s LIFO slot, displacing its occupant through the same placement
-rule a submit uses. -/
+rule a submit uses. Owner-made, so no wake (see `submitLocalRaw`). -/
 @[inline]
 def Executor.spawnLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Unit :=
   (e.cell i).atomically do
@@ -376,7 +339,6 @@ def Executor.spawnLocalRaw (e : Executor α cap) (i : Nat) (x : α) : BaseIO Uni
     let r := p.spawn x
     set r.2
     if !r.1.isEmpty then e.pushItems r.1
-    e.wakeIfParked i
 /-- **T4, the tick**: worker `i`'s allowance refreshes, and only worker `i`'s. -/
 def Executor.tickFor (e : Executor α cap) (i : Nat) : IO Unit :=
   (e.cell i).atomically do
@@ -450,9 +412,7 @@ def Executor.park (e : Executor α cap) (i : Nat) : IO Bool := do
     e.inject.atomicallyOnce e.cv
       (pred := do
         let st ← get
-        let mine := st.poked.getD i false
-        if st.stopping ∨ mine ∨ st.items.size ≠ 0 then
-          if mine then set { st with poked := pokedAt i false st.poked }
+        if st.stopping ∨ st.items.size ≠ 0 then
           return true
         else
           -- Every waiter records itself, once per wait. The predicate is re-evaluated after every wake, and a
@@ -486,9 +446,7 @@ def Executor.waitForWork (e : Executor α cap) : IO Unit := do
   e.inject.atomicallyOnce e.cv
     (pred := do
       let st ← get
-      let mine := st.poked.getD 0 false
-      if st.items.size ≠ 0 ∨ mine ∨ st.finished then
-        if mine then set { st with poked := pokedAt 0 false st.poked }
+      if st.items.size ≠ 0 ∨ st.finished then
         return true
       else
         -- Every waiter records itself, once per wait, the driver included: a wait that did not record itself

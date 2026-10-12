@@ -178,7 +178,10 @@ private partial def serveBoundedLoop (hooks : Hooks) (l : Listener) (sem : Task.
     let client ← try
       Listener.accept l hooks
     catch e =>
-      monadLift (Task.Sync.Semaphore.release sem)
+      -- The release delivers the waiters it wakes on the *releasing* step's own route, so the route of this
+      -- step travels with the call.
+      let push ← Task.EAsync.ofAsync Task.Async.push
+      monadLift (Task.Sync.Semaphore.release sem push)
       throw e
     let h ← Task.MonadAsync.spawn (serve client)
     monadLift (Task.Registry.add reg h)
@@ -211,11 +214,12 @@ def serveBounded (hooks : Hooks) (l : Listener) (bound : Nat) (n : Nat)
     (body : Conn → Task.EAsync IO.Error Unit) : Task.EAsync IO.Error Unit := do
   let sem ← monadLift (Task.Sync.Semaphore.new bound)
   let serve (c : Conn) : Task.EAsync IO.Error Unit := do
+    let push ← Task.EAsync.ofAsync Task.Async.push
     try
       body c
-      monadLift (Task.Sync.Semaphore.release sem)
+      monadLift (Task.Sync.Semaphore.release sem push)
     catch e =>
-      monadLift (Task.Sync.Semaphore.release sem)
+      monadLift (Task.Sync.Semaphore.release sem push)
       throw e
   let reg : Task.Registry (Except IO.Error Unit) ← monadLift (Task.Registry.new (α := Except IO.Error Unit))
   serveBoundedLoop hooks l sem serve 0 n reg

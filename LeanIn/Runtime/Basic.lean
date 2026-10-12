@@ -12,11 +12,13 @@ driver (`run`/`runWith`/`blockOn`) runs worker `0`'s loop **on the calling threa
 operations. That is why no existing scenario's driver changed: a single-carrier run is worker `0`, and the
 instrument it uses is the one a carrier uses.
 
-**Routes.** A computation's re-enqueue route is not captured at its spawn site any more: the *worker that
-fires a step* supplies its own route, so a computation's children follow the worker that ran the parent —
-`docs/interface.md` §3's rule ("a chain stays on the core its parent ran on") now stated at P carriers. The
-root of a chain is submitted to the **shared list** (`Executor.pushInject`), because no worker owns it, and
-the item it builds is `Item.ofRouted`: its body receives the firing worker's route instead of a captured one.
+**Routes.** A computation's re-enqueue route is never captured at a spawn site: the *worker that fires a step*
+supplies it. `fired` builds a root's `Ctx` with that worker's own route as the local one and the runtime's route
+*table* beside it, so a step's re-enqueue takes the route of the worker that fires it — `docs/interface.md` §3's
+rule ("a chain stays on the core its parent ran on") stated at P carriers — and a continuation another worker
+delivers (`Task.Item.ofDeferred`) reads the table at the index it is fired with rather than holding a route that
+was resolved before it ran. The root of a chain is submitted to the **shared list** (`Executor.pushInject`),
+because no worker owns it.
 
 **What crosses a carrier boundary.** Every push into a carrier's queue goes through `Task.Send.lean`'s marker
 (`Executor.pushInject`/`spawnLocal`/`submitLocal`, all of which take a `Sendable`), so the values that cross
@@ -40,29 +42,38 @@ inductive Priority where
   | high
   | normal
 
-/-- **The fire entry for an `ofIndexed` root**: run computation `a` on the worker whose index is `i`, with
-that worker's own routes on the `Ctx`.
+/-- **The shared route as a push function**: the inject, whose push unparks a parked waiter. A thread that is not
+a carrier reaches the composition through this — `Handle.spawn`'s items, the seam completions' continuations, and
+a resolution made off-carrier (`Join.resolve`'s `push`) — which is why those pushes need no wake flag of their
+own. It is also the `Ctx.resumeShared` every step carries. -/
+def sharedPush (e : Executor cap) : Task.Item → BaseIO Unit :=
+  fun it => e.pushInject (Task.Item.sendable it)
+
+/-- **The fire entry for an `ofIndexed` root**: run computation `a` on the worker whose index is `i`, with that
+worker's own route and the runtime's route *table* on the `Ctx`.
 
 The local route is the *firing* worker's (`Executor.route e i`), so a child a step spawns follows the worker
-that ran the parent — `docs/interface.md` §3's rule at P carriers — and the shared route is the inject, for
-the seam continuations that run on a thread which is not the owning carrier. `done` is the computation's
-finish. -/
-def fired (cancel : Task.Cancel) (e : Executor cap) (a : Task.Async α) (done : α → IO Unit)
+that ran the parent — `docs/interface.md` §3's rule at P carriers — and the table is that same route for every
+worker, which is what lets a continuation another worker delivers read *its* route at the index it is fired with
+(`Task.Item.ofDeferred`). The shared route is the inject, for the deliveries made from a thread that is not the
+owning carrier. `done` is the computation's finish, and it takes the context of the step that finished, so a
+completion delivers its awaiter on that worker's own queue. -/
+def fired (cancel : Task.Cancel) (e : Executor cap) (a : Task.Async α) (done : α → Task.Ctx → IO Unit)
     (i : Nat) : IO Unit :=
-  let ctx : Task.Ctx :=
-    { cancel       := cancel
-    , resume       := (e.route i).enqueue
-    , resumeShared := fun it => e.pushInject (Task.Item.sendable it)
-    , «local»      := {} }
-  a.step done ctx
+  a.step done (Task.Ctx.at cancel (fun n it => (e.route n).enqueue it) (sharedPush e) {} i)
 
 /-- **Spawn from the calling thread**: the placement `prio` asks for, on worker `0` — `.high` puts the step in
 the LIFO slot and `.normal` in the ring — so the lane keeps the mechanism `SC16` asserts. A `.high` task is
-served sooner, never promised to run. -/
+served sooner, never promised to run.
+
+The push is worker `0`'s own queue and the calling thread is worker `0`'s stand-in (the `Runtime.blockOn`
+convention), so the push is owner-made when the driver makes it; a spawn from a thread that owns no queue is
+`Handle.spawn`, which takes the shared route. -/
 def spawn (e : Executor cap) (prio : Priority) (a : Task.Async α) : IO (Task.Task α) := do
   let cell ← Task.Join.new
   let cancel ← Task.Cancel.new
-  let it := Task.Item.ofIndexed (some cancel) (fired cancel e a (fun v => Task.Join.resolve cell v))
+  let it := Task.Item.ofIndexed (some cancel)
+    (fired cancel e a (fun v ctx => Task.Join.resolve cell ctx.resume v))
   match prio with
   | .high   => e.spawnLocal 0 (Task.Item.sendable it)
   | .normal => e.submitLocal 0 (Task.Item.sendable it)
@@ -114,7 +125,8 @@ therefore a request the firing worker's own route honours, not a choice this cal
 def Handle.spawn (h : Handle Task.Item cap) (_prio : Priority) (a : Task.Async α) : IO (Task.Task α) := do
   let cell ← Task.Join.new
   let cancel ← Task.Cancel.new
-  let it := Task.Item.ofIndexed (some cancel) (fired cancel h.e a (fun v => Task.Join.resolve cell v))
+  let it := Task.Item.ofIndexed (some cancel)
+    (fired cancel h.e a (fun v ctx => Task.Join.resolve cell ctx.resume v))
   h.e.pushInject (Task.Item.sendable it)
   return ⟨cell, cancel⟩
 
@@ -255,7 +267,9 @@ def runWith (e : Executor cap) (now : IO Nat) (idle : IO Bool) (a : Task.Async �
   -- The driver's own computation carries no token and no handle: the driver is a caller's thread waiting, and
   -- the computation it drives is not one another task holds a handle to.
   let cancel ← Task.Cancel.new
-  let finish : α → IO Unit := fun v => do
+  -- The driver's completion needs no route: it records itself in the cell the driver waits on, and the driver
+  -- is the thread that waits, so nothing is delivered to a queue. The context is therefore ignored.
+  let finish : α → Task.Ctx → IO Unit := fun v _ => do
     done.atomically do set (some v)
     e.noteFinished
   let it := Task.Item.ofIndexed (some cancel) (fired cancel e a finish)
@@ -284,7 +298,9 @@ def runCarriers (e : Executor cap) (p : Nat) (a : Task.Async α) : IO (Carriers 
   let done ← Std.Mutex.new (none : Option α)
   e.clearFinished
   let cancel ← Task.Cancel.new
-  let finish : α → IO Unit := fun v => do
+  -- The driver's completion needs no route: it records itself in the cell the driver waits on, and the driver
+  -- is the thread that waits, so nothing is delivered to a queue. The context is therefore ignored.
+  let finish : α → Task.Ctx → IO Unit := fun v _ => do
     done.atomically do set (some v)
     e.noteFinished
   let it := Task.Item.ofIndexed (some cancel) (fired cancel e a finish)

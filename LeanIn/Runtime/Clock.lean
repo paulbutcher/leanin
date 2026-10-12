@@ -89,11 +89,25 @@ def HarnessClock.advance (hc : HarnessClock) : IO Bool := do
   | some fire => fire; return true
 
 /-- **The clock this harness drives.** Its `sleep` schedules a fire and returns: the wait is a list insertion,
-and the fire runs when the driver advances to it, resuming the awaiter on the driver's own thread. -/
+and the fire runs when the driver advances to it, resuming the awaiter on the driver's own thread.
+
+The fire takes the **shared** route, and it is the general rule for a resume that is not a step's own
+re-enqueue: an expiry is an *event*, not the sleeping step re-scheduling itself, and the thread that advances the
+clock is not the sleeper's worker in general — so the delivery goes through the inject, whose push unparks a
+parked waiter under its own lock, rather than onto a worker's own queue from another thread. The continuation
+itself is `Item.ofDeferred`, so it still carries the sleeping computation's token and a route read at the index it
+is fired with.
+
+Pushing on the *sleeper's* local route was considered and rejected. It is owner-made under `runVirtual` —
+`runWith` drives worker `0` on the calling thread and is the only advancer this seam is used with, so the
+advancer and the sleeper's worker coincide — but that is a *caller's* convention, and this milestone deletes the
+per-worker wake flag that such a convention would otherwise need: a `clock` driven from another thread, or from
+another carrier, would push into a parked worker's own queue with nothing to wake it. A step's own re-enqueue is
+the only resume that may take the local route; every other one takes the shared route, and this is one of them. -/
 def HarnessClock.clock (hc : HarnessClock) : Clock :=
   { now   := hc.now
   , sleep := fun d => ⟨fun k ctx => do
-      let fire : IO Unit := do ctx.resume (Task.Item.ofAction (k ()))
+      let fire : IO Unit := do ctx.resumeShared (Task.Item.ofDeferred ctx (k ()))
       let now0 ← hc.now
       hc.schedule (now0 + d.val.toNat) fire
       return ()⟩ }

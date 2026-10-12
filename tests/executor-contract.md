@@ -759,8 +759,11 @@ their own named fields:
   one of the carriers' own (`ranTids ⊆ carrierTids`, so the work ran on the *started* carriers and not on
   the thread that called the entry). The affirmative control, in the same run, is `carrierCount1 = 1`:
   the same detector on the `P = 1` arm reads exactly one distinct carrier tid, so `≥ 2` at `P = 4` is a
-  reading about a detector that can also read one. `chainCarriers = 1` binds the second measurement
-  condition's structural half — a chain did not cross carriers — to the same record. The record's
+  reading about a detector that can also read one. `chainCarriers` is bound by its own named field — so a
+  record whose shape lost it is rejected — and its value is compared in no clause, the same treatment SC19's
+  `pendingHooks` received under D20: the route rebinding makes the count a consequence of the scheduler's
+  choice — a chain follows the worker that fires each link — so no fixed value is a property of this clause.
+  The record's
   `carriers` field — how many carriers the entry actually started, `Carriers.count`, read before the
   carriers are stopped — is shape-checked but deliberately **not** one of O1's bindings: the red is the
   relation `ranTids ⊆ carrierTids`, not this count (under the staged entry `carriers` reads `0` and the
@@ -786,10 +789,11 @@ their own named fields:
   `inFlightAfter = 0` and `pendingHooks = 0`. `wokeRounds < bound` is read against the bound the mode
   printed (`carrierscfg|bound`), not a literal, so a mode run at another bound cannot silently pass; a
   bound that expires is read as `wokeRounds = bound` with this clause's own assertion failing, never as a
-  setup error. **And the chain arm starts its carriers too**, so `chainCarriers = 1` is an *affirmative*
-  control rather than a construction artifact: with `p` carriers running, a thief can reach a ring item of
-  the carrier running the chain, so a crossing is possible and its absence is a reading, which is what the
-  vacuity rule requires and what a chain measured with no carriers started could never show. The **scale
+  setup error. **And the chain arm starts its carriers too**, which is what keeps a crossing possible rather
+  than a construction artifact: with `p` carriers running, a thief can reach a ring item of the carrier
+  running the chain, so a link may run on a carrier other than its creator's — the reading W18's route
+  rebinding makes legitimate, and which the clause no longer asserts against (`chainCarriers` is compared in
+  no clause). The **scale
   arm**'s `remaining = 0` at `scaleN = 100000` is the affirmative control for "a carrier that parks
   mid-run is woken again" at a size that forces many parks and wakes.
 
@@ -805,26 +809,35 @@ is the clause's own subject is both.
 | `distinctCarriers` (`p = 4`) | `1` — the caller alone | `4`, all from `carrierTids` |
 | `ranTids ⊆ carrierTids` | **no** — the caller's tid is in `ranTids` and `carrierTids` is empty | yes |
 | `carrierCount1` | `1` | `1` |
-| `chainCarriers` | **greater than 1 as measured** — the staged route is captured as worker 0 while the seam sits on the shared route, so a link resumed from the inject lands on another carrier and the chain genuinely crosses; the assertion is about the fixed tree | `1` — the index route plus the owner-only local route keep every link owner-made |
+| `chainCarriers` | not asserted — bound by its own named field and shape-checked, its value compared in no clause (the same treatment in substance that D20 gave SC19's and SC20's `pendingHooks`, and stricter in form: the field keeps a numeric shape gate where that binding has none); the rebinding makes a crossing legitimate, so no fixed value is a property of this clause | not asserted, for the same reason |
 | `parkedBefore` (O3) | `p` | `p` — **no cut here**, so clause three is green on both trees and its red is unavailable |
 | O2's fields | as recorded (the batch-two cut: `victimRingAfter + 2 = victimRingBefore`, `thiefSlotAfter = some`) | as recorded (batch one: `victimRingAfter + 1 = victimRingBefore`, `thiefSlotAfter = -`); `slotVictimSlotBefore = some` in both |
 
-So **`chainCarriers = 1` is a fixed-tree assertion**, and that is said here where the clause is stated
-rather than only in the record: the chain arm keeps starting its carriers, because with none started a
-crossing could not have been observed and the assertion would be vacuous.
+So **`chainCarriers` is asserted on neither tree**: the route rebinding makes the count a consequence of the
+scheduler's choice — a chain follows the worker that fires each link — so the fixture binds and shape-checks
+the field and compares it in no clause, and the field's reading is left to the measurement rows rather than
+asserted as a fixed-tree property. The chain arm keeps starting its carriers, because with none started a
+crossing could not have been observed and the field's reading would be vacuous.
 
 **The detectors' own control, in the same run.** `carriers_ok`, `steal_ok` and `wake_ok` are the
 record-string detectors the assertions are built from. They must accept a well-formed record written from
-the record syntax and the expectation, and reject each near miss, one per clause plus the chain half:
+the record syntax and the expectation, and reject each near miss:
 the work ran on the thread that spawned it (`ranTid = spawnTid`), a thief took two from the ring
-(`victimRingAfter = victimRingBefore - 2`, the shape this tree's clause-two cut produces), a chain
-crossed carriers (`chainCarriers = 2`), and the slot-cleared record a slot-taking thief would produce
-(`slotStolen = yes`). The delivered near-miss count is four; a near miss a detector accepts is a fixture
+(`victimRingAfter = victimRingBefore - 2`, the shape this tree's clause-two cut produces), and the
+slot-cleared record a slot-taking thief would produce (`slotStolen = yes`). `carriers_ok` is also shown
+**accepting** a well-formed record carrying `chainCarriers = 2` — the legitimately-crossed shape W18's route
+rebinding makes — so the amendment trades the old rejection for an affirmation rather than dropping a
+control: a chain across carriers is the correct reading now, not a near miss. The delivered near-miss count
+is three; a near miss a detector accepts is a fixture
 defect reported as a **setup error**, separately from the `Then`. The mode's own `carriersctl|` readings
-must hold too: `accepted` for the well-formed pair, `rejected` for each of the four near misses, and
-`variants = 4`; and its `sendctl|unmarkedPushes` must read `0`. **The authority for those readings is the
-shell fixture's own exercises, not the mode's line**: the mode prints `carriersctl|` and `sendctl|` as
-fixed strings describing what the fixture runs — so they are *descriptions* of the exercises rather than
+must hold too: `accepted` for the mode's accepted set — `[carriersOk carriersGoodRec, stealOk stealGoodRec,
+carriersOk carriersNearChain]`, three records rather than a pair — `rejected` for each near miss the mode's
+own self-check exercises, and `variants = 3`; and its `sendctl|unmarkedPushes` must read `0`. The third
+record's chain field is read through `carriersOk`'s numeric shape gate before being compared in no clause: the
+same treatment in substance that D20 gave SC19's and SC20's `pendingHooks`, and stricter in form, since that
+binding keeps no numeric gate. **The authority for those
+readings is the shell fixture's own exercises, not the mode's line**: the mode prints `carriersctl|` and
+`sendctl|` as fixed strings describing the exercises it checks rather than
 readings of the system, and the near-miss rejections are proved by the fixture's own `setup_error` paths,
 which build each near miss from the record syntax and the expectation rather than from the executable's
 receipt. A printed constant must not be mistaken for evidence.
@@ -841,8 +854,7 @@ counts none of them: `carriers = 0`, `carrierTids = []`, `distinctCarriers = 1` 
 `ranTids = [<main>]` with `ranTids ⊄ carrierTids` — the red is the **relation**, so it does not depend on
 which carrier wins. (The earlier `p−1`-carrier form of this cut was a race — the caller ran none of the 2048
 bodies in 2 of 23 runs — and a clause's red cannot be a race.) The `P = 1` control still reads
-`carrierCount1 = 1`, and the chain arm's carriers make `chainCarriers` read greater than `1` on the staged
-tree where the clause binds `1`. Clause two's staged steal takes a **batch of two** from the victim's ring
+`carrierCount1 = 1`. Clause two's staged steal takes a **batch of two** from the victim's ring
 and gives the second to the thief's own slot, so the ring loses two where the design loses one and the
 thief's slot reads `some`. **Clause three has no staged red**: the parked-accounting cut is withdrawn
 (record §7), so `parkedBefore` reads `p` on the staged tree too and its wake readings pass — the run
@@ -859,7 +871,7 @@ SC18 Then: a thief took more than one element from the victim's ring
 and **no O3 `Then` is printed**: clause three is green on the staged tree, so it contributes no line.
 
 The same fields on the fixed tree read `carriers = 4`, `carrierTids` = the four carriers, then
-`distinctCarriers = 4` with `ranTids ⊆ carrierTids`, `chainCarriers = 1` and `parkedBefore = 4`, and clause
+`distinctCarriers = 4` with `ranTids ⊆ carrierTids` and `parkedBefore = 4`, and clause
 two reads `victimRingAfter = 199` with `thiefSlotAfter = -`. A red is only a red if it is a clause's own
 assertion: a missing or malformed record, a non-zero exit without the check's printed lines, or a watchdog
 expiry is a setup error, not the `Then`. Clause three's evidence is SC17-O1 at `P = 1` (a foreign push
@@ -1868,3 +1880,137 @@ carrier's own consequence — a chain that holds the slot being interrupted on t
 SC12's green and the take-path measurement's flush count, not this scenario's. (iv) The bound is a property of
 a chain that holds the slot: a chain whose links are served from the ring or the shared list never reaches
 this rule, and its shape is unchanged by it.
+
+### SC22 — a step's deferred enqueue takes the route of the worker that fires it, and a chain across carriers completes
+
+**Actor.** The public `controls` executable in a new mode, `lake exe controls --executor-route [--bound N]`,
+playing two arms over one invocation, both of them the task layer's own `Async.await`/`Join` machinery rather
+than a fixture-side stand-in.
+
+*The route arm* keeps its two roles on two workers of one `Sched.Executor.newMetered Task.Item 256 2`. Worker
+`1`'s shift is a dedicated thread of its own — `IO.asTask (Executor.workerLoop e (fun i it => it.fireWith i)) 1`
+with `Task.Priority.dedicated`, the same thread shape `Runtime.startCarriers` uses — and its identity is the tid
+`Executor.noteTid` records in the carrier counters' entry for it. Worker `0` has **no** loop of its own: the
+invocation's thread stands in for it, which is the driver's own convention (`Runtime.blockOn` drives worker `0`
+on the calling thread). The creator's step is the task layer's deferred registration — `Async.await` on a cell
+with no value yet — built as `Item.ofIndexed (some token) (Runtime.fired token e creatorProg done 0)`, so the
+`Ctx` it runs with has worker `0`'s routes; it is placed on worker `0`'s queue with `Executor.submitLocal` and
+fired with `Item.fireWith 0`. The resolving step is an item whose program is `Join.resolve cell ()` followed by a
+read of `Executor.snapshot`; it is delivered through the shared route (`Executor.pushInject`, the one route a
+thread that is not a carrier reaches) and fired by **worker `1`'s carrier with index `1`**, so the fire which
+defers comes from a peer thread relative to the creator.
+
+*The completion arm* is one `Runtime.Executor.newMetered 256 2` with both carriers started through
+`Runtime.startCarriers e 2` — the multi-carrier entry's own configuration — and the mode's own thread only
+observing and waiting.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC22`, which invokes the executable synchronously
+and parses its records. Nothing here calls a private function: every compared value is a named field of a record
+the executable printed on stdout, and the two gates the arms wait on are cells the *composition* owns. Every
+wait the mode makes is a **round count** bounded by `--bound`, never a clock, and the check reads that number
+from the mode's own `sc22cfg|bound` line rather than typing it: a round is a locked read (`Join.value?`,
+`Executor.observe`), an expiry yields `resolverRounds`/`completionRounds` at the bound and the clause's reading
+fails, and the invocation's watchdog (300 s) stays only a hang bound. The bound is larger than the dispatch-only
+modes' 20000 because these arms wait for a dedicated thread's *first shift* and for an item to be taken and run
+on it, not for one wake: a bound's worth of rounds is ~12 ms on this box, against `runUs` rows of a few hundred
+microseconds for an arm that does not expire.
+
+**Given.** For the route arm: an executor whose worker `1` is a started carrier — its counter tid is read before
+anything is pushed, and the check requires the record's `firerTid` to be that identity rather than the creator's
+— and a cell no one has resolved. For the completion arm: both carriers started, one `Join` cell the mode's own
+thread watches while the chain runs, and one link delivered through the shared route.
+
+**When.** One invocation, two records, each arm's ordering enforced by the mode's own steps rather than by which
+carrier wins a race:
+
+1. **The route arm.** The creator's step registers a continuation on the cell and returns; worker `0` has no
+   loop, so nothing takes from worker `0`'s pool while the arm runs. The resolving step is then pushed to the
+   shared list, taken by worker `1`'s carrier, and fired with index `1`: it resolves the cell — which runs the
+   registered continuation's enqueue *on that thread* — and then reads `Executor.snapshot` **before its own step
+   returns**, so the pools are read at the arrival rather than after a race (worker `1` cannot take from its own
+   queue while it is inside a step, and worker `0` has no loop to take with). The mode then takes from worker
+   `0`'s pool and fires whatever it finds there, which is what turns "the item landed on the creator's pool" from
+   an inference into a reading, and waits on the continuation's own cell for it to have run.
+2. **The completion arm.** The creator's root is delivered through the shared route; it delivers its link the
+   same way, and then **holds inside its own step** until that link has started, which is what keeps the link out
+   of the creator's reach (a carrier inside a step cannot take from the shared list). The link holds until the
+   creator's carrier is *parked*, read from the composition's own `parked` count — neither link is inside a park
+   when the hold begins, so the first nonzero reading is the creator's — and then completes, which resolves the
+   creator's cell and enqueues the creator's continuation wherever that resolution's route sends it. The mode
+   waits on the completion cell by the same round count, and then stops and joins the carriers and reads the
+   composition's own `held`.
+
+**Then.** There is exactly one `route|` and one `crossing|` record per invocation, shaped exactly with nonempty
+values, as
+
+`route|creator|firer|p|creatorPoolBefore|creatorPoolAfter|firerPoolBefore|firerPoolAfter|pendingAfter|creatorTid|firerTid|continuationTid|continuationRuns|resolverRounds|bound|runUs`
+
+`crossing|p|completed|creatorRuns|childRuns|continuationRuns|crossed|waiterParked|creatorTid|childTid|continuationTid|completionRounds|bound|heldAfterStop|runUs`
+
+plus the mode's `sc22cfg|bound|p|creator|firer` line. With `bound` the mode's own printed round count, the
+clauses are:
+
+- **SC22-O1 — the deferred enqueue takes the firing worker's route.** The two roles are distinct workers
+  (`creator = 0`, `firer = 1`, and `creatorTid ≠ firerTid`): the peer's identity is the carrier counters' own tid
+  for the firing worker. Both pools are empty before the resolving step, and after it the item is in the *firing
+  worker's* pool (`firerPoolAfter = 1`) and **not** in the creator's (`creatorPoolAfter = 0`) and **not** on the
+  shared list (`pendingAfter = 0`) — so the clause tells the owner-made local route from both the captured-route
+  spelling, which leaves the item in the creator's pool, and the shared route, which leaves it on the shared
+  list. The firing worker's own thread ran it (`continuationTid = firerTid`, `continuationRuns = 1`), the
+  creator's did not, and the resolve was observed inside the mode's own round count (`resolverRounds < bound`).
+- **SC22-O2 — a chain across carriers completes.** `completed = 1` and every link ran exactly once
+  (`creatorRuns = 1`, `childRuns = 1`, `continuationRuns = 1`); the crossing is observed, so "it completed on one
+  carrier" cannot pass as "it completed" (`crossed = 1`, i.e. the link's carrier is not the creator's, both tids
+  nonzero); the completion arrived at a wait that was parked (`waiterParked = 1`, the count the link read from
+  the composition before it completed); it arrived inside the mode's own round count
+  (`completionRounds < bound`), so a completion produced by the drain that follows is not this reading; and the
+  drain left nothing held (`heldAfterStop = 0`). `continuationTid` names the thread the deferred continuation
+  ran on — the *route* clause's subject, read in the `route|` record — and is bound by the check's shape so a
+  record that lost it is rejected, but no conjunct here compares it: this clause is about the chain's completion.
+
+`runUs` is printed and never asserted: a timing assertion is a flake with a schedule.
+
+**Why it is not vacuous.** Seventeen affirmative controls are in the same invocation, run before the invocation's
+own records are asserted, each built from the record syntax and the derived expectation alone and never from the
+executable's receipts. O1's detector is exercised on the record the clause is stated for — the deferred item on
+the firing worker's own pool, its thread running it — and on seven near misses it must reject: **the spelling the
+tree implements today**, where the continuation holds the awaiting step's route and so lands in the creator's
+pool with the creator running it; the rejected shared route, where the item goes to the shared list instead of a
+worker's own pool; the same item read in both pools; an item that reached no pool and never ran; the
+continuation run by a thread that is neither role; the two roles collapsed onto one worker; and a resolve that
+hit the mode's own round count. O2's detector is exercised on the completed crossing and on eight near misses:
+the chain that never completed with its continuation never run (the shape a lost wake leaves); a completion
+whose continuation never ran, i.e. one read from a cell rather than from the work; a completed chain with its
+link short; a completion on one carrier where a crossing was required; a completion that arrived at no parked
+wait; a completion read after the mode's own round count expired; a link run twice; and a drain that left the
+deferred item behind. The mode's own identities are read out of its records and required to be the ones the
+clauses are stated for, so a run at another carrier count or another round count is the clause's own failure
+rather than a silent pass; and O1's positive half is a *pool* reading, so "it went nowhere" and "it went to the
+wrong pool" are told apart rather than both passing as "not the creator's pool". A control that does not hold is
+a fixture defect reported as a setup error, separately from the `Then`.
+
+**Why.** A step's re-enqueue route travels in the `Ctx` its closure holds, and `Async.spawn` builds its child's
+context out of the parent's — so a child's later pushes would take the *parent's* route rather than the route of
+the worker that fires the child. The third site is the `Join`-cell continuation: `Async.await` registers
+`fun v => ctx.resume (Item.ofAction (k v))`, which closes over the *awaiting* step's route, and
+`Join.resolve`/`resolveFirst` run their registered continuations **directly on whichever thread resolved the
+cell**. A deferred item therefore lands in the creator's own queue while the push is made by a peer thread: the
+push is not owner-made, and it is visible only because the executor's wake protocol records the push in the
+shared cell and wakes every waiter so the owner is among them. The `route|` record reads that arrival from the
+executor's own snapshot taken inside the resolving step, and the `crossing|` record reads what the wake buys: a
+chain whose link was delivered through the shared route and whose continuation was deferred onto a parked
+carrier completes, with the crossing observed from the carriers' own tids.
+
+**Limits, stated.** (i) The route arm drives worker `0` on the invocation's thread and starts only worker `1`'s
+loop, so the pools are quiescent and the arrival is a reading; the clause is about *where the deferred item
+lands*, not about a live multi-carrier schedule, and the live schedule's reading is the completion arm's. (ii) The
+crossing in the completion arm is *forced by construction* rather than observed as the scheduler's choice: the
+creator holds inside its step so the link cannot be taken by it, and the link holds until the creator's carrier
+is parked, so the completion necessarily arrives at a parked wait. Nothing here therefore measures how often a
+crossing happens; it reads what one crossing does. (iii) `waiterParked` is the composition's own `parked` count
+as the link read it, so a run whose creator was not parked when the completion arrived is the clause's own
+failure rather than a silent pass. (iv) Nothing here is bounded in time and no conjunct reads a clock: the round
+counts bound a wait so that a lost wake is a reading rather than a wedge, and `runUs` is printed and never
+asserted. (v) The completion arm's `continuationTid` is not compared by O2 on purpose: the route's reading is
+O1's, and this record's clause is about the chain's completion — a reader wanting both readings wants both
+records.

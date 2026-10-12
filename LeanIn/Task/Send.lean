@@ -73,8 +73,11 @@ def Executor.submitLocal (e : Executor α cap) (i : Nat) (x : Sendable α) : Bas
   e.submitLocalRaw i x.of
 
 /-- **A worker's own route.** The step is re-scheduled on the worker that just ran it, so a chain stays on
-the core its parent ran on — `docs/interface.md` §3's rule at P carriers. It is the one place a step becomes
-a `Sendable`, which is why the queue's push requires one. -/
+the core its parent ran on — `docs/interface.md` §3's rule at P carriers. It is where a step becomes a
+`Sendable` on the local route, which is why the queue's push requires one; a push on the **shared** route is
+`Runtime.sharedPush`, which mints the marker the same way. Both are *read* at fire time rather than captured:
+the route table a `Ctx` carries is built from this function (`Runtime.fired`), so a continuation another worker
+delivers is re-bound to that worker rather than holding the route of the step that registered it. -/
 def Executor.route (e : Executor α cap) (i : Nat) [Send α] : Route α :=
   ⟨fun x => e.spawnLocal i (Send.send x)⟩
 

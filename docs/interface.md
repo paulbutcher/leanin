@@ -126,6 +126,15 @@ Protocol, stated as the obligations it must meet rather than the calls it makes:
 | `park i` | only from `i`'s own empty queue *and* an empty inject, and only when `stopping` is false |
 | `stop` | set `stopping`, notify all, drain |
 
+**The chain rule, and who may take the local route.** `pushLocal`'s premise is met by the implementation
+because a route is never captured at a computation's creation site: it is read when a worker fires the step
+that re-enqueues. A step's own re-enqueue takes **the route of the worker that fires it**, so *a chain stays on
+the core its parent ran on* — the parent *ran* there, which is what makes the rule true at P carriers: a step
+re-scheduled by a worker follows that worker, not the site that created the computation. Every resume that is
+not a step's own — a leaf completion, a blocking completion, a clock's fire, or a resolution made by a thread
+that owns no queue — takes `pushShared` instead, which is why those sites need no repair on the local route and
+why no thread other than a worker's own step writes that worker's queue.
+
 Three obligations, each traceable to an axiom, and each re-discharged over this shape:
 
 - **No lost wakeup** — forced by A5 (notifications are not queued): a worker must not be able to
@@ -158,6 +167,39 @@ delegates to `Task` (`Basic.lean:327,389,432,456,463,474`).
 structure Task (α : Type) where       -- a handle: its join cell and its cancellation token
 structure Async (α : Type) where ...  -- a scheduleable computation, given its own token and its scheduling function
 ```
+
+**The route rule, and the surface it is stated on.** A computation's re-enqueue route is never captured at its
+creation site: it is read when a worker fires the step that re-enqueues. `Ctx` therefore carries the firing
+worker's own route *and* the runtime's route **table**, and a continuation another worker resolves is delivered
+as an item whose action re-binds the waiting computation's context at the index it is fired with. The published
+signatures that state this are the task layer's and the runtime's:
+
+```lean
+structure Ctx where                   -- a step's token, the firing worker's local route (`resume`), the runtime's
+  ...                                  -- route table (`routeAt`), the shared route (`resumeShared`), its `local`
+structure Async (α : Type) where
+  step : (α → Ctx → IO Unit) → Ctx → IO Unit   -- the continuation takes the context it will run under
+
+def Ctx.at (cancel : Cancel) (table : Nat → Item → BaseIO Unit) (shared : Item → BaseIO Unit)
+    (l : Local) (i : Nat) : Ctx      -- the context for a step fired by worker `i`
+def Ctx.rebind (c : Ctx) (i : Nat) : Ctx               -- the same context, route read for worker `i`
+def Item.ofDeferred (c : Ctx) (act : Ctx → IO Unit) : Item   -- a continuation delivered to whichever worker fires it
+def Async.push : Async (Item → BaseIO Unit)            -- the local route of the step being run
+
+def Join.onReady (j : Join α) (ctx : Ctx) (k : α → Ctx → IO Unit) : IO Unit
+def Join.resolve (j : Join α) (push : Item → BaseIO Unit) (v : α) : IO Unit
+def Join.resolveFirst (j : Join α) (push : Item → BaseIO Unit) (v : α) : IO Unit
+def Join.resolved (v : α) : IO (Join α)                -- a cell that already holds its value: no delivery, no route
+def Task.cancel (t : Task α) (push : Item → BaseIO Unit) (v : α) : IO Unit
+def Runtime.cancel (hooks : Hooks) (t : Task.Task α) (push : Task.Item → BaseIO Unit) (v : α) : IO Unit
+def Runtime.sharedPush (e : Executor cap) : Task.Item → BaseIO Unit   -- the shared route as a push
+```
+
+Each operation that *delivers* a waiter takes the route it delivers on — `Async.push`, read in the step that
+makes the call — and each registration carries the context of the computation that registers. That is the rule
+in two halves: a step's own re-enqueue takes the route of the worker firing it (§3), and every resume that is
+not a step's own takes the shared route. `Join.onReady`'s "already resolved" case still runs the continuation
+inline, under its own context, because that is the same worker's step.
 
 with instances so that generic code works over either implementation:
 
@@ -237,7 +279,12 @@ it is built: `Runtime/Blocking.lean`, and SC12 drives it at the public executabl
 mutex, an async semaphore and a bounded channel. `Mutex.lock`/`unlock` and `Semaphore.acquire`/`release` park
 the *computation*, not the carrier, and `Channel.send`/`recv` are the same: an awaiting operation is a
 `Task.Async`, and one that cannot park (`Mutex.tryLock`, `Semaphore.tryAcquire`, `Channel.trySend`,
-`Channel.tryRecv`) is an `IO` — the same split as `Join.resolve` against `Async.await`. None of them guards a
+`Channel.tryRecv`) is an `IO` — the same split as `Join.resolve` against `Async.await`. The operations that
+*deliver* a waiter take the delivering step's route: `Semaphore.release (s) (push)`, `Mutex.unlock (m) (push)`,
+`Channel.trySend (c) (v) (push)` and `Channel.tryRecv (c) (push)`, where `push` is `Async.push` read **in the
+step that makes the call** — a release hands its wake to the waiters it took, and the item it enqueues belongs
+on the delivering worker's own queue, so the route is the call's rather than the waiter's and a route fetched
+across an await would be the wrong worker's. None of them guards a
 value or promises an order. The mutex is one permit and no guard (Lean has no drop hook that could release, so
 `unlock` is explicit), it is not reentrant and carries no owner check, and the order in which waiters are
 admitted is unspecified — §5's "no fairness or priority guarantee" governs here too. `Channel.new` refuses a

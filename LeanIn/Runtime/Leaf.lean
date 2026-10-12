@@ -118,14 +118,16 @@ def pending (hooks : Hooks) : IO Nat := do
 /-- **The step that does the work**, factored out so `awaitTask` and `awaitAsync` share one path: register a
 continuation that enqueues, and return.
 
-`ctx.resumeShared` is the runtime's **shared** scheduling route, so the completion is delivered as fresh work
-on the shared list rather than run on whatever thread completed the leaf: the completing thread is not the
-owning carrier in general, so a local push there could land in a parked owner's queue with nothing to wake it. -/
+`ctx.resumeShared` is the runtime's **shared** scheduling route, so the completion is delivered as fresh work on
+the shared list rather than run on whatever thread completed the leaf: the completing thread is not the owning
+carrier in general, so a local push there would land in a parked owner's queue with nothing to wake it. The item
+is `Item.ofDeferred`: it carries the awaiting computation's token and ambient context, and the worker that takes
+it from the shared list supplies the route its continuation re-enqueues on. -/
 def awaitTaskStep {α : Type} (hooks : Hooks) (t : _root_.Task (Except IO.Error α))
-    (k : α → IO Unit) (ctx : Task.Ctx) : IO Unit := do
+    (k : α → Task.Ctx → IO Unit) (ctx : Task.Ctx) : IO Unit := do
   let hooked ← BaseIO.bindTask t (fun r => do
     match r with
-    | Except.ok v    => ctx.resumeShared (Task.Item.ofAction (k v))
+    | Except.ok v    => ctx.resumeShared (Task.Item.ofDeferred ctx (k v))
     | Except.error e => panic! s!"awaitTask: the awaited task failed: {e}"
     return _root_.Task.pure ())
   hooks.add ctx.cancel hooked
@@ -145,7 +147,7 @@ def awaitAsync {α : Type} (hooks : Hooks) (a : Std.Async.Async α) : LeanIn.Tas
   ⟨fun k ctx => do
     let mt ← Std.Async.BaseAsync.toRawBaseIO a
     match mt with
-    | .pure (.ok v)    => k v
+    | .pure (.ok v)    => k v ctx
     | .pure (.error e) => panic! s!"awaitAsync: the computation failed: {e}"
     | .ofTask t        => awaitTaskStep hooks t k ctx⟩
 
@@ -153,10 +155,12 @@ def awaitAsync {α : Type} (hooks : Hooks) (a : Std.Async.Async α) : LeanIn.Tas
 point of `EAsync`: where that one says a failure has nowhere to go and panics, this returns it — which is what a
 socket needs, because a client that goes away mid-request is an ordinary event rather than a defect.
 
-The registry and the one-continuation shape are the same; only the reading of the result differs. -/
+The registry and the one-continuation shape are the same; only the reading of the result differs. The delivery is
+the shared route's, as `awaitTaskStep`'s is. -/
 def awaitTaskE {α : Type} (hooks : Hooks) (t : _root_.Task (Except IO.Error α)) : Task.EAsync IO.Error α :=
   ⟨fun k ctx => do
-    let hooked ← BaseIO.bindTask t (fun r => do ctx.resumeShared (Task.Item.ofAction (k r)); return _root_.Task.pure ())
+    let hooked ← BaseIO.bindTask t (fun r => do
+      ctx.resumeShared (Task.Item.ofDeferred ctx (k r)); return _root_.Task.pure ())
     hooks.add ctx.cancel hooked⟩
 
 /-- **Wait for a promise's result, carrying its failure.** -/
@@ -168,7 +172,7 @@ def awaitAsyncE {α : Type} (hooks : Hooks) (a : Std.Async.Async α) : Task.EAsy
   ⟨fun k ctx => do
     let mt ← Std.Async.BaseAsync.toRawBaseIO a
     match mt with
-    | .pure r   => k r
+    | .pure r   => k r ctx
     | .ofTask t => (awaitTaskE hooks t).step k ctx⟩
 
 /-- **Wait for a process signal**, registered for `signum` and awaited through the seam.
@@ -193,12 +197,17 @@ to be, which is what lets a drain read "nothing outstanding" as soon as the work
 
 `v` is the caller's: a connection's cancellation is `.error (.userError "…")` at a server's call site.
 
+`push` is the **cancelling step's own route** — `Task.Async.push` — because the cancellation resolves the
+cancelled handle's cell, and a resolution delivers the cell's waiters as items on the resolving step's queue. A
+caller that is not running a step — a thread that holds no queue — passes the runtime's shared route instead
+(`Runtime.sharedPush`), which unparks a waiter under its own lock.
+
 Both halves are called from inside a step, on the carrier. Retiring the registrations reads the registry, rebuilds
 it and writes it back — a list operation, not one atomic update — so two cancellations running concurrently would
 race it. That is stated here because this is a public `IO` operation and its callers cannot see the registry; a
 second carrier is where it becomes a defect rather than a comment. -/
-def cancel {α : Type} (hooks : Hooks) (t : Task.Task α) (v : α) : IO Unit := do
-  t.cancel v
+def cancel {α : Type} (hooks : Hooks) (t : Task.Task α) (push : Task.Item → BaseIO Unit) (v : α) : IO Unit := do
+  t.cancel push v
   hooks.retire
 
 /-- **Race a handle against others**: the first of them to become ready wins, and every non-winner is cancelled
@@ -207,14 +216,15 @@ with `v`.
 `select` decides which handle won and leaves the rest running; this applies `cancel` to each loser, so a loser
 resolves with `v` exactly once and immediately, no step of it runs afterwards, and its registrations are retired.
 A loser that finished before the race returned keeps its own value: a cancellation never replaces a value that
-exists. -/
+exists. Each cancellation delivers its loser's waiters on the racing step's own route, which is this step's. -/
 def race {α : Type} (hooks : Hooks) (v : α) (h : Task.Task α) (hs : List (Task.Task α)) :
     Task.Async (Nat × α) := do
   let r ← Task.select h hs
+  let push ← Task.Async.push
   let rec go : List (Task.Task α) → Nat → Task.Async Unit
     | [], _ => pure ()
     | t :: ts, i => do
-        if i != r.1 then monadLift (cancel hooks t v)
+        if i != r.1 then monadLift (cancel hooks t push v)
         go ts (i + 1)
   go (h :: hs) 0
   return r

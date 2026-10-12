@@ -172,7 +172,10 @@ def spawnBlockingE (p : BlockingPool) (hooks : Hooks) (act : IO α) : Task.EAsyn
        p.submit (do
           let r : Except IO.Error α ← try Except.ok <$> act catch e => pure (.error e)
           done.resolve ()
-          ctx.resumeShared (Task.Item.ofAction (k r)))
+          -- The completion is delivered through the **shared** route, because this runs on the pool's own
+          -- thread and not on a carrier; `Item.ofDeferred` carries the awaiting computation's token and the
+          -- worker that takes the item supplies the route the continuation re-enqueues on.
+          ctx.resumeShared (Task.Item.ofDeferred ctx (k r)))
      catch e => done.resolve (); throw e⟩
 
 /-- **Run a blocking action**, carrying no failure channel: the failure is a defect, so a failing job is a
@@ -182,8 +185,8 @@ layer gives a spawned computation, so `await`, `Runtime.cancel` and `concurrentl
 new handle type is introduced. -/
 def spawnBlocking (p : BlockingPool) (hooks : Hooks) (act : IO α) : Task.Async α :=
   ⟨fun k ctx => (spawnBlockingE p hooks act).step
-     (fun r => match r with
-       | .ok v    => k v
+     (fun r ctx' => match r with
+       | .ok v    => k v ctx'
        | .error e => panic! s!"spawnBlocking: the blocking job failed: {e}") ctx⟩
 
 end LeanIn.Runtime

@@ -40,16 +40,21 @@ def never {α : Type} : Task.Async α :=
   ⟨fun _ _ => pure ()⟩
 
 /-- **`a`, or `none` if `d` elapses first.** The first writer wins — the computation's own value, or the
-timer's `none` — and the loser's write is ignored rather than being a defect. -/
+timer's `none` — and the loser's write is ignored rather than being a defect.
+
+Each arm resolves the cell on its own step's route (`Task.Async.push`), so a waiter the resolution delivers is
+an item on the queue the resolving arm is running on. -/
 def withTimeout (c : Clock) (d : Std.Time.Millisecond.Offset) (a : Task.Async α) :
     Task.Async (Option α) := do
   let cell ← Task.Join.new
   Task.background (do
     let v ← a
-    Task.Join.resolveFirst cell (some v))
+    let push ← Task.Async.push
+    Task.Join.resolveFirst cell push (some v))
   Task.background (do
     sleep c d
-    Task.Join.resolveFirst cell none)
+    let push ← Task.Async.push
+    Task.Join.resolveFirst cell push none)
   let token ← (Task.Cancel.new : IO Task.Cancel)
   Task.Async.await (show Task.Task (Option α) from ⟨cell, token⟩)
 

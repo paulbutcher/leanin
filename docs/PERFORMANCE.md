@@ -313,18 +313,43 @@ the row names the construction. **Only the un-instrumented arm is the recorded s
 the instrumented arm's per-link tid record is quadratic and is printed to show it. On the recorded shape ours
 reads **1307 ns** per link (within the band recorded around 924–1394 ns) against native **10806 ns**, a
 **ratio of 8.26×**, with `chainCarriers = 1`. **A regression** is `leaninPerLinkNs` rising into the native
-row's band, a `ratioX` below the base revision's own same-session ratio (per step 3b, ≈4.3× on the reading
+row's band, or a `ratioX` below the base revision's own same-session ratio (per step 3b, ≈4.3× on the reading
 that settled it — the doc's 5.3× and the workplan's historical 7.6× are the same shape at other revisions and
-are stamped as history, not used as constants), or `chainCarriers > 1`. **The scope travels with the ratio**:
-the chain measured is built from `Async.spawn`/`await`, whose pushes are **owner-made**, so a link stays on
-its parent's carrier; a chain whose links are **leaf** completions resumes on the shared route and may migrate
-(the owner-only route and its two seam sites, D19), and nothing printed here is a claim about that chain.
-`chainCarriers = 1` is an *affirmative* control rather than a construction artifact: the arm starts its `p`
-carriers, so a thief can reach a carrier's ring and a crossing is possible.
+are stamped as history, not used as constants).
+
+**The constructions, named, because the route rebinding changed what `chainCarriers` is a claim about.** Before
+it (D19) a link's continuation closed over the *awaiting* step's route, so a chain whose link was flushed to the
+inject by the LIFO allowance still returned to the carrier that *created* it: `chainCarriers = 1` was that
+captured-route artifact, not a property of the chain. After it (D22) a link is pushed on the route of the worker
+that *resolves* it, so a chain follows the worker that fires each link and `chainCarriers > 1` is legitimate
+rather than a regression — the allowance's own flush (measured on this row's chain as roughly one flush per two
+links, D21) can hand a link to another carrier, and the chain follows it. **`chainCarriers` is therefore a
+consequence of the scheduler's choice and not a criterion**: the row states the count it read, and which
+construction it read it on. W8's LIFO milestone criterion 2 (`chainCarriers = 1` on *that* milestone's arm) is
+re-read as the pre-rebinding construction's identity (`w8-lifo-bound/PLAN.md`), and nothing here re-baselines it.
+
+```
+session: 8 cores, kernel 6.17.0-1032-oem, load average 2.0–3.3, both trees interleaved in one command
+chain|construction=Async.spawn/await, per-link tid record|links=2000|leaninNs=819|nativeNs=8165|ratio=9.96|chainCarriers=1
+chain|construction=Async.spawn/await, no per-link instrumentation (recorded shape)|links=2000|leaninNs=810|nativeNs=8165|ratio=10.08|chainCarriers=n/a
+carriers|carriers=4|p=4|…|distinctCarriers=4|carrierCount1=1|chainCarriers=1|parkedBefore=4|…|remaining=0
+```
+
+**The two readings are one construction, one session.** The rows just given were taken in one W18 session, so
+they are comparable to each other and to the band above (ours 810–819 ns per link against the recorded 1307 and
+the 924–1394 band; ratio 9.96–10.08 against 8.26). The count is a reading rather than a control: the arm starts
+its `p` carriers, so a crossing is *possible* there, and a run that reads 1 records the scheduler's choice, not
+a requirement — which is why W18's contract had to stop asserting it.
+
+**The other construction, priced by its own record and not by this row.** The chain the rebinding makes visible
+— one link delivered through the shared route whose continuation is deferred onto a *parked* carrier's own queue
+— is `SC22`'s completion arm (`tests/executor-contract.sh SC22`), whose record reads `crossed = 1` with every link
+run once, `waiterParked = 1` and `heldAfterStop = 0`; it is not comparable to the row above (its links are not a
+spawn/await chain running on one carrier), so it is quoted as a behaviour and never as a multiplier.
 
 **The driven steal.** `stealbench|` prices one driven steal against a local take, and **the pair is not
-like-for-like and the row says so**: `stealNs` (466) is the driven steal alone while `localTakeNs` (486) is
-the whole take path including its steal attempt and the inject check. ⚪ no baseline exists, so the row has no
+like-for-like and the row says so**: `stealNs` (466) is the driven steal alone while `localTakeNs` (486) is the
+whole take path including its steal attempt and the inject check. ⚪ no baseline exists, so the row has no
 regression definition.
 
 **The take path, measured, and its one recorded regression.** The `--runtime-ops` round trip is the
@@ -381,11 +406,28 @@ What remains from it: the hot take and push paths are `@[inline]` (the body's co
 and a call boundary there cost as much as the transaction outright — measured: the same body inlined is ~380 ns
 against ~760 ns called). Those repairs moved the take row from 555 ns to **92 ns** and `spawn+take`
 (steady) from 1407–1683 ns to **442 ns** — at or below the base's 488 ns — and the round trip from ~3524 to
-**2205 ns** (native 6100 ns, `ratioX` ≈ 2.77 in that window). **The enqueue side's gain is partly given back
-and that is stated rather than hidden**: the third off-owner local push (`Async.await`/`select`'s `Join`-cell
-continuation, D19) keeps the per-worker `poked` flag and `wakeIfParked` standing, so a local push again pays
-the inject section — `Executor.spawn` reads 466 ns here against 372–389 ns with the bit removed — and the round
-trip's benefit is correspondingly less than the take row alone suggests. **The residual is the split's own per-operation overhead** — the per-worker cell and its placeholder
+**2205 ns** (native 6100 ns, `ratioX` ≈ 2.77 in that window). **The enqueue-side gain W8 gave back is now
+recovered, and measured rather than assumed.** W8's record priced the per-worker wake flag at `Executor.spawn`
+**466 ns against 372–389 ns with the bit removed**. W18 removes the flag (the third off-owner local push it
+covered no longer exists), so the row is re-taken **interleaved against the base revision in one session** — base
+= the committed tree at `01dcb3b`, a `git archive` export beside the working tree, balanced AB/BA, **four runs
+an arm, minima per §1** — at 8 cores, kernel 6.17.0-1032-oem, load average 2.6–3.3 through the session:
+
+```
+Executor.spawn      base (bit standing)  335 331 359 385     min 331 ns
+                    fixed (bit gone)     295 287 289 296     min 287 ns
+spawn+await round   base                1906 2412 2047 2411  min 1906 ns
+                    fixed               1850 2169 2224 1905  min 1850 ns
+native spawn+join   base 5312–6638 ns    fixed 5317–7989 ns  (calibration, same session)
+```
+
+So the bit's price is **44 ns** in this session, in the direction W8 stated; the fixed tree's absolute
+287–296 ns is at or below the stated bit-free band (372–389 ns), which is a *different session's* level — §1
+forbids pairing across sessions — so the recovery is claimed from the interleaved pair rather than from that
+band. The round trip is **not regressed** by the delivery change: the deferred continuation now builds a
+`Join.Waiter` and an `Item.ofDeferred` and re-binds a context at fire time, and the row still reads at or below
+the base's own same-session minimum. The paragraph above is W8's record of the tree *before* this milestone and
+is left as history; these rows are W18's on the same instrument. **The residual is the split's own per-operation overhead** — the per-worker cell and its placeholder
 on every transaction, the `TakeReport`-shaped decisions the records need, and the `Sendable` marker on every
 crossing — and it is recorded here rather than absorbed: the second measurement condition's criterion is the
 base's same-session ratio, and it is **not met** by the `--runtime-ops` instrument. Per the plan's own rule, a

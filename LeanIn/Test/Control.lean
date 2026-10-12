@@ -1614,6 +1614,205 @@ def executorLifoTurns : IO UInt32 := do
     ++ s!"|runUs={(t1 - t0) / 1000}")
   return 0
 
+/-- **SC22, the route clause's arm — where a step's deferred enqueue lands.**
+
+One executor with two workers, and the two roles kept apart so that the arrival is a reading rather than a
+race. Worker `1` is a genuinely started carrier — a dedicated thread of its own running
+`Executor.workerLoop`, its tid recorded in the carrier counters as it entered the loop — and worker `0` has
+**no** loop of its own: the invocation's thread stands in for it, placing the creator's step on worker `0`'s
+queue and firing it with index `0`, which is the driver's own convention (`Runtime.blockOn` drives worker `0`
+on the calling thread).
+
+The creator's step is the task layer's own deferred registration: `Async.await` on a cell with no value yet,
+run with worker `0`'s routes. It registers a continuation and returns, and what the registration holds is the
+*waiter's* context — its token, its ambient context, and the runtime's route **table** — not a resolved route:
+the route it will re-enqueue on is read when a worker fires it. The resolving step is an item on worker `1`'s
+queue, delivered through the shared route and fired by worker `1`'s carrier — a peer thread relative to the
+creator — which resolves that cell with **its own** route, so the deferred continuation is delivered as an item
+on worker `1`'s own queue, and then reads the composition's own pools. Reading them inside the resolving step,
+before that step returns, is what makes the pool a reading of an enqueue rather than of a race: worker `1`
+cannot take from its own queue while it is inside the step, and worker `0` has no loop to take with.
+
+**The completion clause's arm — a chain across carriers that must complete.** One executor with two started
+carriers. The creator's root is delivered through the shared route, and it delivers its link the same way, so a
+peer carrier runs the link rather than the creator. The creator holds inside its own step until that link has
+started, which is what keeps the link out of the creator's own reach — a carrier inside a step cannot take from
+the shared list — and the link holds until the creator's carrier is **parked**, read from the composition's own
+`parked` count, so the completion arrives at a wait that the wake has to reach. The link's completion resolves
+the creator's cell, and the creator's continuation runs wherever that resolution's route sends it.
+
+Both arms' waits are **round counts**, never clocks: a round is a locked read of a cell the composition owns
+(`Join.value?`, `Executor.observe`), so an expiry is a reading — `resolverRounds` and `completionRounds` at the
+bound — and not a hang, and the shell's watchdog stays only a hang bound. The bound is larger than the
+dispatch-only modes' 20000 because these arms wait for a dedicated thread's *first shift* and for an item to be
+taken and run on it: thousands of lock acquisitions' worth of work rather than one wake, which is what the
+record's round fields let a reader see.
+
+Diagnostic: `lake exe controls --executor-route [--bound N]`. -/
+def executorRoute (bound : Nat) : IO UInt32 := do
+  let runStart ← IO.monoNanosNow
+  -- the two roles of the route arm, and the two workers they run on: distinct, which is the clause's premise
+  let creatorIdx : Nat := 0
+  let firerIdx : Nat := 1
+  let er ← Sched.Executor.newMetered Task.Item 256 2
+  -- worker 0's loop is this thread, playing the driver's part; worker 1 gets a thread of its own
+  let creatorTid ← IO.getTID
+  let peer ← IO.asTask (er.workerLoop (fun idx it => it.fireWith idx) firerIdx)
+    _root_.Task.Priority.dedicated
+  -- the firing worker's identity, from the carrier counters' own tid, recorded as its loop began
+  let mut firerTid : UInt64 := 0
+  let mut tidRounds : Nat := 0
+  while firerTid == 0 && tidRounds < bound do
+    let cs := (← er.metrics).getD []
+    firerTid := (cs[firerIdx]?.map (·.tid)).getD 0
+    tidRounds := tidRounds + 1
+  let poolAt (s : Sched.Snapshot Task.Item 256) (i : Nat) : Nat :=
+    (s.workers[i]?.map (·.inFlight)).getD 0
+  let cell ← Task.Join.new (α := Unit)
+  let tokCreator ← Task.Cancel.new
+  let tokResolver ← Task.Cancel.new
+  let creatorPoolAfter ← IO.mkRef (0 : Nat)
+  let firerPoolAfter ← IO.mkRef (0 : Nat)
+  let pendingAfter ← IO.mkRef (0 : Nat)
+  let continuationTid ← IO.mkRef (0 : UInt64)
+  let continuationRuns ← IO.mkRef (0 : Nat)
+  -- The mode's own two gates, as cells rather than bare flags: every wait below reads them through the
+  -- cell's lock, so a round is a lock acquisition — the shape `--runtime-carriers`' round counts have — and a
+  -- write by the peer is visible to the reader rather than left to a spin over an unsynchronised field.
+  let resolvedCell ← Task.Join.new (α := Unit)
+  let continuationCell ← Task.Join.new (α := Unit)
+  let before ← er.snapshot
+  let creatorPoolBefore := poolAt before creatorIdx
+  let firerPoolBefore := poolAt before firerIdx
+  -- the creator: worker 0's own deferred registration. The continuation it leaves is delivered *as an item*
+  -- by the step that resolves the cell, on that step's own route.
+  let creatorProg : Task.Async Unit := Task.Async.await (⟨cell, tokCreator⟩ : Task.Task Unit)
+  let creatorItem := Task.Item.ofIndexed (some tokCreator)
+    (fun _ => Runtime.fired tokCreator er creatorProg (fun _ ctx' => do
+      continuationTid.set (← IO.getTID)
+      continuationRuns.modify (· + 1)
+      Task.Join.resolve continuationCell ctx'.resume ()) creatorIdx)
+  er.submitLocal creatorIdx (Task.Item.sendable creatorItem)
+  match ← er.takeFor creatorIdx with
+  | some it => it.fireWith creatorIdx
+  | none    => pure ()
+  -- the resolver: fired by the peer carrier, resolving the cell — which delivers the creator's continuation as
+  -- an item on *this* worker's own route, its local pool — and then reading the pools before it returns
+  let resolverProg : Task.Async Unit := ⟨fun k ctx => do
+    Task.Join.resolve cell ctx.resume ()
+    let s ← er.snapshot
+    creatorPoolAfter.set (poolAt s creatorIdx)
+    firerPoolAfter.set (poolAt s firerIdx)
+    pendingAfter.set s.inject.length
+    Task.Join.resolve resolvedCell ctx.resume ()
+    k () ctx⟩
+  let resolverItem := Task.Item.ofIndexed (some tokResolver)
+    (fun i => Runtime.fired tokResolver er resolverProg (fun _ _ => pure ()) i)
+  er.pushInject (Task.Item.sendable resolverItem)
+  let mut resolverRounds : Nat := 0
+  let mut resolvedNow := false
+  while !resolvedNow && resolverRounds < bound do
+    resolvedNow := (← Task.Join.value? resolvedCell).isSome
+    if !resolvedNow then resolverRounds := resolverRounds + 1
+  -- worker 0 has no loop: whatever landed in its own pool is taken here, by this thread, so "it landed on
+  -- the creator's pool" is what the run reads rather than something inferred from where the item ran
+  match ← er.takeFor creatorIdx with
+  | some it => it.fireWith creatorIdx
+  | none    => pure ()
+  let mut contRounds : Nat := 0
+  let mut contNow := false
+  while !contNow && contRounds < bound do
+    contNow := (← Task.Join.value? continuationCell).isSome
+    if !contNow then contRounds := contRounds + 1
+  let routeUs := ((← IO.monoNanosNow) - runStart) / 1000
+  er.stop
+  match ← IO.wait peer with
+  | .ok _    => pure ()
+  | .error _ => pure ()
+  IO.println s!"sc22cfg|bound={bound}|p=2|creator={creatorIdx}|firer={firerIdx}"
+  IO.println (s!"route|creator={creatorIdx}|firer={firerIdx}|p=2"
+    ++ s!"|creatorPoolBefore={creatorPoolBefore}|creatorPoolAfter={← creatorPoolAfter.get}"
+    ++ s!"|firerPoolBefore={firerPoolBefore}|firerPoolAfter={← firerPoolAfter.get}"
+    ++ s!"|pendingAfter={← pendingAfter.get}|creatorTid={creatorTid}|firerTid={firerTid}"
+    ++ s!"|continuationTid={← continuationTid.get}|continuationRuns={← continuationRuns.get}"
+    ++ s!"|resolverRounds={resolverRounds}|bound={bound}|runUs={routeUs}")
+  -- the completion arm, on its own executor so the two arms' parked counts cannot see each other
+  let crossStart ← IO.monoNanosNow
+  let ec ← Runtime.Executor.newMetered 256 2
+  let hc := Runtime.handle ec
+  let c ← Runtime.startCarriers ec 2
+  let tokCross ← Task.Cancel.new
+  let childStarted ← Task.Join.new (α := Unit)
+  let childTid ← IO.mkRef (0 : UInt64)
+  let creatorTidX ← IO.mkRef (0 : UInt64)
+  let continuationTidX ← IO.mkRef (0 : UInt64)
+  let creatorRuns ← IO.mkRef (0 : Nat)
+  let childRuns ← IO.mkRef (0 : Nat)
+  let continuationRunsX ← IO.mkRef (0 : Nat)
+  let waiterParked ← IO.mkRef (0 : Nat)
+  let finished ← Task.Join.new (α := Unit)
+  -- the link, delivered through the shared route: it records where it ran, then holds until the creator's
+  -- carrier is parked. Neither link is inside a park when the hold begins, so the first nonzero reading of
+  -- the composition's own parked count is the creator's — the wait the completion has to reach.
+  let childProg : Task.Async Unit := do
+    let push ← Task.Async.push
+    Task.Async.ofIO do
+      childTid.set (← IO.getTID)
+      childRuns.modify (· + 1)
+      Task.Join.resolve childStarted push ()
+    Task.Async.ofIO do
+      let mut seen : Nat := 0
+      let mut i : Nat := 0
+      while seen == 0 && i < bound do
+        let (_, pk) ← ec.observe
+        seen := pk
+        i := i + 1
+      waiterParked.set seen
+  let creatorProg : Task.Async Unit := do
+    let h ← Runtime.Handle.spawn hc Runtime.Priority.normal childProg
+    -- hold inside this step until the link has started, so the link is a peer carrier's to take
+    Task.Async.ofIO do
+      let mut seen := false
+      let mut i : Nat := 0
+      while !seen && i < bound do
+        seen := (← Task.Join.value? childStarted).isSome
+        if !seen then i := i + 1
+    let _ ← Task.Async.await h
+    pure ()
+  let creatorItem := Task.Item.ofIndexed (some tokCross)
+    (fun i => do
+      creatorTidX.set (← IO.getTID)
+      creatorRuns.modify (· + 1)
+      Runtime.fired tokCross ec creatorProg (fun _ ctx' => do
+        continuationTidX.set (← IO.getTID)
+        continuationRunsX.modify (· + 1)
+        Task.Join.resolve finished ctx'.resume ()) i)
+  ec.pushInject (Task.Item.sendable creatorItem)
+  let mut completionRounds : Nat := 0
+  while (← Task.Join.value? finished).isNone && completionRounds < bound do
+    completionRounds := completionRounds + 1
+  let completed := (← Task.Join.value? finished).isSome
+  let ctid ← creatorTidX.get
+  let chid ← childTid.get
+  let ktid ← continuationTidX.get
+  let crossed := chid != 0 && ctid != 0 && chid != ctid
+  let cruns ← creatorRuns.get
+  let chruns ← childRuns.get
+  let kruns ← continuationRunsX.get
+  let wp ← waiterParked.get
+  -- the readings are taken before the stop: a stop drains, and what a drain runs is not what the chain did
+  c.stop
+  c.join
+  let (heldAfter, _) ← ec.observe
+  let crossUs := ((← IO.monoNanosNow) - crossStart) / 1000
+  IO.println (s!"crossing|p=2|completed={if completed then 1 else 0}"
+    ++ s!"|creatorRuns={cruns}|childRuns={chruns}|continuationRuns={kruns}"
+    ++ s!"|crossed={if crossed then 1 else 0}|waiterParked={wp}"
+    ++ s!"|creatorTid={ctid}|childTid={chid}|continuationTid={ktid}"
+    ++ s!"|completionRounds={completionRounds}|bound={bound}|heldAfterStop={heldAfter}|runUs={crossUs}")
+  (← IO.getStdout).flush
+  return 0
+
 /-- **W3's evidence: timers on our carriers.**
 
 `n` sleepers and one late spawn, with the *order* of the events doing the work a clock would otherwise be asked
@@ -1673,8 +1872,10 @@ def runtimeTime : IO UInt32 := do
   -- so arriving at the print at all is part of the evidence.
   let (firstWins, lateTimerIgnored) ← Runtime.run e (do
     let cell ← LeanIn.Task.Join.new
-    LeanIn.Task.Join.resolveFirst cell (some 1)
-    LeanIn.Task.Join.resolveFirst cell (some 2)
+    -- The writes are issued from this step, so each delivers on this step's own route.
+    let push ← LeanIn.Task.Async.push
+    LeanIn.Task.Join.resolveFirst cell push (some 1)
+    LeanIn.Task.Join.resolveFirst cell push (some 2)
     let token ← (LeanIn.Task.Cancel.new : IO LeanIn.Task.Cancel)
     let first ← LeanIn.Task.Async.await (show LeanIn.Task.Task (Option Nat) from ⟨cell, token⟩)
     let late ← Runtime.withTimeout clock 5 (pure 7)
@@ -1797,6 +1998,7 @@ def runtimeCancel : IO UInt32 := do
   let hold ← IO.mkRef (some never)
   let benchProg : LeanIn.Task.EAsync IO.Error String := do
     let clock : IO Nat := IO.monoNanosNow
+    let push ← LeanIn.Task.EAsync.ofAsync LeanIn.Task.Async.push
     let t0 ← monadLift clock
     for _ in List.range benchN do
       let h ← LeanIn.Task.MonadAsync.spawn (pure ())
@@ -1810,7 +2012,7 @@ def runtimeCancel : IO UInt32 := do
     -- mode depend on the gate being present, which is what a red must not do.
     for _ in List.range benchN do
       let h ← LeanIn.Task.MonadAsync.spawn (LeanIn.Task.EAsync.ofAsync (Runtime.never : LeanIn.Task.Async Unit))
-      monadLift (Runtime.cancel benchHooks h (.error (.userError "bench")) : IO Unit)
+      monadLift (Runtime.cancel benchHooks h push (.error (.userError "bench")) : IO Unit)
       pure ()
     let t2 ← monadLift clock
     let ran ← monadLift (IO.mkRef (0 : Nat) : BaseIO (IO.Ref Nat))
@@ -1829,12 +2031,13 @@ def runtimeCancel : IO UInt32 := do
     for _ in List.range benchN do monadLift (one.token.set : BaseIO Unit)
     let t4 ← monadLift clock
     let cell ← monadLift (LeanIn.Task.Join.new : IO (LeanIn.Task.Join Unit))
-    for _ in List.range benchN do monadLift (LeanIn.Task.Join.resolveFirst cell () : IO Unit)
+    for _ in List.range benchN do monadLift (LeanIn.Task.Join.resolveFirst cell push () : IO Unit)
     let t5 ← monadLift clock
     for _ in List.range benchN do monadLift (Runtime.Hooks.retire benchHooks : IO Unit)
     let t6 ← monadLift clock
     for h in parkers do
-      monadLift (Runtime.cancel benchHooks h (.error (.userError "bench")) : IO Unit)
+      let push2 ← LeanIn.Task.EAsync.ofAsync LeanIn.Task.Async.push
+      monadLift (Runtime.cancel benchHooks h push2 (.error (.userError "bench")) : IO Unit)
     let cancelled ← monadLift (Runtime.pending benchHooks : IO Nat)
     return s!"hooksAwaits={awaits}|hooksCancelled={cancelled}|registrySize={size}|nsAwait={(t1 - t0) / benchN}|nsCancel={(t2 - t1) / benchN}|nsCancelFlag={(t4 - t3) / benchN}|nsCancelResolve={(t5 - t4) / benchN}|nsCancelRetire={(t6 - t5) / benchN}|parkersRan={ranN}"
   let benchOut ← Runtime.run benchE benchProg
@@ -1872,7 +2075,10 @@ def runtimeCancel : IO UInt32 := do
       | none    => pure 0
     atCancelRef.set atCancel
     pendingAtRef.set pendingAt
-    monadLift (Runtime.cancel hooks handle (.error (.userError "canceled")) : IO Unit)
+    -- The cancellation's route is read here, in the step that makes the call: a route fetched earlier would
+    -- be the route of a worker this step may not be running on.
+    let push ← LeanIn.Task.EAsync.ofAsync LeanIn.Task.Async.push
+    monadLift (Runtime.cancel hooks handle push (.error (.userError "canceled")) : IO Unit)
     let afterCancel ← match tok with
       | some tk => ofWork tk
       | none    => pure 0
@@ -1880,7 +2086,8 @@ def runtimeCancel : IO UInt32 := do
     let ok : Except IO.Error Unit := .ok ()
     monadLift (IO.Promise.resolve ok gate : BaseIO Unit)
     let secondTry ← try
-        monadLift (Runtime.cancel hooks handle (.error (.userError "canceled")) : IO Unit)
+        let push2 ← LeanIn.Task.EAsync.ofAsync LeanIn.Task.Async.push
+        monadLift (Runtime.cancel hooks handle push2 (.error (.userError "canceled")) : IO Unit)
         pure "ok"
       catch _ => pure "raised"
     doubleRef.set secondTry
@@ -2211,19 +2418,22 @@ def syncCtlLine : String :=
     syncCtlPair "recvProbe" syncNearRecv,
     syncCtlPair "sendProbe" syncNearSend]
 
-/-- `n` lock/unlock pairs on one mutex, as one computation. -/
+/-- `n` lock/unlock pairs on one mutex, as one computation. A release delivers the waiters it wakes, so it
+takes the releasing step's own route. -/
 def syncLockPairs (m : LeanIn.Task.Sync.Mutex) : Nat → LeanIn.Task.Async Unit
   | 0     => pure ()
   | n + 1 => do
       LeanIn.Task.Sync.Mutex.lock m
-      LeanIn.Task.Sync.Mutex.unlock m
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Sync.Mutex.unlock m push
       syncLockPairs m n
 
 /-- Yield the rest of this computation as a fresh step on the same carrier, so another computation's step can
 run at the boundary. The task layer exposes no primitive for this, so it is spelled here as `ctx.resume` of a
-continuation. -/
+continuation: the item goes into this worker's own slot and this worker fires it, so the context it carries is
+already the firing one. -/
 def syncYield : LeanIn.Task.Async Unit := ⟨fun k ctx => do
-  ctx.resume (LeanIn.Task.Item.ofAction (k ()))⟩
+  ctx.resume (LeanIn.Task.Item.ofDeferred ctx (k ()))⟩
 
 /-- `n` lock/unlock pairs where each pair **holds the permit across a yield**, so two computations running this
 interleave at the mutex: one takes the permit, yields, and the other's non-parking `tryLock` **finds it held** —
@@ -2242,7 +2452,8 @@ def syncLockPairsYielding (m : LeanIn.Task.Sync.Mutex) (held : IO.Ref Bool) : Na
         held.set true
         LeanIn.Task.Sync.Mutex.lock m
       syncYield
-      LeanIn.Task.Sync.Mutex.unlock m
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Sync.Mutex.unlock m push
       syncLockPairsYielding m held n
 
 /-- `n` acquires on one semaphore, as one computation. -/
@@ -2256,7 +2467,8 @@ def syncSemAcquires (s : LeanIn.Task.Sync.Semaphore) : Nat → LeanIn.Task.Async
 def syncSemReleases (s : LeanIn.Task.Sync.Semaphore) : Nat → LeanIn.Task.Async Unit
   | 0     => pure ()
   | n + 1 => do
-      LeanIn.Task.Sync.Semaphore.release s
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Sync.Semaphore.release s push
       syncSemReleases s n
 
 /-- The `syncbench|` rows: per-op nanoseconds for the uncontended and contended lock, a release that
@@ -2295,10 +2507,11 @@ def syncBench : IO String := do
   let w := 16
   let s3 ← LeanIn.Task.Sync.Semaphore.new 0
   let relNs ← timeRun (do
+    let push ← LeanIn.Task.Async.push
     for _ in List.range w do
       let _ ← LeanIn.Task.Async.spawn (LeanIn.Task.Sync.Semaphore.acquire s3)
       pure ()
-    LeanIn.Task.Sync.Semaphore.release s3)
+    LeanIn.Task.Sync.Semaphore.release s3 push)
   let cap := n
   let c1 ← LeanIn.Task.Sync.Channel.new Nat cap
   let chanOursNs ← timeRun (do
@@ -2348,7 +2561,8 @@ def parkRun (n : Nat) (park : LeanIn.Task.Async Unit) : IO Nat := do
   let hooks ← Runtime.Hooks.new
   Runtime.run e (do
     let (ns, hs) ← parkTimed hooks n park
-    for h in hs do Runtime.cancel hooks h ()
+    let push ← LeanIn.Task.Async.push
+    for h in hs do Runtime.cancel hooks h push ()
     for h in hs do let _ ← LeanIn.Task.Async.await h; pure ()
     pure ns)
 
@@ -2370,6 +2584,11 @@ def loadAvg : IO String := do
     return (s.splitOn " ").headD "?"
   catch _ => return "?"
 
+/-- **The push for a call whose waiter list is empty by construction.** The benches below send into a channel
+nobody is parked on and receive from one with no parked sender, so no delivery happens and the call has no route
+to name: this says that, rather than borrowing a route that would misdescribe the call. It is never called. -/
+def noWaiterPush : LeanIn.Task.Item → BaseIO Unit := fun _ => pure ()
+
 /-- **The `waiterbench|` rows: parking a large number of waiters.**
 
 One line per size `n`: the nanoseconds to park `n` computations on the semaphore's `acquire`, on a full
@@ -2386,7 +2605,7 @@ def waiterBench : IO Unit := do
     let s ← LeanIn.Task.Sync.Semaphore.new 0
     let semNs ← parkRun n (LeanIn.Task.Sync.Semaphore.acquire s)
     let cs ← LeanIn.Task.Sync.Channel.new Unit 1
-    let _ ← LeanIn.Task.Sync.Channel.trySend cs ()
+    let _ ← LeanIn.Task.Sync.Channel.trySend cs () noWaiterPush
     let sendNs ← parkRun n (LeanIn.Task.Sync.Channel.send cs ())
     let cr ← LeanIn.Task.Sync.Channel.new Unit 1
     let recvNs ← parkRun n (LeanIn.Task.Sync.Channel.recv cr)
@@ -2491,32 +2710,40 @@ def chanDecomp : IO String := do
       c.state.atomically do let st ← get; set st
   let nsOpFull ← bestNs (2 * n) do
     let c ← LeanIn.Task.Sync.Channel.new Nat 1
-    let _ ← LeanIn.Task.Sync.Channel.trySend c 0
+    let _ ← LeanIn.Task.Sync.Channel.trySend c 0 noWaiterPush
     for i in List.range (2 * n) do
-      let _ ← LeanIn.Task.Sync.Channel.trySend c i
+      let _ ← LeanIn.Task.Sync.Channel.trySend c i noWaiterPush
   let nsOpServed ← bestNs (2 * n) do
     let c ← LeanIn.Task.Sync.Channel.new Nat n
     for i in List.range n do
-      let _ ← LeanIn.Task.Sync.Channel.trySend c i
+      let _ ← LeanIn.Task.Sync.Channel.trySend c i noWaiterPush
     for _ in List.range n do
-      let _ ← LeanIn.Task.Sync.Channel.tryRecv c
-  -- The parked waiter's cell, per registration.
+      let _ ← LeanIn.Task.Sync.Channel.tryRecv c noWaiterPush
+  -- The parked waiter's cell, per registration. `onReady` carries the registering step's context, which is
+  -- never used here — the cell is never resolved, so nothing is ever delivered.
+  let benchCtx : LeanIn.Task.Ctx :=
+    { cancel := ← LeanIn.Task.Cancel.new
+    , resume := noWaiterPush
+    , routeAt := fun _ => noWaiterPush
+    , resumeShared := noWaiterPush
+    , «local» := {} }
   let nsJoinPark ← bestNs k do
     for _ in List.range k do
       let j ← LeanIn.Task.Join.new (α := Unit)
-      LeanIn.Task.Join.onReady j (fun _ => pure ())
+      LeanIn.Task.Join.onReady j benchCtx (fun _ _ => pure ())
   -- One step, per step.
   let cancel ← LeanIn.Task.Cancel.new
   let nsStep ← bestNs k do
     for _ in List.range k do
       let it := LeanIn.Task.Item.stamp (LeanIn.Task.Item.ofAction (pure ())) cancel
       if it.cancel.isNone then IO.println "chanunit: the stamp left the token empty"
-  -- The `Ctx` record's two `BaseIO` closure fields, per construction.
+  -- The `Ctx` record's three `BaseIO` closure fields, per construction.
   let nsCtx ← bestNs k do
     for _ in List.range k do
       let ctx : LeanIn.Task.Ctx :=
         { cancel := cancel
         , resume := fun (_ : LeanIn.Task.Item) => (pure () : BaseIO Unit)
+        , routeAt := fun (_ : Nat) (_ : LeanIn.Task.Item) => (pure () : BaseIO Unit)
         , resumeShared := fun (_ : LeanIn.Task.Item) => (pure () : BaseIO Unit)
         , «local» := {} }
       if ctx.cancel.id == 0 then IO.println "chanunit: the ctx has no token"
@@ -2590,7 +2817,8 @@ def runtimeSync : IO UInt32 := do
     let _ ← LeanIn.Task.Async.spawn unrelatedSecond
     let _ ← Runtime.awaitPromiseE hooks bGate
     record "b-exit"
-    LeanIn.Task.Sync.Mutex.unlock m
+    let push ← LeanIn.Task.Async.push
+    LeanIn.Task.Sync.Mutex.unlock m push
     return 9
   let holderA : LeanIn.Task.Async Nat := do
     LeanIn.Task.Sync.Mutex.lock m
@@ -2599,7 +2827,8 @@ def runtimeSync : IO UInt32 := do
     let _ ← LeanIn.Task.Async.spawn unrelatedFirst
     let _ ← Runtime.awaitPromiseE hooks aGate
     record "a-exit"
-    LeanIn.Task.Sync.Mutex.unlock m
+    let push ← LeanIn.Task.Async.push
+    LeanIn.Task.Sync.Mutex.unlock m push
     let vb ← LeanIn.Task.Async.await hb
     setNat bResultRef vb
     return 7
@@ -2613,7 +2842,8 @@ def runtimeSync : IO UInt32 := do
     -- `recv` draining as they park; the control channel is the same count into a channel with room.
     let c ← LeanIn.Task.Sync.Channel.new Nat cap
     for i in List.range sent do
-      let ok ← LeanIn.Task.Sync.Channel.trySend c (100 + i)
+      let push ← LeanIn.Task.Async.push
+      let ok ← LeanIn.Task.Sync.Channel.trySend c (100 + i) push
       addNat (if ok then tryAccRef else tryRejRef) 1
     let senders ← (List.range sent).mapM (fun i => LeanIn.Task.Async.spawn (do
       LeanIn.Task.Sync.Channel.send c (200 + i)
@@ -2627,7 +2857,8 @@ def runtimeSync : IO UInt32 := do
 
     let ctl ← LeanIn.Task.Sync.Channel.new Nat sent
     for i in List.range sent do
-      let ok ← LeanIn.Task.Sync.Channel.trySend ctl (300 + i)
+      let push ← LeanIn.Task.Async.push
+      let ok ← LeanIn.Task.Sync.Channel.trySend ctl (300 + i) push
       addNat (if ok then ctlAccRef else ctlRejRef) 1
 
     -- the semaphore's count: two permits, a third refused, one release, one more admitted.
@@ -2637,7 +2868,8 @@ def runtimeSync : IO UInt32 := do
     let s3 ← LeanIn.Task.Sync.Semaphore.tryAcquire sem
     setNat semAccRef ((if s1 then 1 else 0) + (if s2 then 1 else 0))
     setStr semRejRef (if s3 then "yes" else "no")
-    LeanIn.Task.Sync.Semaphore.release sem
+    let semPush ← LeanIn.Task.Async.push
+    LeanIn.Task.Sync.Semaphore.release sem semPush
     let s4 ← LeanIn.Task.Sync.Semaphore.tryAcquire sem
     setStr semAfterRef (if s4 then "yes" else "no")
 
@@ -2651,8 +2883,9 @@ def runtimeSync : IO UInt32 := do
       gateResolve wReady
       LeanIn.Task.Sync.Mutex.lock m2)
     let _ ← Runtime.awaitPromiseE hooks wReady
-    Runtime.cancel hooks w ()
-    LeanIn.Task.Sync.Mutex.unlock m2
+    let wPush ← LeanIn.Task.Async.push
+    Runtime.cancel hooks w wPush ()
+    LeanIn.Task.Sync.Mutex.unlock m2 wPush
     let got ← LeanIn.Task.Sync.Mutex.tryLock m2
     setStr lockRef (if got then "yes" else "no")
 
@@ -2665,30 +2898,34 @@ def runtimeSync : IO UInt32 := do
       let _ ← LeanIn.Task.Sync.Channel.recv rc
       pure ())
     let _ ← Runtime.awaitPromiseE hooks rReady
-    Runtime.cancel hooks r ()
+    let rPush ← LeanIn.Task.Async.push
+    Runtime.cancel hooks r rPush ()
     LeanIn.Task.Sync.Channel.send rc 42
     -- The receiver's value is taken by its own stock task once the send resolves its queue entry; that
     -- task runs on the pool, so the probe waits for a stock completion scheduled after the send before
     -- reading the channel. The wait is a completion, not a clock.
     let settle ← IO.asTask (pure (Except.ok () : Except IO.Error Unit)) _root_.Task.Priority.default
     let _ ← Runtime.awaitTask hooks settle
-    let gotR ← LeanIn.Task.Sync.Channel.tryRecv rc
+    let gotRPush ← LeanIn.Task.Async.push
+    let gotR ← LeanIn.Task.Sync.Channel.tryRecv rc gotRPush
     setStr recvRef (match gotR with | some _ => "present" | none => "lost")
 
     -- (c) a cancelled sender consumes no slot: the sender parks on a full channel, is cancelled,
     -- one value is drained, and a non-parking trySend reads whether a slot is free and whether the
     -- cancelled sender's value has appeared.
     let sc ← LeanIn.Task.Sync.Channel.new Nat 1
-    let _ ← LeanIn.Task.Sync.Channel.trySend sc 901
+    let scPush ← LeanIn.Task.Async.push
+    let _ ← LeanIn.Task.Sync.Channel.trySend sc 901 scPush
     let sReady ← (IO.Promise.new : IO (IO.Promise (Except IO.Error Unit)))
     let s ← LeanIn.Task.Async.spawn (do
       gateResolve sReady
       LeanIn.Task.Sync.Channel.send sc 999)
     let _ ← Runtime.awaitPromiseE hooks sReady
-    Runtime.cancel hooks s ()
-    let _ ← LeanIn.Task.Sync.Channel.tryRecv sc
-    let sentOk ← LeanIn.Task.Sync.Channel.trySend sc 555
-    let held ← LeanIn.Task.Sync.Channel.tryRecv sc
+    let sPush ← LeanIn.Task.Async.push
+    Runtime.cancel hooks s sPush ()
+    let _ ← LeanIn.Task.Sync.Channel.tryRecv sc sPush
+    let sentOk ← LeanIn.Task.Sync.Channel.trySend sc 555 sPush
+    let held ← LeanIn.Task.Sync.Channel.tryRecv sc sPush
     setStr sendAccRef (if sentOk then "yes" else "no")
     setStr ghostRef (match held with
       | some v => if v == 999 then "present" else "absent"
@@ -3217,7 +3454,8 @@ def runtimeRegistry : IO UInt32 := do
     | some h3 =>
       -- The connection's lifetime ends where the cancellation is issued (SC14's `endConn` shape), so
       -- the cancelling step appends the id to `ends`; the cancelled handler's own append is absent.
-      monadLift (Runtime.cancel hooks h3 (.error (.userError "sc15")) : IO Unit)
+      let push ← LeanIn.Task.EAsync.ofAsync LeanIn.Task.Async.push
+      monadLift (Runtime.cancel hooks h3 push (.error (.userError "sc15")) : IO Unit)
       monadLift (logMod fun s => { s with ends := s.ends ++ [k - 1], live := s.live - 1 })
       let d : LeanIn.Task.EAsync IO.Error Unit := do
         monadLift (IO.Promise.resolve ((.ok () : Except IO.Error Unit)) drainStarted : BaseIO Unit)
@@ -3474,10 +3712,11 @@ def priorityBench (k n : Nat) : IO (Nat × Nat) := do
     normalNs := normalNs + (← priorityOne k false)
   return (highNs, normalNs)
 
-/-- A handle whose cell is already resolved, so a benchmark can await it without a scheduling round. -/
+/-- A handle whose cell is already resolved, so a benchmark can await it without a scheduling round. The
+cell is *built* resolved (`Join.resolved`) rather than resolved later: nothing can have registered on it, so
+there is no waiter to deliver and no route for a resolution to name. -/
 def resolvedTask {α : Type} (v : α) : IO (LeanIn.Task.Task α) := do
-  let cell ← LeanIn.Task.Join.new
-  LeanIn.Task.Join.resolve cell v
+  let cell ← LeanIn.Task.Join.resolved v
   let token ← LeanIn.Task.Cancel.new
   return ⟨cell, token⟩
 
@@ -3847,7 +4086,8 @@ def runtimeHandle (readyFile : String) : IO UInt32 := do
   let spawned1 : LeanIn.Task.Async Unit := do
     let tid0 ← monadLift currentTid
     monadLift (ranTidRef.set tid0 : IO Unit)
-    monadLift (LeanIn.Task.Join.resolve gate1 () : IO Unit)
+    let push ← LeanIn.Task.Async.push
+    monadLift (LeanIn.Task.Join.resolve gate1 push () : IO Unit)
   let _ ← Runtime.Handle.spawn h1 Runtime.Priority.normal spawned1
   let _ ← IO.wait carrier1
   let ranTid ← ranTidRef.get
@@ -4063,7 +4303,9 @@ def runtimeHandle (readyFile : String) : IO UInt32 := do
   for _ in List.range benchN do
     let _ ← Runtime.Handle.spawn hbH Runtime.Priority.normal (pure () : LeanIn.Task.Async Unit)
   let hbT1 ← IO.monoNanosNow
-  LeanIn.Task.Join.resolve hbGate ()
+  -- The resolution is made by this thread, which is not a carrier: the shared route is the one it can take,
+  -- and its push unparks the parked driver under the shared cell's own lock.
+  LeanIn.Task.Join.resolve hbGate (Runtime.sharedPush hbE) ()
   let _ ← IO.wait hbCarrier
   let spawnUs := (hbT1 - hbT0) / benchN / 1000
   let hbE2 ← Sched.Executor.new LeanIn.Task.Item 256 1
@@ -4140,8 +4382,9 @@ def stealFields : List String :=
    "emptyVictimRingBefore", "slotStolen", "slotVictimSlotBefore", "thiefRingAfter", "thiefSlotAfter", "thiefTid", "victimTid"]
 
 /-- SC18-O1 and SC18-O3 as one detector: work spread over more than one of the *started* carriers, the same
-detector reading exactly one on the `P = 1` arm, the chain staying on one carrier, every carrier parked with
-nothing ready before a push from a thread that is not a carrier, both pushes running on a carrier rather than
+detector reading exactly one on the `P = 1` arm, the chain's `chainCarriers` bound by its own named field and
+compared in no clause, every carrier parked with nothing ready before a push from a thread that is not a
+carrier, both pushes running on a carrier rather than
 on the spawning thread, and the drain leaving nothing held. Every operand is read from its own named field.
 
 The record's `carriers` field — the number of carriers the entry actually started, `Carriers.count` — is
@@ -4157,10 +4400,10 @@ def carriersOk (rec : String) : Bool :=
         serviceNat rec "remaining", serviceNat rec "ranTid", serviceNat rec "spawnTid",
         serviceField rec "inWorkerTids", serviceField rec "ran1", serviceField rec "ran2",
         serviceIds rec "ranTids", serviceIds rec "carrierTids" with
-  | some p, some dc, some cc1, some chain, some pb, some rb, some _, some _, some _, some ifa, some pend,
+  | some p, some dc, some cc1, some _chain, some pb, some rb, some _, some _, some _, some ifa, some pend,
     some sn, some rem, some ranTid, some spawnTid, some inw, some ran1, some ran2, some ranTids,
     some carrierTids =>
-      dc ≥ 2 && cc1 == 1 && chain == 1 && pb == p && rb == 0 && inw == "yes" &&
+      dc ≥ 2 && cc1 == 1 && pb == p && rb == 0 && inw == "yes" &&
       ran1 == "yes" && ran2 == "yes" && ranTid ≠ spawnTid &&
       ranTids.all (fun t => carrierTids.contains t) &&
       ifa == 0 && pend == 0 && sn == 100000 && rem == 0
@@ -4206,9 +4449,10 @@ def stealNearBatch : String :=
 /-- The slot-only victim's slot was cleared by the call: the shape a slot-taking thief produces. -/
 def stealNearSlot : String := stealGoodRec.replace "slotStolen=no" "slotStolen=yes"
 
-/-- The mode's own checker readings: the well-formed pair is accepted, each near miss is rejected, and
-`variants` is how many near-miss variants were exercised — the caller, clause two's batch, the chain half,
-and the slot-cleared record.
+/-- The mode's own checker readings: the accepted set is three records rather than a pair — the well-formed
+pair plus the chain record, which the route rebinding makes an acceptance rather than a near miss — each
+remaining near miss is rejected, and `variants` is derived as `near.length`, the number of near-miss variants
+exercised: the caller, clause two's batch, and the slot-cleared record.
 
 **A description, not evidence.** The mode evaluates its own `carriersOk`/`stealOk` on records it constructs
 so that they pass by construction, so this line states *what the fixture is expected to exercise*; it is not a
@@ -4218,12 +4462,11 @@ fixture's own exercises (`tests/executor-contract.sh`, whose `setup_error` paths
 line is likewise a description: `unmarkedPushes` is printed as the constant `0` the marked path makes true,
 and the marker's real enforcement is the compile (an unmarked push does not elaborate), not this line. -/
 def carriersCtlLine : String :=
-  let good := [carriersOk carriersGoodRec, stealOk stealGoodRec]
-  let near := [carriersOk carriersNearCaller, stealOk stealNearBatch, carriersOk carriersNearChain,
-               stealOk stealNearSlot]
+  let good := [carriersOk carriersGoodRec, stealOk stealGoodRec, carriersOk carriersNearChain]
+  let near := [carriersOk carriersNearCaller, stealOk stealNearBatch, stealOk stealNearSlot]
   "carriersctl|accepted=" ++ (if good.all id then "yes" else "no") ++
   "|rejected=" ++ (if near.all (fun b => !b) then "yes" else "no") ++
-  "|variants=4"
+  "|variants=" ++ toString near.length
 
 /-- The box's logical core count, read for the batch row so that oversubscription at the widest arm is
 visible rather than mysterious: the native pool's own width is a configuration, and a `ratio` that reverses
@@ -4321,7 +4564,9 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
       ran.atomically do set ((← get) ++ [← IO.getTID])
       let k ← done.atomically do let k ← get; set (k + 1); return k
       if k + 1 == n then
-        LeanIn.Task.Join.resolve all ()
+        -- The body's step runs on a carrier it cannot name, and the waiter it wakes is parked: the shared
+        -- route is the one any thread may take, and its push unparks under the shared cell's own lock.
+        LeanIn.Task.Join.resolve all (Runtime.sharedPush e) ()
       else pure ()
     let root : LeanIn.Task.Async Unit := do
       LeanIn.Task.Async.ofIO do
@@ -4329,7 +4574,8 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
           let _ ← Runtime.Handle.spawn h Runtime.Priority.normal body
       let token ← LeanIn.Task.Async.ofIO LeanIn.Task.Cancel.new
       LeanIn.Task.Async.await ⟨all, token⟩
-      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin ())
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin push ())
     let (c, _) ← Runtime.runCarriers e workers root
     -- how many carriers the entry actually started: `Carriers.count` reads the thread array, so it is `0`
     -- under the staged entry (no carriers) and `workers` under the fixed one. Read before `stop`/`join`,
@@ -4369,12 +4615,12 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
   let first ← LeanIn.Task.Join.new (α := Unit)
   let _ ← Runtime.Handle.spawn h3 Runtime.Priority.normal (LeanIn.Task.Async.ofIO do
     ran1Tids.atomically do set ((← get) ++ [← IO.getTID])
-    LeanIn.Task.Join.resolve first ())
+    LeanIn.Task.Join.resolve first (Runtime.sharedPush e3) ())
   let (_, wokeRounds) ← awaitRounds first
   let second ← LeanIn.Task.Join.new (α := Unit)
   let _ ← Runtime.Handle.spawn h3 Runtime.Priority.normal (LeanIn.Task.Async.ofIO do
     ran2Tids.atomically do set ((← get) ++ [← IO.getTID])
-    LeanIn.Task.Join.resolve second ())
+    LeanIn.Task.Join.resolve second (Runtime.sharedPush e3) ())
   let _ ← awaitRounds second
   let m3 ← Runtime.Handle.metrics h3
   let parkedAfter := m3.parked
@@ -4406,7 +4652,7 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
   let bodyS : LeanIn.Task.Async Unit := LeanIn.Task.Async.ofIO do
     let k ← doneS.atomically do let k ← get; set (k + 1); return k
     if k + 1 == scaleN then
-      LeanIn.Task.Join.resolve allS ()
+      LeanIn.Task.Join.resolve allS (Runtime.sharedPush eS) ()
     else pure ()
   for _ in List.range scaleN do
     let _ ← Runtime.Handle.spawn hS Runtime.Priority.normal bodyS
@@ -4475,7 +4721,7 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
       bodyJob leaninSum (← done.atomically do return (← get))
       let k ← done.atomically do let k ← get; set (k + 1); return k
       if k + 1 == batchN then
-        LeanIn.Task.Join.resolve all ()
+        LeanIn.Task.Join.resolve all (Runtime.sharedPush e) ()
       else pure ()
     let root : LeanIn.Task.Async Unit := do
       LeanIn.Task.Async.ofIO do
@@ -4483,7 +4729,8 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
           let _ ← Runtime.Handle.spawn h Runtime.Priority.normal body
       let token ← LeanIn.Task.Async.ofIO LeanIn.Task.Cancel.new
       LeanIn.Task.Async.await ⟨all, token⟩
-      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin ())
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin push ())
     let t0 ← IO.monoNanosNow
     fanOutPush e wp fin root
     let t1 ← IO.monoNanosNow
@@ -4555,11 +4802,13 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
         go (k - 1)
     let prog : LeanIn.Task.Async Unit := do
       go links
-      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin ())
-    -- The carriers are started, so `chainCarriers = 1` is an **affirmative** control rather than a
+      let push ← LeanIn.Task.Async.push
+      LeanIn.Task.Async.ofIO (LeanIn.Task.Join.resolve fin push ())
+    -- The carriers are started, so the *construction* is an **affirmative** control rather than a
     -- construction artifact: with `p` carriers running, a thief can reach a ring item of the carrier running
-    -- the chain, so a crossing is possible and its absence is a reading. The chain's links live in the LIFO
-    -- slot, which a ring-only steal cannot see, which is why the crossing does not happen. The program is
+    -- the chain, so a crossing is possible, and `chainCarriers` is a reading of which carrier fired each link
+    -- rather than a fixed assertion. The chain's links live in the LIFO
+    -- slot, which a ring-only steal cannot see. The program is
     -- pushed through the off-carrier capability and its cell is polled by a bounded round count, so the
     -- caller never drives worker 0 alongside the worker-0 carrier — the extra driver is what the staged wait
     -- accounting cannot survive at P carriers (a bounded poll cannot hang on it).
@@ -4682,6 +4931,7 @@ def main (args : List String) : IO UInt32 := do
   | "--executor-park" :: _ => return ← executorPark 256
   | "--executor-queue" :: _ => return ← executorQueue
   | "--executor-lifo-turns" :: _ => return ← executorLifoTurns
+  | "--executor-route" :: rest => return ← executorRoute (argNat rest "--bound" 200000)
   | "--runtime-threads" :: _ => return ← runtimeThreads
   | "--runtime-bench" :: _ => return ← runtimeBench
   | "--runtime-tail" :: _ => return ← runtimeTail

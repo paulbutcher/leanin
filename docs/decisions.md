@@ -4,7 +4,7 @@ Settled decisions and the evidence each rests on. Evidence anchors are in
 [`lean-scheduler.md`](lean-scheduler.md) (the current runtime), [`tokio-map.md`](tokio-map.md) (what
 we are taking), [`evidence.md`](evidence.md) (the claim-to-source register) and
 [`PERFORMANCE.md`](PERFORMANCE.md) (the measured rows the cost records cite). No decision is open: each
-entry states its own limits, and the ones D20 and D21 leave are named in them.
+entry states its own limits, and the ones D20, D21 and D22 leave are named in them.
 
 ______________________________________________________________________
 
@@ -1099,9 +1099,93 @@ untouched; and the three laws' `#print axioms` lines name nothing beyond `propex
 
 ______________________________________________________________________
 
+### D22 — A step's re-enqueue takes the firing worker's route, and a deferred continuation is an item on the resolver's own queue.
+
+W18's decision record, and **D19's residual closed**: the per-worker wake flag and its broadcast are gone,
+because the third off-owner local push they covered no longer exists.
+
+**The route is read at fire time, never captured.** D19 had the route travel as an *index* (`Item.act : Nat →
+IO Unit`) and a root supply the firing worker's route. This decision makes that the *only* way a route enters a
+step: `Task.Ctx` carries the worker's own route (`resume`) **and the runtime's route table** (`routeAt`, whose
+`n`-th entry is worker `n`'s own queue), a step's own re-enqueue reads the table at the index it is fired with
+(`Ctx.rebind`), and a continuation that a *different* worker resolves is delivered as an item —
+`Task.Item.ofDeferred` — whose action re-binds the waiting computation's context at the firing index. So a
+step's re-enqueue takes the route of the worker that fires it, and **no continuation holds a route that was
+resolved before it ran**. The rule's other half is its mirror: every resume that is *not* a step's own
+re-enqueue — a leaf completion, a blocking completion, the harness clock's fire, a resolution made by a thread
+that owns no queue — takes the **shared** route (`Ctx.resumeShared`), whose push appends to the inject and
+unparks a parked waiter inside that same section.
+
+**The census, because the last three counts in this family were wrong.** D19's own audit found two off-owner
+sites where the code has three, and this milestone's first draft then named one continuation registration where
+the repository has five. Each site is therefore written out, with its route and its owner before and after; the
+table is in `LeanIn/Task/Basic.lean`'s module header. The five registrations a *resolving step* runs
+(`Async.await`, `select`'s final continuation, and `Semaphore.acquireStep`/`Channel.sendStep`/`Channel.recvStep`)
+now deliver on the **resolving** worker's own queue, and the harness clock's fire takes the shared route. The
+distinction the `Sync` sites turn on is preserved: **the route comes from the firer and the token from the
+waiter** (`Item.ofDeferred` carries the waiter's token and ambient context), so a retry keeps its own stamp.
+
+**Why the resolver's *own* queue, and the shared route rejected for that site.** A `Join`-cell continuation is
+delivered as an item on the route of the worker that resolves the cell, because the resolver *is* a carrier: the
+thread that pushes and the worker that owns the target queue are the same worker, which is exactly `pushLocal`'s
+premise. Routing the site through `resumeShared` — D19's rejected alternative, restated here because it stays
+rejected — would send *every* await continuation through the inject and let a chain cross a carrier on a tree
+where nothing was stolen, and it would put that traffic on the one contended cell W8's third milestone prices.
+`Join.onReady`'s "already resolved" case keeps calling the continuation inline: that is the *same* worker's
+step, so nothing is deferred and no route is needed.
+
+**What is removed.** `Executor.wakeIfParked` and its two callers, the per-worker flag it recorded and the
+helper that set it, and the two predicates' reads of that flag. With them goes the shared section every local
+push paid for it (`submitLocalRaw`/`spawnLocalRaw` now make one pool transaction; their placement overflow
+still unparks through `pushItems`, as every shared push does). With the third off-owner site gone, `pushLocal`'s
+"worker `i` is not parked" holds as an implementation fact rather than a convention a wake has to repair, and
+`Model/` is untouched: this is the implementation moving back onto the premise the model already had.
+
+**The locality's identity changes, and which construction each row prices is now written down.** A chain link is
+pushed on the route of the worker that *resolved* it — the worker that ran the child — so a chain follows the
+worker that fires each link, and `chainCarriers > 1` is legitimate rather than a defect. The old reading
+(`chainCarriers = 1`) meant "the chain did not leave the core its parent ran on **because the parent's route was
+captured**"; the new reading is the interface's own rule, now stated in `interface.md` §3, where a chain stays
+on the core its parent *ran* on. W8's LIFO milestone criterion 2 (`chainCarriers = 1` on *that* milestone's
+arm, whose chain is spawned through `Handle.spawn` on `p` carriers) is re-read as the pre-rebinding identity,
+and its criterion 3 — the ratio against the base revision — is a different construction and is not re-used.
+
+**What it costs and what it buys, measured.** The change's only cost on the local path is that a
+`Push`-carrying operation states its route: `Join.resolve`/`Join.resolveFirst`/`Task.cancel`/`Runtime.cancel`
+and the `Sync` operations that deliver waiters take the *delivering step's* own route — `Task.Async.push`, read
+in the step that makes the call, never hoisted across an await, because a route fetched earlier is a route of a
+worker the calling step may not be running on. What it buys is the enqueue side W8 gave back: interleaved
+against the base revision in one session (four runs an arm, minima per §1, 8 cores, kernel 6.17.0-1032-oem, load
+2.6–3.3), `Executor.spawn` reads **331 ns with the flag against 287 without it** — 44 ns in the same session, in
+the direction W8's record stated (466 against 372–389) — and the `spawn+await` round trip is not regressed by
+delivering a continuation as an item (base min 1906 ns against 1850). `docs/PERFORMANCE.md` §3.5 carries the
+runs, the interleaving and the load.
+
+**Evidence.** SC22 is green and reads the *mirror* of the route clause's unstaged red: the pre-fix tree read
+`creatorPoolAfter=1|firerPoolAfter=0|continuationTid=creatorTid` for a chain crossing carriers, and the fixed
+tree reads the firing worker's own pool gaining one, the creator's unchanged, the shared list empty, and the
+firing worker's thread running the continuation. The staged cut no longer matters — with a `wakeIfParked` whose
+entire action is `pure ()`, called from both local pushes, re-applied in a scratch copy, SC22's completion
+clause reads `completed=1|crossed=1|waiterParked=1|heldAfterStop=0`, where the same cut on the pre-fix tree
+read `completed=0|waiterParked=1`. The no-regression set is SC1–SC3, SC5, SC12–SC14 and SC16–SC21; the four
+scenarios coupled to the changed sites are SC13 (the sync registrations), SC14 (the service's admission bound),
+SC16 (`select`) and SC12 (the blocking seam). `Model/` is byte-identical.
+
+**What this does not establish.** (i) It does not show that *no other* site needed the flag: that is the
+census's job, and the census is held to the standard of naming every site that can enqueue into a worker's own
+queue, with the shared-by-design ones named and given their reason. (ii) The harness clock's fire takes the
+shared route even though today's only advancer is the single-carrier driver: pushing on the sleeper's local
+route is owner-made only under that caller's convention, and a convention cannot be load-bearing once the flag
+is gone — a `clock` advanced from another thread would push into a parked worker's own queue with nothing to
+wake it. (iii) The `Sync` primitives' delivering operations now take a route, which is a signature change for
+`Semaphore.release`, `Mutex.unlock`, `Channel.trySend` and `Channel.tryRecv`: they stay `IO` (the interface's
+parking/non-parking split is untouched) and their callers state the route.
+
+______________________________________________________________________
+
 ## Open
 
-No decision is open: D19's successor is D20, and D21 is this register's last entry. The limits those records
-leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s uncancelled loser on
-either side, and the second measurement condition as D21 reads it — are stated in their own entries rather than
-here.
+No decision is open: D19's residual is closed by D22, and D22 is this register's last entry. The limits those
+records leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s uncancelled
+loser on either side, the second measurement condition as D21 reads it, and the harness clock's
+single-advancer convention as D22 reads it — are stated in their own entries rather than here.
