@@ -437,8 +437,6 @@ plan's §6 condition-2 measurement, reads green; the two instruments disagree be
 constructions (a 2000-link chain pushed off-carrier against a 20000-link round trip driven on the calling
 thread), and both readings are recorded rather than one chosen.
 
-
-
 ## 4. 🔴 Where we are worse
 
 Stated before anything above it, because it is the honest part of this document. The section holds one
@@ -598,9 +596,9 @@ channel's **460–589 ns** in the same run — the 1.06–1.35× (`chanRatioPct`
 band. Of that whole, in
 nanoseconds per message:
 
-* **78–92 ns** is the mutual exclusion itself — two bare `Std.Mutex.atomically` transactions (`nsBareTx`),
+- **78–92 ns** is the mutual exclusion itself — two bare `Std.Mutex.atomically` transactions (`nsBareTx`),
   consistent with `--runtime-unit`'s plumbing row (61–68 ns) and `--runtime-ops`' mutex section (29–49 ns);
-* **200–256 ns** is the served transaction's own state work (`nsServedTx` minus `nsBareTx`), split — by a full
+- **200–256 ns** is the served transaction's own state work (`nsServedTx` minus `nsBareTx`), split — by a full
   capacity-1 channel's `trySend`, which runs the served branch's `else`, against a roomy channel's
   `trySend`/`tryRecv` — into the `live`/`prune` walk plus the room check, **92–110 ns** (`nsPruneWalk`), and
   the enqueue or dequeue and the wake, **108–150 ns** (`nsEnqueue`). On this path the two halves are
@@ -608,7 +606,7 @@ nanoseconds per message:
   `ChanState` record twice, and the `sweep` that decides whether a walk is due is paid over two *empty* lists
   even when it walks nothing — which is why this figure is largely fixed cost rather than a walk's cost, and
   why amortizing the walk (see below) left the served row within noise;
-* **~120–180 ns** is the CPS closure chain the operation is written in (`nsLoopAsync`, the same program with
+- **~120–180 ns** is the CPS closure chain the operation is written in (`nsLoopAsync`, the same program with
   `pure ()` in place of every send and receive), with the served operation's own closure and its call into
   `sendStep`/`recvStep` in the residual between `nsChanWork` and `nsServedTx`.
 
@@ -650,6 +648,65 @@ carrier free, and the CPS closure chain and the mutex transaction this row price
 message because we do not block the carrier** — the same trade seen from the other side in §4.1, where a
 blocking call that does not take the pool stops everything — and the row reads as the price of that choice
 rather than a plain deficit.
+
+### The libuv server path (W16): the socket layer without the promise bridge
+
+`c/netuv.c` and `LeanIn/Runtime/Io.lean` are a server-side socket layer on our own libuv loop. The five
+operations `Http.serveConn` and the accept loops use — `Listener.bind`/`sockName`/`accept`,
+`Conn.recv`/`send`/`sendAll`/`shutdown` — keep their names, types and semantics, `Http.lean` and the accept loops
+are unchanged, and the handler still runs on one of our carriers (SC19's `carrierThreads = 1` holds). What
+changes is where a completion comes from: the shim's loop runs on a dedicated stock Lean task, and it resolves
+the runtime's own `Join` cell through `Runtime.sharedPush`, so it no longer matters that the lease arrives
+through a promise.
+
+These rows are from a working tree in which the path is **not yet committed** — `HEAD` still holds the
+`Std.Async` path — and they are the reason it is not committed. Same client and mode as §2's baseline
+(`load.mjs`, connection-per-request, `close`), 5-second runs, `server static`.
+
+| connections | `Std.Async` path (`HEAD`) | libuv path | ours is |
+|---|---|---|---|
+| 1 | 2 864 req/s | 2 169–2 685 req/s | 🔴 parity to −24%; within §1's drift |
+| 8 | 5 096 | 692–729 | 🔴 ~7× slower |
+| 32 | 3 722 | 511–527 | 🔴 ~7× slower |
+
+**The C=8 and C=32 rows are withdrawn as throughput figures**, and the reason is the finding: the server *exits
+1* under load. `c/netuv.c` fills a 16 384-slot event ring, sets `g_ev_dropped`, and synthesises an overflow event,
+which `Io.lean` turns into `throw` — the loop thread dies, every parked operation hangs with it, `Io.stop`
+re-raises on shutdown, and the process ends inside its own exit path (which is why the message reached no log).
+A full ring is treated in that file as an impossible internal state; it is reachable from load. The sibling
+condition is worse if it is hit: a refused submission (`MAX_SUBMIT`, 8 192) returns 0, and a caller that parks
+anyway hangs a connection *silently*, with no error anywhere. Both are correctness items before they are
+performance items.
+
+**What the instruments did establish, on a server that survived:**
+
+- **It is not one thread and it is not spinning.** Per-thread CPU over a window of a C=1 run and a C=8 run
+  (`/proc/<pid>/task/*/stat`): the carrier and the loop thread each consume roughly half a core at C=1 and
+  saturate together at C=8-plus. Over the same window the carrier reads 5 280 ms user against 370 ms system, the
+  loop thread 3 960 against 980, and the context switches are 84 351 voluntary against 2 021 nonvoluntary (carrier)
+  and 77 609 against 1 770 (loop thread). So the cost is **Lean work on both sides of a handoff**, not syscall
+  traffic and not a contended lock — a hypothesis those counters refuted rather than supported. The per-operation
+  share is ~32 µs of user CPU on the loop thread and ~364 µs per completed request on the carrier, and what that
+  364 µs is *made of* is not yet localised.
+- **`completed`/s under-credits the server, and the gap grows with connections.** The client's error share —
+  each error a connection the server also accepted, read and closed — reads 61% at C=1 and **80% at C=8**. So at
+  eight connections the server does roughly five connections' worth of work per request the client counts. In the
+  one run where both instruments were read, the server served 6 633 while the client completed 5 295 (different
+  runs, so not a clean pair). Whether `HEAD`'s path shows the same share is unmeasured, and it is the calibration
+  that decides how much of the C=8 gap is a work multiplier rather than a per-operation cost.
+- **The 41 ms floor was ours, and no scenario could see it.** Before the fix, stage timing put 4–5 µs in
+  enqueue→apply and 42 244 µs in apply→completion; the shim asked for the read promptly and the completion
+  arrived 41 ms later. `Conn.sendAll` was issuing one `uv_write` per buffer, so a response went out as two
+  back-to-back small segments and the peer's delayed-ACK timer held the second, and the accepted connection
+  never had `TCP_NODELAY` set. The old `sendAll` wrote them as one operation, which its own docstring states —
+  **a documented promise that none of SC1–SC22 asserts**, found by measurement rather than by the contract.
+  With both fixed the floor is gone (308 / 127 / 77 / 208 µs for successive responses on one connection) and C=1
+  close-mode moved 1 160 → 2 509 req/s.
+
+**Not a comparison.** The spike that motivated this path measured 5 538–10 494 / 14 934–18 664 / 18 025–21 496
+req/s, and it is ⚪ here for a reason worth stating: it handled each request *on the loop thread*, so it had no
+handoff at all, and it parsed no HTTP. Those figures are a ceiling for a different shape, not a target this one
+is failing to reach.
 
 ## 5. ⚪ Rows that are about a pool, not about us
 

@@ -468,10 +468,8 @@ scenario is SC16, green on every run — `nix develop -c bash tests/executor-con
 `lake exe controls --runtime-select` three times and asserts the same fields in each. One invocation's records
 read `winner=h1 readyOrder=h1,h0` (the handle that became ready first won, against a readiness log where the
 head became ready second), with `loserValue=10 joined=10,20` (the loser was left running and produced its own
-value after `select` returned; `join` collected both in list order); `loserOutcome=error loserRanOn=no
-pendingBefore=1 pendingAfter=0 winnerRan=yes` (the race cancelled the loser with its value, no step of it ran
-afterwards, and its registration was retired); and `normalThenHigh=high,normal highThenNormal=high,normal
-servedBeforeHigh=0 servedBeforeNormal=4` (a `.high` spawn is served before a `.normal` one regardless of issue
+value after `select` returned; `join` collected both in list order); `loserOutcome=error loserRanOn=no pendingBefore=1 pendingAfter=0 winnerRan=yes` (the race cancelled the loser with its value, no step of it ran
+afterwards, and its registration was retired); and `normalThenHigh=high,normal highThenNormal=high,normal servedBeforeHigh=0 servedBeforeNormal=4` (a `.high` spawn is served before a `.normal` one regardless of issue
 order). The milestone's measurement rows are `--runtime-select`'s `selectbench|`/`racebench|`/`priorityorder|`/
 `prioritybench|` lines, recorded with their command in `docs/PERFORMANCE.md` §3.3; the design, the losers' fate,
 the register statement and the model question are in `docs/decisions.md` D17 and the module prose.
@@ -507,8 +505,7 @@ The scenario is SC15, green on every run —
 `nix develop -c bash tests/executor-contract.sh SC15`, which invokes `lake exe controls --runtime-registry` three
 times and asserts the same fields in each. One invocation's records read
 `scope=7 child=7 unrelated=0` (the value installed on the client computation is read by the computation it
-spawned and not by one it did not), `heldBefore=4 completions=3 completedAtDrainReturn=3 liveAtDrainReturn=0
-heldAfter=0` (the drain returned only after the outstanding handlers finished, with the live count at zero) and
+spawned and not by one it did not), `heldBefore=4 completions=3 completedAtDrainReturn=3 liveAtDrainReturn=0 heldAfter=0` (the drain returned only after the outstanding handlers finished, with the live count at zero) and
 `cancelOutcome=error` (a cancelled handle neither hangs the drain nor is granted to a caller). The milestone's
 measurement rows are `--runtime-registry`'s `registrybench|`/`registryhand|`/`registryheld|` lines, recorded with
 their command in `docs/PERFORMANCE.md` §3.2; the design, the deferred deadline arm and the argued model
@@ -543,16 +540,13 @@ from the harness clock, with the control that the same test at a shorter deadlin
 has `Clock`, `Clock.live` (production's exact composition), `HarnessClock` and the harness-driven entry
 `runVirtual`; `Time.lean`'s `sleep`/`withTimeout` take a clock; `Leaf.lean` has `awaitSignal`; and
 `Task/Basic.lean`'s `Cancel.new` allocates its id under a `Std.Mutex`. The scenario is SC17, green on every run —
-`nix develop -c bash tests/executor-contract.sh SC17`, which backgrounds `lake exe controls --runtime-handle
---ready-file PATH`, sends `SIGTERM` to the pid it publishes, and asserts three clauses. One invocation's records
+`nix develop -c bash tests/executor-contract.sh SC17`, which backgrounds `lake exe controls --runtime-handle --ready-file PATH`, sends `SIGTERM` to the pid it publishes, and asserts three clauses. One invocation's records
 read `handle|spawnTid=…|ranTid=…|carrierTid=…|readyBefore=0|parkedBefore=1|readyAfter=0|parkedAfter=0` with
 `ranTid = carrierTid ≠ spawnTid` (the work a non-carrier thread spawned ran on the carrier, with the carrier
-parked when the spawn arrived); `signal|signal=15|signalSeen=yes|stopSeen=yes|handlerCarrier=yes|acceptedAtStop=1|
-acceptedFinal=1|offered=2|bodyDone=yes|inFlightAfter=0|pendingHooks=0` with
+parked when the spawn arrived); `signal|signal=15|signalSeen=yes|stopSeen=yes|handlerCarrier=yes|acceptedAtStop=1| acceptedFinal=1|offered=2|bodyDone=yes|inFlightAfter=0|pendingHooks=0` with
 `log=[accept:1,stop-observed,body-echoed,drain-returned,offer:2]` (the registered signal stopped accepting —
 `acceptedFinal = 1` against `offered = 2`, controlled by `acceptedAtStop = 1` — and then drained the connection
-in flight); and `clock|completesAt=30|longDeadline=100|longOutcome=some:7|longElapsed=30|shortDeadline=20|
-shortOutcome=none|shortElapsed=20|pendingAfter=1|deadlineAt=30|deadlineWinner=timer` (both elapsed readings are
+in flight); and `clock|completesAt=30|longDeadline=100|longOutcome=some:7|longElapsed=30|shortDeadline=20| shortOutcome=none|shortElapsed=20|pendingAfter=1|deadlineAt=30|deadlineWinner=timer` (both elapsed readings are
 the stated instants, read from the harness clock, with `shortDeadline < completesAt` making the pair a relation
 rather than two numbers). The milestone's measurement rows are `--runtime-handle`'s `handlebench|`/`metricscost|`/
 `signaldrain|` lines, recorded with their command in `docs/PERFORMANCE.md` §3.4; the design, the `Cancel.new`
@@ -581,8 +575,7 @@ carriers, and two measurement conditions: the batch-shape gap to the native pool
 chain-shape advantage must not regress. The second condition's criterion is the base revision's own
 same-session ratio, not the historical 7.6× (`docs/PERFORMANCE.md` §3.5).
 
-**Met, and what its record reads.** SC18 is green and SC1–SC17 (the subset `SC1 SC2 SC3 SC5 SC6 SC8 SC10 SC11
-SC14 SC15 SC16 SC17`) are green on the fixed tree. **One finding the run produced, stated rather than hidden:
+**Met, and what its record reads.** SC18 is green and SC1–SC17 (the subset `SC1 SC2 SC3 SC5 SC6 SC8 SC10 SC11 SC14 SC15 SC16 SC17`) are green on the fixed tree. **One finding the run produced, stated rather than hidden:
 Rule 2 covers two of three off-owner sites.** The two seam completions take `resumeShared`, and the third is on
 the task layer — `Async.await`/`select`'s `Join`-cell continuation runs on whichever carrier resolved the cell,
 so a shared-list child can land in another parked worker's queue; the per-worker `poked` flag and the broadcast
@@ -795,6 +788,45 @@ async layer, so the single thing that differs between the two runs is the server
 **Acceptance.** The baseline row against the shipped server, reproducible from one command; then, once the
 vendored driver exists, the same command against this runtime, differing only in the address it is given. The
 figures enter `docs/PERFORMANCE.md` at that point and not before — that document carries measured rows only.
+
+### W16 continued — the libuv path's concurrency gap
+
+The path exists and its contract holds: the five socket operations keep their signatures, `Http.lean` and the
+accept loops are unchanged, and SC1–SC22 pass on it. Its C=1 rate is at parity with the promise bridge within
+drift; its C=8 and C=32 rates are not yet established, because the service exits 1 under load and because the
+client's error share inflates the server's work per counted request (both measured, both recorded in
+`PERFORMANCE.md` §4). The following order is what the evidence supports, not a preference:
+
+1. **Restore the half-close.** `Conn.shutdown` currently pairs `uv_shutdown` with `uv_close` in the shutdown
+   callback, where the path it replaces only sent a FIN and let the socket lapse. Closing with unread data in the
+   receive buffer makes the kernel send RST instead of FIN, and in `close` mode there is nearly always unread
+   data — the peer's next request, or its FIN that we never read because reading stops at the header terminator.
+   That is the mechanism behind the error share rising 61% → 80% with connections. Either close only after the
+   peer has gone or the receive side has been drained to EOF, or keep the write-side shutdown and let the handle
+   close on the peer's own close. Checks: `netstat -s` RST counts across a run, and a keep-alive comparison that
+   separates our close from the client's shape.
+1. **A full ring must not terminate the service, and a refused submission must not park.** `Io.lean` throws on
+   the shim's overflow event; a thrown loop thread hangs every parked operation and then aborts the process
+   inside `Io.stop`. The submit path already refuses and returns 0, which is the right shape — the event path
+   should mirror it, failing the specific operation where it can be attributed, or the loop should drain until
+   empty before polling with the ring sized from measurement.
+1. **Count shim operations per request.** The cost is unlocalised: ~364 µs of user CPU per completed request on
+   the carrier, ~32 µs per shim operation on the loop thread, and no reading of how many operations a request
+   actually costs. Until that exists, every candidate below is a guess.
+1. **Then cheapen the hot loop**, in the order the count suggests: reuse or remove the per-iteration `Array` the
+   drain builds; make the parking table indexed rather than a list that is scanned per event; take the
+   `Std.Mutex` off the per-operation path.
+1. **Then consider the loop thread as carrier zero**, so a completion it produces can run where it was produced
+   instead of being handed to another thread. This collapses the handoff to zero in the single-carrier case the
+   scenarios measure and keeps `carrierThreads = 1` — it is what Node does, and what Tokio's reactor-as-worker
+   allows. It is structural, and it should follow 1–3 rather than lead them.
+
+Two measurements gate the interpretation of all of it. **Build `HEAD` in a scratch copy and measure the same
+client against it**: the recorded 2 864 / 5 096 / 3 722 req/s is from the run notes rather than this box state,
+and — more importantly — **`HEAD`'s error share at C=8 is unknown**. If it was also ~80%, then 5 096 was reached
+*with* the same wasted work and item 1 would not close the gap by itself; if it was far lower, item 1 likely
+accounts for most of it. And re-measure only after item 2, because a server that exits mid-run cannot report a
+steady-state cost.
 
 ### P1, P2 — Two cross-cutting performance items
 
