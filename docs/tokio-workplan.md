@@ -842,15 +842,32 @@ are favourable because a threading-instrument serialises the threads. Two change
    re-check must stay inside the lock the park is recorded under, or a push is lost; that is the hazard, not the
    yield. Criterion: switches per request from ~8 toward ~4, with throughput and p50 reported, and reverted if the
    instrument does not move or CPU per request rises without throughput following it.
-2. **Then completion-local delivery**: the loop thread as one of the executor's workers, so a completion runs where
+1. **Then completion-local delivery**: the loop thread as one of the executor's workers, so a completion runs where
    it was produced — no inject item (47% of all frees), no unpark, no pair of switches. The constraint is the park,
    not the routing (`Ctx.rebind` already reads a route at fire time): a worker parked inside `uv_run` is
    unavailable to its own queue, so the loop must never block while that worker has queued work — `uv_run(NOWAIT)`
    while the queue is non-empty, `UV_RUN_ONCE` only when there is nothing to run, the loop and the worker queue
    becoming one event loop. Target ~1 switch per request.
 
-The read deadline stays on the list for its instruction share but is demoted by this measurement: its timer fires
-twelve seconds after the request, off the critical path, so it adds work rather than switches.
+**The read deadline is back at the top of this list on switch evidence**, superseding the demotion the instruction
+accounting gave it one paragraph up. Per-thread attribution puts a near-idle thread at **2.02 switches per
+request** — 8 user ticks across a whole run, so it wakes and sleeps and does nothing else — and the deadline's
+fingerprints match that thread exactly: one `lean_uv_timer_mk`, two `Task.background` spawns and thirteen
+`CancellationToken.wait` transactions per request, plus a loser timer that stays registered for the whole
+`stallTimeout` and wakes to fire a read that already won.
+
+The change is **one function**: `Clock.live`'s `sleep`, currently `fun d => awaitAsync hooks (Std.Async.sleep d)`,
+which is where the timer, the promise and the task are created. The interface stays as it is — `now` and `sleep`,
+so no call site and no injected clock changes — and the live implementation becomes a registry of real instants:
+the runtime already carries a worked example in `HarnessClock`, which sorts its timers under a mutex and fires them
+on the shared route. **What does not exist yet is removal**: a read that wins must be able to withdraw its entry,
+and then only an entry that actually expires needs a wake, provided by one timer for the earliest entry or a
+bounded `uv_run` timeout rather than one timer per read. The two spawns per request go with it.
+
+The trap stands as written: the deadline keeps going through `Clock`, so nothing may arm a real timer where
+`withTimeout` is called, or SC20-O3's `at == stall` on the virtual clock breaks. Criterion: that thread's count
+from 2.02 toward ~0 and the process total from 7.98 toward ~6, with throughput and p50 beside them; revert and
+record it if the count does not move, as the park spin was.
 
 **Gate discipline for these.** Bound each scenario at 600 s and no less — SC18 legitimately needs ~124 s on this
 machine, and a tighter wrapper manufactures failures that look like regressions. Print the load average and count
