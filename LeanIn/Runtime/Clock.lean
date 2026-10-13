@@ -36,10 +36,83 @@ structure Clock where
   /-- A one-shot wait for `d` from now. -/
   sleep : Std.Time.Millisecond.Offset → Task.Async Unit
 
-/-- **The production clock**: the live reading and the libuv timer behind W1's seam. -/
-def Clock.live (hooks : Hooks) : Clock :=
+/-- **The live clock's registry**: pending fires, earliest first, under one mutex. It replaces one libuv timer per
+`sleep`, which cost a handle, a promise and a task per read and showed up, per thread, as a thread paying 2.02
+context switches per request while burning 8 user ticks in a whole run — pure orchestration, a quarter of the
+7.98 switches a request costs here. A `sleep` is now a list insertion and a fire is a list element; the *live*
+driver is one dedicated thread that sleeps to the earliest instant and fires what is due, exiting when nothing is
+pending so an idle service pays nothing. `Clock.live`'s `sleep` takes the same shape, so the interface and every
+call site are unchanged; the virtual clock is untouched, so SC20-O3's `at == stall` still holds. -/
+structure LiveClockState where
+  timers : List (Nat × Task.Cancel × IO Unit) := []
+deriving Inhabited
+
+/-- The live clock's registry and pump state. -/
+structure LiveClock where
+  state   : Std.Mutex LiveClockState
+  pumping : IO.Ref Bool
+deriving Nonempty
+
+/-- The live clock, created once at module init so `Clock.live` stays pure. -/
+initialize liveClock : LiveClock ← do
+  return { state := ← Std.Mutex.new {}, pumping := ← IO.mkRef false }
+
+/-- Note a callback due at `instant`, keeping the list sorted earliest-first. -/
+private def liveSchedule (instant : Nat) (c : Task.Cancel) (fire : IO Unit) : IO Unit :=
+  liveClock.state.atomically do
+    let s ← get
+    let rec ins : List (Nat × Task.Cancel × IO Unit) → List (Nat × Task.Cancel × IO Unit)
+      | []              => [(instant, c, fire)]
+      | (t, tc, f) :: rest =>
+          if instant < t then (instant, c, fire) :: (t, tc, f) :: rest else (t, tc, f) :: ins rest
+    set { s with timers := ins s.timers }
+
+/-- The pump: sleep to the earliest instant, fire everything due whose token is still unset, repeat. It exits
+when the registry is empty; the next registration restarts it. One thread for the whole service rather than one
+timer per wait. -/
+private partial def livePump : IO Unit := do
+  let next? ← liveClock.state.atomically do
+    let s ← get
+    match s.timers with
+    | []              => return none
+    | (t, _, _) :: _  => return some t
+  match next? with
+  | none   => liveClock.pumping.set false
+  | some t => do
+      let now ← IO.monoNanosNow
+      if now < t then IO.sleep (((t - now) / 1000000 + 1).toUInt32)
+      let now ← IO.monoNanosNow
+      let due ← liveClock.state.atomically do
+        let s ← get
+        let (d, rest) := s.timers.partition fun p => p.1 <= now
+        set { s with timers := rest }
+        return d
+      for (_, c, f) in due do
+        unless ← c.isSet do f
+      livePump
+
+/-- Start the pump thread if it is not running. -/
+private def liveKick : IO Unit := do
+  if !(← liveClock.pumping.get) then
+    liveClock.pumping.set true
+    let _ ← IO.asTask (prio := _root_.Task.Priority.dedicated) livePump
+    return ()
+
+/-- **The production clock**: the live reading and a registry of real instants. A `sleep` registers a fire and
+returns; the fire is inert if its token is set, which a winning read arranges by cancelling the loser. So a
+deadline that loses to a completing read never fires, and a service under a read deadline pays no per-read timer,
+task or thread wakeup. The interface and every call site are unchanged; the virtual clock is untouched, so
+SC20-O3's `at == stall` still holds. -/
+def Clock.live (_hooks : Hooks) : Clock :=
   { now   := IO.monoNanosNow
-  , sleep := fun d => awaitAsync hooks (Std.Async.sleep d) }
+  , sleep := fun d => ⟨fun k ctx => do
+      let fire : IO Unit := do
+        unless ← ctx.cancel.isSet do
+          ctx.resumeShared (Task.Item.ofDeferred ctx (k ()))
+      let now0 ← IO.monoNanosNow
+      liveSchedule (now0 + d.val.toNat * 1000000) ctx.cancel fire
+      liveKick
+      return ()⟩ }
 
 /-- The virtual clock's state: the current instant and its pending timers, sorted by instant and FIFO on
 ties. -/
