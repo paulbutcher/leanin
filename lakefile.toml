@@ -36,3 +36,8 @@ root = "BridgeControls"
 [[lean_exe]]
 name = "server"
 root = "Server"
+
+[[lean_exe]]
+name = "netspike"
+root = "NetSpike"
+moreLinkArgs = [".lake/build/netpoll.o"]
