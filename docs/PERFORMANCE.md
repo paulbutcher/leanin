@@ -717,6 +717,7 @@ loop thread does not yet double as a carrier.
   traffic and not a contended lock — a hypothesis those counters refuted rather than supported. The per-operation
   share is ~32 µs of user CPU on the loop thread and ~364 µs per completed request on the carrier, and what that
   364 µs is *made of* is not yet localised.
+
 - **`completed`/s under-credits the server, and the gap grows with connections.** The client's error share —
   each error a connection the server also accepted, read and closed — reads 61% at C=1 and **80% at C=8**. So at
   eight connections the server does roughly five connections' worth of work per request the client counts. In the
@@ -724,6 +725,26 @@ loop thread does not yet double as a carrier.
   runs, so not a clean pair). The calibration has since run: against the same client in keep-alive mode,
   `e2b2988`'s path shows **no** such inflation (0 errors at every level) and the path above still beats it at every
   level — so the multiplier was ours, and the close-path fix is what removed it.
+
+- **Where the CPU actually is, from a profile rather than from arithmetic.** `callgrind` over ~1 100 requests at
+  one connection (keep-alive, echo handler, `server static quiet`) records **300 M instructions, about 272 000 per
+  request**, and its self-cost table is a memory-management table: `lean_dec_ref_cold` 16.1%, `lean_mark_mt` (the
+  GC mark phase) 8.2%, `mi_free` 8.1%, `lean_alloc_small_object_core` 3.8%, `mi_theap_malloc_zero` 2.8%,
+  `lean_alloc_object` 1.6%, `lean_free_object` 1.2% — **allocation, refcounting and GC together above 42%** — with
+  closure application (`lean_apply_1/2/3/4`) about 12%, `Std.Mutex` and `pthread_mutex_lock`/`unlock` under 3%,
+  the H1 header scan (`Parsec.ByteArray.scanWhileUpTo`) 0.9%, and `c/netuv.c` absent from the top 22 entirely.
+
+  The inclusive view says where those objects come from: `Join.deliver` 46.9%, `Item.ofDeferred` 47.4%,
+  `Item.fire`/`fireAt` 54.7%, `Http.drive`'s loops ~35%, `EAsync.ofAsync` 28.8%. So roughly half the program is
+  the **completion-delivery path**, allocating closures, waiter records and items per completion and paying
+  refcount and GC on them — not the socket layer, not the locks, and not the HTTP machine.
+  `lean_copy_expand_array` at 2.1% is the per-iteration event array: real, small, and worth doing, but not the
+  story.
+
+  What this rules out is worth as much as what it names. The remaining cost is **not** in the shim, **not** lock
+  contention (which the context-switch counters had already refused), and **not** the per-read deadline's timer
+  arming. The lever is fewer and cheaper objects on the delivery path.
+
 - **The 41 ms floor was ours, and no scenario could see it.** Before the fix, stage timing put 4–5 µs in
   enqueue→apply and 42 244 µs in apply→completion; the shim asked for the read promptly and the completion
   arrived 41 ms later. `Conn.sendAll` was issuing one `uv_write` per buffer, so a response went out as two

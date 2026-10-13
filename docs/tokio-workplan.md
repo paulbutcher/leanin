@@ -828,6 +828,16 @@ and — more importantly — **`HEAD`'s error share at C=8 is unknown**. If it w
 accounts for most of it. And re-measure only after item 2, because a server that exits mid-run cannot report a
 steady-state cost.
 
+Its profile has since moved the target. `callgrind` over ~1 100 keep-alive requests puts **over 42% of self cost in
+allocation, reference counting and GC** (`lean_dec_ref_cold` 16.1%, `lean_mark_mt` 8.2%, `mi_free` 8.1%,
+`lean_alloc_small_object_core` 3.8%) and about half the program's inclusive cost in the **completion-delivery
+path** (`Join.deliver` 46.9%, `Item.ofDeferred` 47.4%, `Item.fire` 54.7%) — with the shim absent from the top 22,
+locks under 3% and the H1 parser under 1%. So the order below changes on the evidence: the operation count is not
+the target (keep-alive costs two operations per request, measured at 2.0), and neither is lock traffic nor the
+per-read deadline's timer arming. The target is the number of objects a completion allocates. Items 4 and 5
+remain the structural route to that — a completion that runs where it was produced allocates no inject item — but
+what guides them is the profile, not the operation counter.
+
 ### P1, P2 — Two cross-cutting performance items
 
 **P2 — the burst path (landed).** Enqueuing into a saturated ring costs **1533 ns** against **169 ns**
