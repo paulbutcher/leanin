@@ -113,6 +113,10 @@
               # headers (`dev`) and the shared object (`out`) reach the compiler and the linker.
               pkgs.libuv
               pkgs.libuv.dev
+              # The profiler, for the one question it answers: `callgrind` counts instructions, so it says where a
+              # request's CPU goes without the I/O waits a wall-clock run is dominated by. In the shell rather than
+              # fetched ad hoc, so a profile in `docs/PERFORMANCE.md` is reproducible as printed.
+              pkgs.valgrind
               # The I/O shim itself. It is here so the compiler and linker can find it by name (`-lnetuv`), with
               # no store path written into any build flag.
               netuvLib

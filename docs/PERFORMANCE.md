@@ -745,6 +745,11 @@ loop thread does not yet double as a carrier.
   contention (which the context-switch counters had already refused), and **not** the per-read deadline's timer
   arming. The lever is fewer and cheaper objects on the delivery path.
 
+  Reproduce it with the shell's own `valgrind`: start the server under
+  `nix develop -c valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out ./.lake/build/bin/server <port> static quiet`,
+  drive it with `load.mjs` in keep-alive at one connection for a few seconds (callgrind is 20–50× slower, so a
+  small load is the point), and read it with `nix develop -c callgrind_annotate --inclusive=yes /tmp/cg.out`.
+
 - **The 41 ms floor was ours, and no scenario could see it.** Before the fix, stage timing put 4–5 µs in
   enqueue→apply and 42 244 µs in apply→completion; the shim asked for the read promptly and the completion
   arrived 41 ms later. `Conn.sendAll` was issuing one `uv_write` per buffer, so a response went out as two
