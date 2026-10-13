@@ -659,24 +659,53 @@ changes is where a completion comes from: the shim's loop runs on a dedicated st
 the runtime's own `Join` cell through `Runtime.sharedPush`, so it no longer matters that the lease arrives
 through a promise.
 
-These rows are from a working tree in which the path is **not yet committed** — `HEAD` still holds the
-`Std.Async` path — and they are the reason it is not committed. Same client and mode as §2's baseline
-(`load.mjs`, connection-per-request, `close`), 5-second runs, `server static`.
+**Where it lands, connection-per-request, the same client and mode as §2's baseline** (`load.mjs`, `close`,
+5-second runs, `server static`):
 
-| connections | `Std.Async` path (`HEAD`) | libuv path | ours is |
-|---|---|---|---|
-| 1 | 2 864 req/s | 2 169–2 685 req/s | 🔴 parity to −24%; within §1's drift |
-| 8 | 5 096 | 692–729 | 🔴 ~7× slower |
-| 32 | 3 722 | 511–527 | 🔴 ~7× slower |
+| connections | `Std.Async` path | libuv path |
+|---|---|---|
+| 1 | 2 864 req/s | **4 024** (p50 112 µs) |
+| 8 | 5 096 | **7 585** |
+| 32 | 3 722 | **6 103** |
 
-**The C=8 and C=32 rows are withdrawn as throughput figures**, and the reason is the finding: the server *exits
-1* under load. `c/netuv.c` fills a 16 384-slot event ring, sets `g_ev_dropped`, and synthesises an overflow event,
-which `Io.lean` turns into `throw` — the loop thread dies, every parked operation hangs with it, `Io.stop`
-re-raises on shutdown, and the process ends inside its own exit path (which is why the message reached no log).
-A full ring is treated in that file as an impossible internal state; it is reachable from load. The sibling
-condition is worse if it is hit: a refused submission (`MAX_SUBMIT`, 8 192) returns 0, and a caller that parks
-anyway hangs a connection *silently*, with no error anywhere. Both are correctness items before they are
-performance items.
+The `Std.Async` column is from the run notes rather than re-measured on this machine, so the multipliers (1.40×,
+1.49×, 1.64×) are indicative. The error column is not: 61–80% before these fixes, **0** at every level after.
+
+**The four-way, keep-alive, echo handler, every server on this box inside one run** (`threeway.sh` in the run
+notes), with the load caveat stated below:
+
+| server | C=1 | C=8 | C=32 | CPU per request, C=1 |
+|---|---|---|---|---|
+| Node 22 | 31 833 | 70 175 | 73 396 | 24 µs |
+| leanin, `Io.lean` | **8 273** (p50 79 µs) | **10 259** | **6 712** | 118 µs |
+| leanin, `e2b2988` | 5 103 | 5 560 | 4 157 | 199 µs |
+| shipped `Std.Http.Server` | 666 | 1 548 | 1 382 | not read — the pid sampled was the wrapper |
+
+Against the path it replaces: 1.62× / 1.85× / 1.62×, on **1.7× less CPU per request** (118 against 199 µs).
+Against the shipped Lean server: 12.4× / 6.6× / 4.9×, where the path we replaced *lost* at C=32. Against Node it
+is 3.8× / 6.8× / 10.9× behind — and the gap that matters, CPU per request, has gone from ~120× (this document's
+earlier reading of 2 072–2 148 µs against 17 µs) to **~5×**. **The load average was 4.8–6.0 through that run and
+Node's own row sits below its recorded 41 195 / 95 800, so the absolute figures are depressed and the ratios are
+what to read; a settled re-run is owed for the record.**
+
+**The close path is where the resets were, and it was worth more than everything else here together.** The first
+version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
+data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
+dirty: reading stops at the header terminator, so the peer's FIN is never read and neither is a pipelined
+request. That made the client's error column a report of *our* resets rather than the client's own reconnect
+race, and each reset was a connection the server accepted, read and closed for nothing — which is why
+`completed`/s under-credited the server by roughly five-fold at C=8. `on_shutdown` no longer closes: a connection
+whose write side has gone is drained to the peer's end of stream first, and only then closed. Errors went to zero
+and C=1 close-mode went 1 160 → 4 024 req/s.
+
+**Still open on this path.** A full 16 384-slot event ring is treated in `c/netuv.c` as an impossible internal
+state, and `Io.lean` throws on it: the loop thread dies, every parked operation hangs with it, `Io.stop` re-raises
+during shutdown and the process ends inside its own exit path, with the message reaching no log. It is reachable
+from load. The sibling condition is worse if it is reached — a refused submission (`MAX_SUBMIT`, 8 192) returns 0,
+and a caller that parks anyway hangs a connection silently, with no error anywhere. Both are correctness items
+before they are performance items. And C=32's p50 (2.35 ms against C=1's 79 µs) says the per-operation cost is
+still the ceiling at concurrency: the number of shim operations a request costs has not been counted, and the
+loop thread does not yet double as a carrier.
 
 **What the instruments did establish, on a server that survived:**
 
@@ -692,8 +721,9 @@ performance items.
   each error a connection the server also accepted, read and closed — reads 61% at C=1 and **80% at C=8**. So at
   eight connections the server does roughly five connections' worth of work per request the client counts. In the
   one run where both instruments were read, the server served 6 633 while the client completed 5 295 (different
-  runs, so not a clean pair). Whether `HEAD`'s path shows the same share is unmeasured, and it is the calibration
-  that decides how much of the C=8 gap is a work multiplier rather than a per-operation cost.
+  runs, so not a clean pair). The calibration has since run: against the same client in keep-alive mode,
+  `e2b2988`'s path shows **no** such inflation (0 errors at every level) and the path above still beats it at every
+  level — so the multiplier was ours, and the close-path fix is what removed it.
 - **The 41 ms floor was ours, and no scenario could see it.** Before the fix, stage timing put 4–5 µs in
   enqueue→apply and 42 244 µs in apply→completion; the shim asked for the read promptly and the completion
   arrived 41 ms later. `Conn.sendAll` was issuing one `uv_write` per buffer, so a response went out as two
