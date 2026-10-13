@@ -336,8 +336,10 @@ instance : Monad Async where
 /-- Run an `IO` action as a step of a computation. This is the inside of `interface.md` §4's one bridge: a leaf
 operation — a timer, a socket, a stock `Task` — arrives as an action, and what keeps it non-blocking is that
 whoever completes it schedules the continuation instead of running it here. -/
+@[inline]
 def Async.ofIO (act : IO α) : Async α := ⟨fun k ctx => do k (← act) ctx⟩
 
+@[inline]
 instance : MonadLift IO Async where monadLift act := Async.ofIO act
 
 /-- **Read the ambient context.** A field read of the immutable `Ctx` the step was already given — no lock, no
@@ -418,6 +420,7 @@ parked. Delivering an item on the resolver's own queue makes the push owner-made
 
 Reading then registering is not a race: if the value arrives between the two, `onReady` runs the continuation
 immediately, which is the case it exists for. -/
+@[inline]
 def Async.await (t : Task α) : Async α := ⟨fun k ctx => do
   match ← t.cell.value? with
   | some v => k v ctx
