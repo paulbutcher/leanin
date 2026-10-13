@@ -745,6 +745,23 @@ loop thread does not yet double as a carrier.
   contention (which the context-switch counters had already refused), and **not** the per-read deadline's timer
   arming. The lever is fewer and cheaper objects on the delivery path.
 
+- **The gap at one connection is orchestration, not work.** `voluntary_ctxt_switches` summed over a server's
+  threads and divided by the client's completed requests — keep-alive, one connection, echo handler, `quiet` —
+  reads **7.98** for this path against **0.93** for Node, in the same shape: 4 895 against 18 843 req/s, p50 162
+  against 39 µs. At ~10–15 µs per handoff that is essentially the whole latency difference.
+
+  The decomposition is exact, from the gated operation counters: a keep-alive request costs two shim operations
+  (read and writev), and each costs four switches — the completion wake, the carrier's wake, the carrier's
+  submission while the loop is parked, and the loop's wake to apply it. The wake suppression committed in
+  `b1afd0b` applies only while the loop is *running*, which is not the case in that steady state, so it removes
+  less than it could; the figure above is *with* it, and would read higher without.
+
+  **This is the measurement that instruction counting cannot make, and the reason the two disagree.** `callgrind`
+  serialises the two threads, so the same path reads a *favourable* 277 943 instructions per request against
+  Node's ~378 000 while being four times slower in wall time — the counts are sound and the conclusion drawn from
+  them was wrong. The instrument to reuse is the switch count: a count, therefore load-invariant on a machine that
+  never idles, and the only one in this section that prices waiting rather than work.
+
   Reproduce it with the shell's own `valgrind`: start the server under
   `nix develop -c valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out ./.lake/build/bin/server <port> static quiet`,
   drive it with `load.mjs` in keep-alive at one connection for a few seconds (callgrind is 20–50× slower, so a

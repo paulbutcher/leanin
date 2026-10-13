@@ -828,6 +828,35 @@ and — more importantly — **`HEAD`'s error share at C=8 is unknown**. If it w
 accounts for most of it. And re-measure only after item 2, because a server that exits mid-run cannot report a
 steady-state cost.
 
+**Its measurement of record is now the cross-thread switch count, and it re-orders the list above.** Summed
+`voluntary_ctxt_switches` over a server's threads per completed request, keep-alive at one connection, reads
+**7.98** here against **0.93** for Node, with 4 895 against 18 843 req/s and p50 162 against 39 µs beside it — so
+the remaining gap is orchestration rather than work, and the instruction and cache figures that looked favourable
+are favourable because a threading-instrument serialises the threads. Two changes follow, and the first is small:
+
+1. **Spin before the carrier parks**, in `Executor.park`'s `e.inject.atomicallyOnce e.cv` wait. The switch to
+   remove is the carrier's park-and-wake: the committed wake suppression applies only while the loop is *running*,
+   and in the keep-alive steady state the loop is already parked when the carrier submits. A bounded spin — check
+   the worker's queue and the inject, then yield, repeat for a bounded interval — leaves the carrier running when
+   the loop delivers, so its next submission lands while the loop is awake and that half costs nothing. The
+   re-check must stay inside the lock the park is recorded under, or a push is lost; that is the hazard, not the
+   yield. Criterion: switches per request from ~8 toward ~4, with throughput and p50 reported, and reverted if the
+   instrument does not move or CPU per request rises without throughput following it.
+2. **Then completion-local delivery**: the loop thread as one of the executor's workers, so a completion runs where
+   it was produced — no inject item (47% of all frees), no unpark, no pair of switches. The constraint is the park,
+   not the routing (`Ctx.rebind` already reads a route at fire time): a worker parked inside `uv_run` is
+   unavailable to its own queue, so the loop must never block while that worker has queued work — `uv_run(NOWAIT)`
+   while the queue is non-empty, `UV_RUN_ONCE` only when there is nothing to run, the loop and the worker queue
+   becoming one event loop. Target ~1 switch per request.
+
+The read deadline stays on the list for its instruction share but is demoted by this measurement: its timer fires
+twelve seconds after the request, off the critical path, so it adds work rather than switches.
+
+**Gate discipline for these.** Bound each scenario at 600 s and no less — SC18 legitimately needs ~124 s on this
+machine, and a tighter wrapper manufactures failures that look like regressions. Print the load average and count
+stray `controls` children before and after: a killed scenario leaves its child running, and that is what loaded
+this box for an afternoon.
+
 Its profile has since moved the target. `callgrind` over ~1 100 keep-alive requests puts **over 42% of self cost in
 allocation, reference counting and GC** (`lean_dec_ref_cold` 16.1%, `lean_mark_mt` 8.2%, `mi_free` 8.1%,
 `lean_alloc_small_object_core` 3.8%) and about half the program's inclusive cost in the **completion-delivery
