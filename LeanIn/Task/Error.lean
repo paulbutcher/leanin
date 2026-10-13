@@ -29,7 +29,6 @@ def fail (e : ε) : EAsync ε α :=
   ⟨fun k ctx => k (.error e) ctx⟩
 
 /-- Sequencing short-circuits on `error`; nothing runs after a failure. -/
-@[inline]
 instance : Monad (EAsync ε) where
   pure v := ⟨fun k ctx => k (.ok v) ctx⟩
   bind a f := ⟨fun k ctx => a.step (fun r ctx' => match r with
@@ -37,7 +36,6 @@ instance : Monad (EAsync ε) where
     | .error e => k (.error e) ctx') ctx⟩
 
 /-- The channel itself: `throw` fails a computation, `tryCatch` handles one. -/
-@[inline]
 instance : MonadExcept ε (EAsync ε) where
   throw e := fail e
   tryCatch a h := ⟨fun k ctx => a.step (fun r ctx' => match r with
@@ -45,24 +43,20 @@ instance : MonadExcept ε (EAsync ε) where
     | .error e => (h e).step k ctx') ctx⟩
 
 /-- An `IO` action in this layer: its error is the failure. -/
-@[inline]
 instance : MonadLift IO (EAsync IO.Error) where
   monadLift act := ofAsync (Async.ofIO act)
 
 /-- A `BaseIO` action in this layer, which is what the runtime's primitives are — `IO.getTID` among them.
 Separate from the `IO` instance because instance search does not chain lifts. -/
-@[inline]
 instance : MonadLift BaseIO (EAsync IO.Error) where
   monadLift act := ofAsync (Async.ofIO (liftM act))
 
 /-- Awaiting a handle on a failing computation yields its `Except`, so the error travels with the value. -/
-@[inline]
 instance : MonadAwait (EAsync ε) where
   Handle := fun α => Task (Except ε α)
   await h := Async.await h
 
 /-- Starting a computation cannot itself fail, so the handle arrives as `ok`. -/
-@[inline]
 instance : MonadAsync (EAsync ε) where
   spawn a := ⟨fun k ctx => (Async.spawn a).step (fun h ctx' => k (.ok h) ctx') ctx⟩
 
