@@ -119,6 +119,14 @@ static uint64_t (*g_ev)[3] = NULL;
 static size_t g_ev_cap = 0;
 static int g_ev_n = 0;
 static int g_ev_dropped = 0;
+
+/* Set while the loop thread is inside a *non-blocking* iteration. A submission made by a carrier while this is set
+   need not wake the loop: another iteration follows immediately in the same call, and it re-applies the queue
+   after that one, so the submission is found without a wake. The *parking* poll leaves the flag clear on purpose
+   -- a submission that arrives while the loop is parked there is exactly the one `uv_async_send` exists for, and
+   the queue is only re-checked after the poll returns, which is what needed the wake. `uv_async_send` is
+   level-triggered, so a wake raised in the window between an iteration and the poll is serviced, not lost. */
+static int g_loop_running = 0;
 static submit_t g_sub[MAX_SUBMIT];
 static int g_sub_head = 0, g_sub_n = 0;
 static uv_mutex_t g_sub_lock;
@@ -321,7 +329,7 @@ static int push_submit(int kind, uint32_t conn, char *p, size_t n, size_t want) 
   g_sub[g_sub_n].n = n; g_sub[g_sub_n].want = want;
   g_sub[g_sub_n].buf = NULL; g_sub_n++;
   uv_mutex_unlock(&g_sub_lock);
-  if (!g_stopping && g_async_up) uv_async_send(&g_async);
+  if (!g_stopping && g_async_up && !g_loop_running) uv_async_send(&g_async);
   return 1;
 }
 
@@ -468,6 +476,20 @@ LEAN_EXPORT lean_object *np_uv_run_once(void) {
     if (active == 0) destroy_loop();
     return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
   }
+  /* Non-blocking iterations while submissions are queued: a submission landing during one is found by the next
+     `apply_submits` in this same call, which is what makes skipping its wake safe. The blocking poll below runs
+     with the flag clear, because a submission arriving while the loop is parked there must wake it. */
+  for (;;) {
+    int queued;
+    uv_mutex_lock(&g_sub_lock);
+    queued = g_sub_head < g_sub_n;
+    uv_mutex_unlock(&g_sub_lock);
+    if (!queued) break;
+    g_loop_running = 1;
+    uv_run(g_loop, UV_RUN_NOWAIT);
+    g_loop_running = 0;
+    apply_submits();
+  }
   int active = uv_run(g_loop, UV_RUN_ONCE);
   return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
 }
@@ -538,7 +560,7 @@ LEAN_EXPORT lean_object *np_uv_writev(uint32_t idx, lean_object *chunks) {
   g_sub[g_sub_n].p = NULL; g_sub[g_sub_n].buf = p; g_sub[g_sub_n].n = total;
   g_sub[g_sub_n].want = 0; g_sub_n++;
   uv_mutex_unlock(&g_sub_lock);
-  if (!g_stopping && g_async_up) uv_async_send(&g_async);
+  if (!g_stopping && g_async_up && !g_loop_running) uv_async_send(&g_async);
   return lean_io_result_mk_ok(lean_box_uint32(1));
 }
 
