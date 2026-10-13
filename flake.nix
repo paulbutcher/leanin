@@ -85,6 +85,11 @@
               pkgs.git
               pkgs.coreutils
               pkgs.zstd
+              # The event loop for the I/O path: `libuv` is the portable one (epoll on Linux, kqueue on the BSDs
+              # and macOS, IOCP on Windows), which a raw `epoll` shim is not. Both outputs are listed so the
+              # headers (`dev`) and the shared object (`out`) reach the compiler and the linker.
+              pkgs.libuv
+              pkgs.libuv.dev
               config.treefmt.build.wrapper
             ];
 
