@@ -59,7 +59,9 @@
 #include <uv.h>
 #include <netinet/in.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 #define MAX_CONN 4096
@@ -121,6 +123,42 @@ static submit_t g_sub[MAX_SUBMIT];
 static int g_sub_head = 0, g_sub_n = 0;
 static uv_mutex_t g_sub_lock;
 static int g_mutex_up = 0;
+/* Per-kind operation counters, and the loop's own progress. Held unconditionally -- an increment is three
+   instructions -- and reported from the loop thread every few seconds as `npuv ops` when NPUV_OPS is set, so a
+   measurement does not need a graceful exit to read them. Off by default, and the environment is consulted once. */
+#define CNT_ACCEPT 0
+#define CNT_READ 1
+#define CNT_WRITE 2
+#define CNT_WRITEV 3
+#define CNT_SHUTDOWN 4
+#define CNT_CLOSE 5
+#define CNT_EVENTS 6
+#define CNT_ITER 7
+static uint64_t g_cnt[8];
+static uint64_t g_last_report_ms = 0;
+/* The report is off unless NPUV_OPS is set, and the environment is read once, at the first iteration. */
+static int g_ops_report = -1;
+
+static uint64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static void report_counts(void) {
+  if (g_ops_report < 0) g_ops_report = getenv("NPUV_OPS") != NULL ? 1 : 0;
+  if (!g_ops_report) return;
+  uint64_t now = now_ms();
+  if (g_last_report_ms == 0) { g_last_report_ms = now; return; }
+  if (now - g_last_report_ms < 2000) return;
+  g_last_report_ms = now;
+  dprintf(2, "npuv ops accept=%llu read=%llu write=%llu writev=%llu shutdown=%llu close=%llu events=%llu iters=%llu\n",
+          (unsigned long long)g_cnt[CNT_ACCEPT], (unsigned long long)g_cnt[CNT_READ],
+          (unsigned long long)g_cnt[CNT_WRITE], (unsigned long long)g_cnt[CNT_WRITEV],
+          (unsigned long long)g_cnt[CNT_SHUTDOWN], (unsigned long long)g_cnt[CNT_CLOSE],
+          (unsigned long long)g_cnt[CNT_EVENTS], (unsigned long long)g_cnt[CNT_ITER]);
+}
+
 static int g_stopping = 0;
 static int g_listening = 0;
 static int g_async_up = 0;
@@ -218,6 +256,7 @@ static void on_conn(uv_stream_t *server, int status) {
      `accept` returns, and the shim has no listener handle of its own to set it on. A response written as more
      than one segment otherwise waits on the peer's delayed ACK, which is tens of milliseconds on loopback. */
   uv_tcp_nodelay(&c->handle, 1);
+  g_cnt[CNT_ACCEPT]++;
   push_ev(EV_ACCEPT, (uint64_t)c->idx, 0);
 }
 
@@ -292,6 +331,7 @@ static void apply_submit(submit_t *s) {
   int dead = !c->used || uv_is_closing((uv_handle_t *)&c->handle);
   switch (s->kind) {
     case SUB_READ:
+      g_cnt[CNT_READ]++;
       if (dead) { push_ev(EV_READ, s->conn, (uint64_t)(int64_t)UV_ECANCELED); break; }
       c->want = s->want ? s->want : READ_CHUNK;
       if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) != 0) {
@@ -300,6 +340,7 @@ static void apply_submit(submit_t *s) {
       }
       break;
     case SUB_WRITEV: {
+      g_cnt[CNT_WRITEV]++;
       /* one write for several buffers: copied into one block here, so the peer reads one segment rather than one
          per buffer. Two segments would be two writes back to back, which is exactly what Nagle holds back. */
       if (s->buf == NULL || s->n == 0) { free(s->buf); push_ev(EV_WRITE, s->conn, 0); break; }
@@ -315,6 +356,7 @@ static void apply_submit(submit_t *s) {
       break;
     }
     case SUB_WRITE: {
+      g_cnt[CNT_WRITE]++;
       if (s->n == 0) { free(s->p); push_ev(EV_WRITE, s->conn, 0); break; }   /* nothing to write is written */
       if (dead) { free(s->p); push_ev(EV_WRITE, s->conn, (uint64_t)(int64_t)UV_ECANCELED); break; }
       write_req_t *w = malloc(sizeof(write_req_t));
@@ -328,6 +370,7 @@ static void apply_submit(submit_t *s) {
       break;
     }
     case SUB_SHUTDOWN: {
+      g_cnt[CNT_SHUTDOWN]++;
       if (dead) { push_ev(EV_SHUTDOWN, s->conn, (uint64_t)(int64_t)UV_ECANCELED); break; }
       c->shutting = 1;
       shutdown_req_t *sh = malloc(sizeof(shutdown_req_t));
@@ -340,6 +383,7 @@ static void apply_submit(submit_t *s) {
       break;
     }
     case SUB_CLOSE:
+      g_cnt[CNT_CLOSE]++;
       /* A connection whose write side has already been shut down is drained before it is closed, so the peer
          reads a clean end of stream; one that never got that far is closed here and now. */
       if (c->used && !uv_is_closing((uv_handle_t *)&c->handle)) {
@@ -410,6 +454,8 @@ LEAN_EXPORT lean_object *np_uv_start(uint32_t port) {
 
 LEAN_EXPORT lean_object *np_uv_run_once(void) {
   if (g_loop == NULL) return lean_io_result_mk_ok(lean_box_uint32(0));
+  g_cnt[CNT_ITER]++;
+  report_counts();
   apply_submits();
   if (g_stopping) {
     /* The stopped loop is closed and drained here, never by the thread that asked for the stop: the close
@@ -434,6 +480,7 @@ LEAN_EXPORT lean_object *np_uv_events(void) {
     arr = lean_array_push(arr, lean_box_uint64(g_ev[i][1]));
     arr = lean_array_push(arr, lean_box_uint64(g_ev[i][2]));
   }
+  g_cnt[CNT_EVENTS] += (uint64_t)g_ev_n;
   g_ev_n = 0;
   return lean_io_result_mk_ok(arr);
 }

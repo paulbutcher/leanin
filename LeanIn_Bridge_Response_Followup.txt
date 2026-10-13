@@ -1,0 +1,140 @@
+LeanIn bridge response followup
+===============================
+
+Assessment
+----------
+The exact notification-membership change addresses the previous defect. The renamed lock_wait_unlock_postcondition also accurately describes the present theorem. Deferring whole-program execution semantics is a reasonable milestone decision if the current claims remain limited to conditional primitive contracts.
+
+The following answers the response's requests for pushback on representation and frame conditions. It is based on the supplied World.lean, Bridge.lean, and revision response. The files were read but not compiled. The proof sketch below should be checked in the project's pinned Lean toolchain.
+
+1. Representation dependence is an immediate repair
+---------------------------------------------------
+The issue is stronger than permitting two independent objects to alias under a representation. Runs does not mention Rep, while the operation axioms quantify over every Rep. Therefore the same Runs witness can be instantiated with arbitrarily different maps without changing its worlds.
+
+For any model lock index l, choose:
+
+  r.lockOf := fun _ => l
+  r.condOf := fun _ => 0
+
+Then IsLock r m l holds by definition. Consequently, the current lock_spec entails:
+
+  Runs t (Std.BaseMutex.lock m) w () w'
+    -> forall l, (w'.locks l).owner = some t
+
+A Lean proof sketch using the current declarations is:
+
+  theorem lock_claim_for_every_index
+      {m : Std.BaseMutex} {w w' : World} {t : Tid}
+      (h : Runs t (Std.BaseMutex.lock m) w () w') :
+      forall l : LockId, (w'.locks l).owner = some t := by
+    intro l
+    let r : Rep := { lockOf := fun _ => l, condOf := fun _ => 0 }
+    have hL : IsLock r m l := rfl
+    exact (lock_spec hL h).1
+
+There is no two-object premise here, so guarding distinct_mutexes_are_distinct_locks with NonAliasing cannot prevent the derivation. It says that acquiring one mutex sets every abstract lock's owner to its caller.
+
+The same construction with constant condOf maps makes notifyAll_spec entail that every abstract condvar has an empty waiter list after one broadcast. For each chosen c, every remaining member must have been a previous member, while every previous member is excluded; hence no member can remain.
+
+This does not establish an unconditional logical contradiction. An empty Runs interpretation satisfies the contracts. It establishes a fidelity defect: the intended nonvacuous runtime interpretation cannot preserve independently tracked objects.
+
+Required repair:
+
+  opaque Runs (r : Rep) ...
+
+Move Rep before this declaration and pass the same r consistently through the primitive axioms and derived theorems. An execution interpreted under one representation must not be reused unchanged under another representation.
+
+Additionally, scope contracts to admissible representations, or use a bridge context that fixes the representation and its validity obligations. These are separate concerns:
+  representation dependence prevents changing maps while keeping one Runs witness;
+  representation validity prevents invalid mappings within one execution interpretation.
+
+Full lifetime and allocator modelling can remain future work. Representation dependence cannot: it is a small interface correction, not a requirement to complete the whole refinement programme.
+
+Regression checks:
+  retain the old signature in a control module and prove lock_claim_for_every_index;
+  after changing Runs, verify that a hypothesis Runs r ... cannot be passed to a
+  contract instantiated with a different constant representation;
+  provide an interpreted example with one tracked lock changing while another
+  tracked lock remains unchanged;
+  make admissibility or local representation premises explicit in that example.
+
+Do not introduce a desired-runtime theorem as an axiom merely to defeat the control.
+
+2. Notification release and execution progress are distinct
+-----------------------------------------------------------
+The response describes requiring notification to release an eligible waiter as a fairness assumption. That conflates unblocking with eventual scheduling or successful mutex reacquisition.
+
+The C++ draft specifies that notify_one unblocks one thread if threads are blocked waiting on that condvar; notify_all unblocks all blocked threads. It does not follow that those threads promptly execute, successfully acquire the mutex, or return from wait.
+
+Source: C++ draft, thread.condition.condvar, notify_one and notify_all effects:
+https://eel.is/c++draft/thread.condition.condvar
+
+Allowing notifyOne to leave an eligible waiter set unchanged is a legitimate weaker abstraction. For safety analysis it can conservatively admit extra behaviours. Describe that as deliberately forgetting the native selection guarantee, rather than as a guarantee excluded by lack of fairness.
+
+The response's assertion that neither notification contract promises release is also inconsistent with notifyAll_spec. Its two membership clauses force the post-list to be empty. If membership denotes condvar-blocked threads, that already requires removal of every enrolled waiter.
+
+Required documentation correction:
+  notifyOne currently permits zero-or-one removals, even for nonempty waiters;
+  notifyAll requires all enrolled waiters removed;
+  neither contract promises eventual execution, successful reacquisition, or return.
+
+If the bridge is intended to reflect the native event more exactly, strengthen notifyOne so it selects an enrolled waiter whenever the eligible set is nonempty. Keep progress assumptions separate.
+
+3. Isolated-effect frame conditions can be added now
+---------------------------------------------------
+Yes: the narrower frame-condition proposal is separable from the full concrete abstraction relation.
+
+For the isolated acquisition effect on l:
+  ownership at l becomes some t;
+  every other tracked lock is unchanged;
+  every tracked condvar is unchanged;
+  model clock and lastSample are unchanged.
+
+For unlock on l, use the corresponding frame with ownership at l becoming none. For notifications on c, preserve all tracked locks, other condvars, and clock state while specifying the selected condvar's exact change. A failed tryLock can preserve the whole tracked world for its isolated effect.
+
+These abstract frames constrain what the primitive claims to do. They do not require a complete concrete heap relation first. Untracked runtime bookkeeping can remain outside World.
+
+Do not attach these no-interference frames to a whole wait interval. Other actors can modify locks, condvars, clock samples, or model time during a wait. In particular, requiring SameClock across an actual wait interval would exclude interleaved tick/read events if those are included in the history.
+
+Use a distinct isolated-effect relation, or make the operation-dependent interval convention explicit and defer wait's frame to path semantics. A documentation statement that wait is a composition is not yet evidence that its Runs witness contains that path.
+
+Acceptance checks:
+  one isolated mutex effect cannot alter an unrelated tracked condvar;
+  one notification effect cannot alter another tracked lock;
+  a whole wait history still admits other actors' steps between its stages.
+
+4. The native actor issue is resolved, but actor state is still coarse
+--------------------------------------------------------------------
+World.lean explicitly defines Tid as a native thread identity, including carrier and external waker. That addresses the identity concern; no renaming is necessary merely for terminology.
+
+However, .lock l t checks only that l is free. After .wait c l t, the same parked actor can immediately perform .lock l t before any notify or spurious event. The no-duplicate waiter condition prevents double enrolment on the same condvar, but does not prevent a parked actor from acting, holding a lock, or enrolling on a different condvar.
+
+This can be an intentional overapproximation of primitive ownership effects, with actual actor behaviour enforced later by execution histories. If so, state that scope explicitly. The comment that a thread is either parked or running is not an invariant enforced by the current transition relation.
+
+For the later layer, track actor execution state or constrain admissible histories so a suspended carrier does not perform another action before release. Keep reacquisition by other carriers legal. Do not confuse an existence proof of a permitted wait cycle with proof that a particular runtime call follows it.
+
+5. What can remain in the next milestone
+---------------------------------------
+The following can remain deferred under accurately limited claims:
+  complete BaseIO pure/bind execution semantics;
+  concrete allocation-lifetime and address-reuse correspondence;
+  wait episode histories and release/reacquisition linkage;
+  finite-prefix native execution refinement;
+  scheduler-specific memory visibility and invariant transport;
+  fairness and real-time responsiveness.
+
+Before continuing that programme, repair representation dependence, constrain isolated effects, and clarify notification release semantics. Those changes improve the current bridge rather than replace its milestone with a finished runtime verification system.
+
+Suggested next revision
+-----------------------
+1. Parameterize Runs by Rep or a fixed validated bridge context.
+2. Add admissibility premises appropriate to the currently tracked objects.
+3. Add frame conditions to isolated primitive effects.
+4. Correct notification-strength documentation and decide whether notifyOne should reflect native selection exactly.
+5. Preserve the waiter-replacement controls and add the constant-map control.
+6. Document the model's actor-state overapproximation.
+7. Audit derived bridge theorems and their explicit hypotheses, not only #print axioms.
+
+Current claim to use
+--------------------
+The model's stated invariants are machine-checked. Primitive runtime contracts are assumed, and selected endpoint consequences are derived from those contracts. A whole-program connection to actual execution remains future work. Representation and interference restrictions are part of the stated contract, not implicit consequences of a small axiom count.

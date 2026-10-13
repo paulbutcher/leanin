@@ -1,0 +1,165 @@
+LeanIn runtime bridge axioms implementation handoff
+=================================================
+
+Objective
+---------
+Replace Bridge.lean's endpoint-only assumptions with an explicit execution contract: every supported runtime primitive contributes a permitted sequence of abstract events, and whole-program execution preserves the correspondence. Prove scheduler properties over those events. Treat native implementation adequacy as a named assumption until runtime semantics and refinement proofs replace it.
+
+This proposal is based on the pasted Bridge.lean. World.lean and the scheduler implementation were not available for inspection. All Lean-like signatures below are interface sketches, not compiling replacements. Adapt them after inspecting those files. Do not claim runtime verification merely because these assumptions can be stated.
+
+Scope decisions
+---------------
+1. V1 has one scheduler carrier, but explicitly inventory other native threads that can invoke wake, shutdown, or notification. A single carrier does not necessarily mean a single native actor.
+2. Separate CarrierId (native thread) from TaskId (green task). Std.BaseMutex ownership and Std.Condvar.wait concern the carrier. Two green tasks running on the same carrier do not become different native mutex owners. If existing Tid denotes a green task, introduce CarrierId rather than reusing it.
+3. The model covers synchronization, task transitions, selected shared state, and clock samples. Unmodelled runtime fields may change freely only if those changes do not invalidate the representation relation.
+4. State guarantees for defined executions: live objects, valid mutex ownership, valid condvar/mutex association, and all relevant lifetime and data-race obligations. Do not assign arbitrary specifications to undefined behaviour.
+5. No fairness, termination of blocking operations, finite wakeup delay, or scheduling-time guarantee is included in the base bridge.
+
+Architecture
+------------
+Use three layers:
+
+Runtime layer: concrete operation invocations, returns, pending calls, native actor identities, object identities, and interleaved execution histories.
+Abstract layer: World transitions and event traces; finite prefixes suffice for safety, including prefixes ending inside a blocked call.
+Representation layer: Rep maps a runtime snapshot to the corresponding abstract state and runtime object identities to stable abstract lock/condvar identities.
+
+Introduce a stable per-object map rather than independent world-indexed IsLock claims. Record object kind, allocation identity, liveness, and lifetime. Reused addresses must have distinct allocation identities. Prove or assume creation establishes the mapping and permitted operations preserve it. Never permit one live runtime mutex to represent two independent model locks.
+
+Core declarations, schematically:
+
+  RuntimePrefix : execution history including pending invocations
+  Realizes : RuntimePrefix -> Prop
+  Rep : RuntimeSnapshot -> World -> Prop
+  AbstractStep : World -> Event -> World -> Prop
+  AbstractPath : World -> List Event -> World -> Prop
+
+Define AbstractPath using AbstractStep; do not axiomatize reflexivity, concatenation, or induction. Define Runs from a realized history segment with matched invocation/return and its represented endpoint states where possible. A returning-call relation is not enough to describe pending waits.
+
+BaseIO's execution meaning is supplied by the runtime interpretation; this does not require clients to write their scheduler in a deeply embedded language. A shallow semantic interface still needs a specified runtime history and a correspondence to the actual BaseIO operations. An opaque predicate alone is not that correspondence.
+
+Suggested assumption inventory
+------------------------------
+The following are assumption families, not a target axiom count. Split them into separately auditable declarations. Each declaration must identify source version, supported operation, preconditions, abstract effect, and whether it depends on the compiler or native runtime. A small number of axioms is not evidence of a small TCB.
+
+B0 Runtime interpretation and composition
+
+Choose a runtime interpreter for the supported BaseIO fragment. If it is opaque, assume correspondence with actual executions explicitly. Supply pure and bind laws:
+
+  pure returns its value with no operation-owned model event.
+  A terminating bind execution decomposes into an execution of its first action
+  and an execution of the continuation using that action's actual result.
+  Conversely, compatible executions compose under the same runtime/environment
+  schedule and matching intermediate runtime state.
+
+Do not compose arbitrary endpoint witnesses from unrelated executions. Environment events may occur before or after return; they are attributed to the environment rather than to pure. Use a history interpretation to settle this convention.
+
+Runtime interpretation must cover every executed effect: refs, mutexes, condvars, clock, foreign functions, exceptions where relevant, and task steps. Pure compiled calculations rely on compiler/runtime correctness. Additional shared references need explicit read/write semantics and synchronization; the mutex contracts alone do not specify their contents.
+
+B1 Initial representation and object construction
+
+Under an explicit initialization contract, each actual completed creation of a mutex establishes a fresh live abstract mutex initially unowned; creation of a condvar establishes a fresh condvar with no wait episodes. Initialize tracked refs and clock state as specified.
+
+Establish an initial Rep witness for the supported program configuration, and preserve object correspondence until legal destruction. Destruction requires no outstanding use or prohibited wait. Scope initial-world claims to objects being tracked: do not require unrelated external locks to be free.
+
+Avoid a forall-op-exists-return axiom: lock and wait may never return. Nonvacuity comes from linking the interpretation to actual runtime prefixes and initialization, not from asserting termination.
+
+B2 Mutex operation adequacy
+
+Represent successful acquisition by an Acquire(carrier, lock) event whose precondition is that the lock is unowned. The event gives it to that carrier and preserves unrelated abstract fields. The operation can remain pending until acquisition; a returned lock call has exactly the required successful acquisition in its history. Require nonrecursive use and live, valid objects.
+
+tryLock true contributes an acquisition event under the same ownership rule. tryLock false contributes a failure observation and no ownership modification by that operation. Allow failure even when the lock is unowned. Do not infer another owner solely from failure. Exclude self-acquisition according to the supported native primitive's preconditions.
+
+unlock requires that its actor owns the lock at the release event, then clears ownership. A later carrier may acquire before the call interval ends, so do not claim the final global world is necessarily unowned.
+
+Mutual exclusion follows from the abstract transition rules and validity preservation; do not separately assume the scheduler's mutual-exclusion theorem.
+
+If scheduler correctness uses protected data visibility, include the mutex synchronization/happens-before contract. Ownership fields alone do not establish memory visibility for concrete shared data.
+
+B3 Condition-variable wait protocol adequacy
+
+Give every wait invocation a fresh WaitEpisodeId. Track episodes rather than only carrier IDs: the same carrier can return and wait again while another operation is still in progress.
+
+A well-formed wait performs, in order:
+  (a) an atomic ReleaseAndEnrol episode event, while its carrier owns the mutex;
+  (b) a ReleaseWaiter event, caused by notification or an allowed spurious wake;
+  (c) an Acquire event by that same carrier for that same mutex;
+  (d) return, with that episode finished.
+
+Atomic release-and-enrol prevents a notify from falling between unlock and enrol. Specify compatibility with notification ordering. A released waiter is waiting to reacquire, not already executing with the mutex held.
+
+The acquisition in (c) must be linked to the episode, not merely some acquisition by some actor along a path. Ordinary acquisitions by other actors can occur between these events.
+
+Runtime prefixes may stop before any stage completes. Permit repeated spurious releases and impose no eventual return. Prove the caller's postcondition at return from the episode protocol and an actor well-formedness condition excluding an intervening unlock by that actor. Other actors cannot legally unlock its mutex.
+
+Record native preconditions, including the mutex held by the caller and the same-mutex requirement for concurrent waiters where applicable. Preserve object liveness throughout the call.
+
+B4 Notification adequacy
+
+Represent notifyOne by one abstract event selecting zero or one currently eligible wait episode, removing it from the condvar-blocked collection and making it eligible for reacquisition. An empty collection leaves no saved notification credit. There is no bounded latency or fairness promise.
+
+The event itself preserves all other wait episodes and adds none. Separately occurring spurious releases and new enrolments are separate history events. This is why a whole-call before/after cardinality comparison is insufficient.
+
+Represent notifyAll by one event selecting all wait episodes currently eligible on that condvar, moving each to reacquisition eligibility. It does not release episodes that begin later. It cannot by itself establish that every released carrier eventually runs.
+
+Specify the condvar-specific order connecting release-and-enrol, notifications, and resumption. Notification is not a substitute for the mutex or atomic synchronization of the shared predicate being checked.
+
+If waiter lists remain in World, prove NoDup and exact membership updates. Prefer a finite set of episode IDs. For an isolated notifyOne event, use removal of an optional selected episode; for notifyAll use emptying the eligible episode set. Do not impose those effects on an interval that contains environment events.
+
+B5 Clock sampling adequacy
+
+Separate the last observed clock sample from physical elapsed time. A ReadClock(n) event returns the native sample and records it as the last sample; ordered nonoverlapping reads in the same clock domain have nondecreasing values. Equal readings are allowed. Handle wraparound or exclude it for the stated execution horizon.
+
+Do not infer monotonicity from n >= w.clock combined with w'.clock = w.clock. Either update lastSample to n or directly relate successive ordered reads.
+
+For budget logic, prove the arithmetic against observed samples first. Claims about real nanoseconds additionally need explicit units, resolution, drift/error bounds, and clock-domain assumptions. Claims about response deadlines additionally need bounds on time between checks and progress of execution. These are optional timing assumptions, outside the safety bridge.
+
+B6 Runtime prefix correspondence
+
+For every actual defined runtime prefix beginning in Rep, produce a matching abstract path and final Rep. Match primitive events using B2-B5; map harmless untracked effects to stuttering. Include environment steps with their actors. Include invocation/return evidence and intermediate wait stages, not just endpoints.
+
+Prefer proving this by induction from a runtime transition semantics and primitive adequacy. If that semantics is unavailable, introduce it as an explicit native execution adequacy assumption. Do not hide a whole scheduler correctness claim inside it.
+
+An infinite execution requires compatible prefix witnesses, or a separate infinite-trace construction; unrelated existential paths for each length need not combine. Finite-prefix correspondence is sufficient for invariant safety claims. Liveness requires more.
+
+Scheduler obligations that must remain theorems
+----------------------------------------------
+1. AbstractStep preserves World validity and each scheduler invariant.
+2. Model paths compose and transport invariants.
+3. Actual initialization meets the bridge initialization preconditions.
+4. Each scheduler call meets the native primitive's preconditions.
+5. Shared scheduler data accesses are synchronized according to the chosen runtime model.
+6. The wait loop releases/enrols atomically, links reacquisition to the same episode, and rechecks its predicate after waking.
+7. Task state, notifications, and queue transfers preserve the scheduler's own ownership and wakeup invariants.
+8. Wake and shutdown refinements use notify semantics; notifyAll alone proves neither completion nor termination of shutdown.
+9. A concrete runtime-prefix theorem transfers the model invariant through Rep.
+
+Keep green-task scheduling proofs separate from native mutex ownership. The bridge does not prove the scheduler's algorithm merely by validating the synchronization primitives.
+
+Audit and implementation plan
+-----------------------------
+1. Inspect World.lean, scheduler call sites, and all executed BaseIO/IO effects. Produce an actor/object/effect inventory before adding axioms.
+2. Introduce CarrierId and WaitEpisodeId as needed. Define finite event histories, well-formed actor behaviour, and AbstractPath.
+3. Define representation maps and construction/lifetime rules. Replace unstable per-world IsLock predicates or prove their stability from Rep.
+4. Replace endpoint assumptions with event contracts and the wait protocol. Derive convenient endpoint lemmas only under explicit interference conditions.
+5. Implement pure/bind semantics for the supported interface, plus refs/shared data. Prove generic semantic laws when they follow from definitions; axiomatize only native correspondence that remains unproved.
+6. Prove runtime-facing scheduler safety conditionally on named bridge assumptions. Inspect #print axioms on that theorem as well as model-only lemmas.
+7. Add countermodels: equal-length waiter replacement; failed tryLock with intervening ownership change; notified episode followed by a fresh wait; another actor reacquiring during wait; decreasing clock reads; empty Runs interpretation; duplicate runtime-object mapping.
+8. Add trace tests against native execution. They can falsify bridge contracts but cannot prove adequacy. Pin the Lean/compiler/native runtime revisions and platform configuration used in the audit.
+
+No fairness should appear implicitly in any helper axiom. No final theorem may use sorry or new undeclared assumptions. Standard logical axioms should be distinguished from project-specific runtime assumptions; model proofs need not literally report an empty axiom list if they legitimately use standard Lean foundations.
+
+Deliverables
+------------
+Execution.lean: defined histories, pending calls, and composition interface.
+Representation.lean: stable object mapping, liveness, and initial correspondence.
+Bridge.lean: named native adequacy assumptions with versioned source references.
+BridgeLemmas.lean: derived endpoint and transport lemmas.
+SchedulerRefinement.lean: scheduler-specific finite-prefix correspondence and safety theorem.
+BridgeControls.lean: countermodel tests and regressions for each weakened contract.
+docs/runtime-assumptions.md: logical dependencies, compiler/runtime TCB, platform scope, and excluded timing/progress claims.
+
+Acceptance criterion
+--------------------
+The final theorem states: for every supported defined actual runtime prefix, from a represented valid initial configuration, the represented scheduler state satisfies the stated invariant. Its dependency report names the native bridge assumptions. Matching abstract events and intermediate wait episodes are evidence for the connection; endpoint agreement alone is not.
+
+Do not describe an axiomatized correspondence as a proved native implementation refinement. Describe it as a machine-checked scheduler proof conditional on explicit runtime contracts, until those contracts are discharged against a concrete runtime semantics.

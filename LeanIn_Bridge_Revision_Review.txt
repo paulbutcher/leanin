@@ -1,0 +1,140 @@
+LeanIn bridge revision review and implementation handoff
+=======================================================
+
+Scope
+-----
+Review of the revised Bridge.lean pasted on 8 October 2026. The revision adds creation contracts, a world-independent Rep, local non-aliasing hypotheses, lastSample tracking, and three demonstration theorems. World.lean and the scheduler were not inspected, and the pasted file was not compiled. Suggested signatures are schematic.
+
+Assessment
+----------
+The revision improves representation stability and enables a conditional monotonicity theorem for clock samples. Its chaining theorem demonstrates that primitive postconditions can be used together when matching intermediate worlds are supplied.
+
+It does not yet establish correspondence between actual scheduler executions and valid model paths. The remaining work is execution semantics, admissible representation, exact notification effects, and a runtime-facing scheduler theorem. Describe the present result as assumed primitive postconditions plus derived contract-chaining lemmas.
+
+1. Separate an isolated effect from a call interval
+--------------------------------------------------
+Runs is documented as relating the world before an operation to the world immediately after that operation's own effect, excluding interference. This can describe an unlock or notification linearization event. It does not uniformly describe a wait call, which releases/enrols, suspends, wakes, and reacquires while other actors execute.
+
+Introduce distinct concepts, for example:
+
+  Effect : CarrierId -> PrimitiveEvent -> World -> World -> Prop
+  Call : CarrierId -> BaseIO alpha -> RuntimeHistorySegment -> Prop
+
+Effect describes one abstract event. Call includes invocation, return where present, intermediate events, and interference. Represent a call's endpoints through an explicit correspondence with its history. These signatures are design suggestions, not an implementation ready to paste.
+
+For each wait invocation, use an episode identity and require ordered events:
+  atomic release-and-enrol;
+  release from condvar waiting, by notification or spurious wake;
+  reacquisition by the same carrier of the same mutex;
+  return.
+
+Other actors may acquire and release between those stages. A pending wait must also have representable finite prefixes. A returning-only relation cannot establish safety of all blocked executions.
+
+Confirm that Tid denotes a native carrier, not a green task. Std mutex ownership belongs to the executing native thread. If necessary, introduce CarrierId separately from TaskId.
+
+Acceptance check: a valid history in which another carrier acquires the mutex while the first waits is permitted. A history in which the wrong carrier's reacquisition is used to justify the wait return is rejected. Preserve atomic release-and-enrol so notification cannot be lost in an artificial gap between those actions.
+
+2. Add actual execution composition
+----------------------------------
+calls_compose takes three already-matched Runs hypotheses and derives the final lock postcondition. This is useful, but does not connect those hypotheses to execution of BaseIO.bind or to the scheduler's actual do block.
+
+Rename it lock_wait_unlock_postcondition unless true execution composition is added.
+
+Supply pure/bind semantics through a defined interpreter or explicit native interpretation assumptions. A bind execution must decompose using the actual first result, a compatible intermediate runtime state, and the same execution history. Conversely, composition must join compatible history segments, not arbitrary existential endpoint witnesses.
+
+This can be a shallow interface: clients need not write their scheduler in an embedded language. Nevertheless, the interface must explain what counts as an execution of the actual BaseIO expression.
+
+Acceptance check: derive a theorem for execution of the composed lock/wait/unlock expression, rather than requiring the user to provide three primitive Runs hypotheses. If wait never returns, the semantics allows that; do not assume termination to make composition easy.
+
+3. Restrict the bridge to admissible representations
+---------------------------------------------------
+Rep.lockOf and Rep.condOf are arbitrary total functions. The operation axioms quantify over every Rep. Thus they apply even to a map collapsing two independent runtime mutexes into one model lock. A NonAliasing hypothesis on a later theorem does not restrict the axioms themselves.
+
+Introduce an admissibility predicate, schematically:
+
+  ValidRep : Rep -> LiveRuntimeObjects -> Prop
+
+Require it at the execution-interpretation boundary or directly in primitive contracts. Establish it for tracked initial objects, preserve it through operations, and extend it on creation. Distinct simultaneously live objects of the same kind must map to distinct model identities; repeated handles to the same runtime object must map to the same identity.
+
+Creation should establish the new object's representation and state while preserving existing tracked objects. Allocation lifetime identities must handle address reuse. Local NonAliasing remains a useful corollary of validity and distinct live objects.
+
+Do not globally equate two distinct Lean values with two distinct native allocations without an explicit runtime identity contract. The representation predicate must connect native identity to the mathematical map.
+
+Acceptance check: a collapsing map is inadmissible for two distinct live locks. Legal allocation reuse does not confuse an old lifetime with a new one. A constructor cannot reset an existing live model lock through a colliding mapping.
+
+4. Specify notification by exact membership changes
+---------------------------------------------------
+notifyOne_spec's two length inequalities permit replacing [Alice, Bob] by [Carol, Dave]. notifyAll_spec also permits that replacement: the size stays unchanged and every original member disappears.
+
+For an isolated notification event, state exact removal rather than only cardinality constraints:
+
+  notifyOne removes zero or one selected eligible wait episode;
+  notifyAll removes all eligible wait episodes present at that event;
+  every removed episode becomes eligible to reacquire its associated mutex;
+  unrelated episodes and modelled fields are preserved.
+
+If World stores lists, prove distinctness and express exact removal with an appropriate list relation. A finite set of wait episode IDs makes membership semantics more direct. New wait episodes and spurious releases are separate events and may occur during the surrounding call interval.
+
+Decide the intended notification-strength contract separately: removing at most one is a weak safety contract and permits no release even when waiters exist. If a native-standard guarantee selecting a waiter when eligible ones exist is needed, state and audit that stronger obligation explicitly. Selection is not a guarantee of eventual execution or mutex reacquisition.
+
+Acceptance check: waiter replacement is rejected; empty notification creates no saved credit; broadcast releases all eligible episodes at its event without releasing future episodes. Shutdown completion remains a separate progress argument.
+
+5. Keep clock monotonicity separate from timing guarantees
+---------------------------------------------------------
+The revised clock contract records the latest sample and compares it with the prior sample. readings_monotone_across_a_call can use that information if World.SameClock indeed preserves lastSample as the proof expects.
+
+Retain that improvement, but specify the clock domain and ordering of samples. A shared global lastSample must evolve through a globally ordered history; arbitrary call endpoint sampling can introduce ambiguity under overlapping reads.
+
+Prove preservation for every permitted non-clock event, or at the path level, not just the one lock call in the example. Sample monotonicity allows equal values and establishes neither progress of time nor a deadline bound. Real-time claims need units, resolution/error assumptions, and execution progress or bounded poll/check durations.
+
+Acceptance check: decreasing ordered readings are rejected. A constant clock remains compatible with the monotonicity-only contract and must not accidentally prove finite real-time responsiveness.
+
+6. Preserve model validity and tracked state
+-------------------------------------------
+The operation postconditions still constrain only selected fields. SameClock adds a frame for clock fields but does not constrain unrelated lock ownership, waiter state, or scheduler data. A resulting world can therefore meet a postcondition without being reachable by valid model steps.
+
+Allow untracked implementation effects through an abstraction relation. Require tracked effects to match AbstractStep or a valid AbstractPath and preserve representation. Derive convenient endpoint postconditions from that correspondence.
+
+For shared scheduler refs, specify their contents and synchronization/visibility contract. A mutex owner field alone does not establish the native memory-visibility guarantee on protected data.
+
+Acceptance check: primitive execution cannot arbitrarily corrupt another tracked mutex or condvar while still qualifying as a valid isolated primitive effect. Separate environment events remain allowed to change their own tracked objects.
+
+7. Expand the audit to the claimed runtime guarantee
+---------------------------------------------------
+Printing only World.lean theorem dependencies establishes their independence from project bridge axioms. It does not show that the runtime scheduler theorem consumes those axioms.
+
+Add dependency reports for:
+  lock_wait_unlock_postcondition;
+  readings_monotone_across_a_call;
+  distinct_mutexes_are_distinct_locks;
+  the final runtime-facing scheduler theorem.
+
+Document explicit hypotheses as well as named axioms. #print axioms does not display a theorem's hypotheses, including NonAliasing or ValidRep. Distinguish standard Lean logical foundations from project runtime assumptions. Inventory compiler/runtime trust separately; nine named axioms are not the whole native execution TCB.
+
+Opaque Runs still requires a nonvacuous interpretation linking actual execution prefixes to represented histories. Do not fix vacuity by asserting every blocking operation returns. Link actual prefixes and actual initialization instead.
+
+Acceptance check: the final theorem quantifies over supported actual execution prefixes from a represented valid initial configuration and transfers the scheduler invariant. No hidden fairness or termination assumption, sorry, or extra unreviewed axiom is introduced.
+
+Implementation order
+--------------------
+1. Read World.lean and scheduler call sites; inventory actors, objects, and all executed effects.
+2. Specify runtime histories and distinguish primitive effects from call intervals.
+3. Introduce representation validity and construction/lifetime rules.
+4. Replace notification count bounds with exact episode transitions.
+5. Link wait's phases and prove validity/frame preservation.
+6. Define or assume the supported BaseIO interpretation and composition laws.
+7. Prove scheduler-specific history correspondence and safety transport.
+8. Audit dependencies, explicit premises, countermodels, and native trace tests.
+
+Suggested files
+---------------
+Execution.lean: histories, call intervals, pending calls, and composition.
+Representation.lean: admissibility, object identities, and lifetimes.
+Bridge.lean: auditable native adequacy contracts with pinned source references.
+BridgeLemmas.lean: derived postconditions and sample monotonicity.
+SchedulerRefinement.lean: actual-program correspondence and safety transport.
+BridgeControls.lean: countermodels and regression checks.
+
+Completion criterion
+--------------------
+The model invariant is transferred to every supported defined runtime prefix through an explicit represented history. The theorem exposes native adequacy assumptions and all representation/environment premises. Describe this as a machine-checked proof conditional on runtime contracts until those contracts are discharged against native execution semantics.
