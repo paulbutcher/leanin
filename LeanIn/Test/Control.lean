@@ -942,6 +942,21 @@ private def escBytes (b : ByteArray) : String :=
     else if c == 0x0A then ['\\', 'n']
     else [Char.ofNat c.toNat])
 
+/-- **Echo an accepted connection until the peer stops, then shut it down.** The server-side peer of
+`Runtime.echoConn`, which is the client's half: this one runs on a connection an accept loop produced, and its
+socket operations are the runtime's own path rather than `Std.Async`'s. A socket failure ends the connection
+rather than the mode, which is what the body of an accept loop wants: the peer going away mid-stream is an
+ordinary event here.
+
+`partial` for the same reason `Runtime.echoConn` is: a connection has no bound, and `Async` is `Inhabited`. -/
+private partial def echoAccepted (hooks : Runtime.Hooks) (c : Runtime.Conn) :
+    LeanIn.Task.EAsync IO.Error Unit := do
+  try
+    match ← Runtime.Conn.recv c hooks with
+    | none    => Runtime.Conn.shutdown c hooks
+    | some bs => Runtime.Conn.send c hooks bs; echoAccepted hooks c
+  catch _ => pure ()
+
 /-- **W2's evidence: sockets driven from our carriers.**
 
 The server half is ours — bind, an accept loop of ours, one task per connection, all as `Task.Async` steps on
@@ -968,7 +983,7 @@ def runtimeNet : IO UInt32 := do
   let body : Runtime.Conn → LeanIn.Task.EAsync IO.Error Unit := fun c => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     srvTids.modify (· ++ [tid])
-    Runtime.echoConn hooks c
+    echoAccepted hooks c
   -- the control: the pool holds work only until a carrier takes it, so the reader is shown a queue nothing is
   -- draining. These three no-op items are taken first when the driver starts, and they change nothing else.
   for _ in List.range 3 do e.submit (LeanIn.Task.Item.ofAction (pure ()))
@@ -2171,7 +2186,7 @@ def runtimeDrain : IO UInt32 := do
       let now ← monadLift (IO.monoNanosNow : IO Nat)
       stopAt.set now
       monadLift (e.stop : IO Unit)
-      Runtime.echoConn hooks c) [])) _root_.Task.Priority.dedicated
+      echoAccepted hooks c) [])) _root_.Task.Priority.dedicated
   let payload : ByteArray := "drain me".toUTF8
   let addr ← do
     let mut a : Option Std.Net.SocketAddress := none
@@ -4921,7 +4936,7 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
   return 0
 
 /-- Run every control that can be run, or one executor scenario when named. -/
-def main (args : List String) : IO UInt32 := do
+def runMode (args : List String) : IO UInt32 := do
   -- The affirmative baseline header, in every mode, before any observation: a check reads it to tell
   -- "the executable ran" from "the executable did not", which is a setup error rather than a verdict.
   IO.println "controls for the bridge axioms"
@@ -4979,5 +4994,15 @@ def main (args : List String) : IO UInt32 := do
   IO.println ""
   IO.println "  done"
   return 0
+
+/-- **Run the named mode, then stop the I/O loop this process started.**
+
+The stop is the process's own bookkeeping rather than a mode's: a mode that bound a listener leaves a loop thread
+parked in the shim's `uv_run`, and the Lean task manager waits for every dedicated task at shutdown, so without
+this the process would print its record and then never exit. It is a no-op in a mode that bound no listener. -/
+def main (args : List String) : IO UInt32 := do
+  let code ← runMode args
+  Runtime.Io.stop
+  return code
 
 end LeanIn.Test

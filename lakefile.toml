@@ -24,6 +24,7 @@ root = "WakerSpike"
 [[lean_exe]]
 name = "controls"
 root = "Controls"
+moreLinkArgs = ["-lnetuv", "-luv"]
 
 [[lean_exe]]
 name = "dynamics"
@@ -36,8 +37,4 @@ root = "BridgeControls"
 [[lean_exe]]
 name = "server"
 root = "Server"
-
-[[lean_exe]]
-name = "netuv"
-root = "NetUv"
 moreLinkArgs = ["-lnetuv", "-luv"]

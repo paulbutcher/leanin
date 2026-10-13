@@ -91,6 +91,10 @@ def main (args : List String) : IO UInt32 := do
   -- loop's own sleep never resumes. That is a defect to fix rather than a configuration to choose, and it is
   -- recorded in the notes beside this file rather than worked around by leaving the server single-carrier blind.
   let outcome : Except IO.Error Unit ← Runtime.run e prog
+  -- The accept loop can only return once the loop that accepted its connections is gone (that is what fails a
+  -- parked accept), so this is a no-op in the ordinary case; it is here so that a run that ended some other way
+  -- — a full slot table, say — does not leave the loop thread parked and the process waiting on it at shutdown.
+  Runtime.Io.stop
   match outcome with
   | .ok _ => return 0
   | .error err =>
