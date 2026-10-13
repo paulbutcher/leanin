@@ -84,7 +84,7 @@ def main (args : List String) : IO UInt32 := do
     return reply head
   IO.println s!"leanin server listening on {addr}"
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    Runtime.serveUntilStopped hooks e l 10 (Runtime.Http.serveConn hooks cfg · handler) []
+    Runtime.serveForever hooks l (Runtime.Http.serveConn hooks cfg · handler)
   -- Driven by `Runtime.run`: the caller's thread runs the executor while it waits, which is what pumps the
   -- live clock's timer. The multi-carrier entry `Runtime.runCarriers` does **not** serve here — a connection is
   -- accepted by the kernel and never answered, because its caller waits on a cell without pumping and the accept

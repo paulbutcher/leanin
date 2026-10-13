@@ -160,6 +160,24 @@ def serveUntilStopped (hooks : Hooks) (e : Sched.Executor Task.Item cap) (l : Li
   let clock := Clock.live hooks
   serveUntilStoppedLoop hooks e l clock interval body reg
 
+/-- **An accept loop that waits on the listener instead of polling it.** `Listener.accept` parks until a
+connection arrives, so this loop neither sleeps between attempts nor delays an accept by a poll interval: where
+`serveUntilStopped` answers a connection up to `interval` late and spends a sleep on every tick, this one is
+woken by the arrival itself.
+
+It has **no stop condition**, and that is a consequence rather than an oversight: a parked accept can only be
+withdrawn by closing the listener, and this seam has no `close` — only `shutdown`, which is the write side — so
+an accept already waiting cannot be called off. A programme that must stop accepting uses `serveUntilStopped`,
+whose stop is a drain over a registry; this loop is for a server that runs until the process is killed.
+
+Each accepted connection is spawned on the accepting worker's own route, and its handle is dropped: nothing
+awaits it, and the connection's own end is what retires it. -/
+partial def serveForever (hooks : Hooks) (l : Listener) (body : Conn → Task.EAsync IO.Error Unit) :
+    Task.EAsync IO.Error Unit := do
+  let c ← Listener.accept l hooks
+  let _ ← Task.MonadAsync.spawn (body c)
+  serveForever hooks l body
+
 /-- The admission loop of `serveBounded`: one admission per iteration, with the handles accepted so
 far accumulated, until exactly `n` connections have been served — then every handle is awaited.
 
