@@ -15,7 +15,9 @@
  *   np_uv_take(idx)          the bytes accumulated on that connection, clearing them
  *   np_uv_write(idx, bytes)  write a response on that connection
  *   np_uv_close(idx)         close a connection (after its write completed)
- *   np_uv_stop()             ask the loop to return
+ *   np_uv_stop()             stop the loop and drain it (SIGINT and SIGTERM also arrive through the same event
+ *                            queue, as kind 5, so a shutdown is an event Lean handles rather than a signal that
+ *                            interrupts it)
  *
  * Event kinds: 1 = a complete request has arrived, 2 = a write finished, 3 = the peer closed or errored.
  *

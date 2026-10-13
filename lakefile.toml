@@ -38,11 +38,6 @@ name = "server"
 root = "Server"
 
 [[lean_exe]]
-name = "netspike"
-root = "NetSpike"
-moreLinkArgs = [".lake/build/netpoll.o"]
-
-[[lean_exe]]
 name = "netuv"
 root = "NetUv"
-moreLinkArgs = [".lake/build/netuv.o", "-luv"]
+moreLinkArgs = ["-lnetuv", "-luv"]
