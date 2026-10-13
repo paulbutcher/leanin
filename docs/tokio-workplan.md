@@ -869,6 +869,22 @@ The trap stands as written: the deadline keeps going through `Clock`, so nothing
 from 2.02 toward ~0 and the process total from 7.98 toward ~6, with throughput and p50 beside them; revert and
 record it if the count does not move, as the park spin was.
 
+**Attempted on the strength of that datum, and reverted: the withdrawal is load-bearing.** The registry was written
+without it — a winning read's entry stays in the list — and the pump then fired it. Measured, the fire **resumed a
+computation that had already completed**: switches went from 7.98 to **25.55 per request** and throughput halved
+(2 065 against ~4 800 req/s), with SC20 failing — the scenario that owns the deadline. It compiled, and the
+pre-registered criterion caught it.
+
+The one number that improved is the informative one: **p50 fell from 159 µs to 84.6 µs** while the machine
+thrashed. So the per-request critical path really does get shorter when no timer arm sits in front of a read, and
+the registry's core is confirmed rather than refuted — what fails is a stale fire, which is a correctness bug
+before it is a switch cost.
+
+What the next attempt needs, therefore, is a **handle**: `sleep` returns `Task.Async Unit`, which carries no
+cancellation, and `withTimeout` keeps no handle on either of its arms today, so the interface must grow one. The
+call sites that move are `Runtime.sleep` and `withTimeout` in `Runtime/Time.lean` — not `Clock.live` alone. Do not
+transcribe the registry again without it.
+
 **Gate discipline for these.** Bound each scenario at 600 s and no less — SC18 legitimately needs ~124 s on this
 machine, and a tighter wrapper manufactures failures that look like regressions. Print the load average and count
 stray `controls` children before and after: a killed scenario leaves its child running, and that is what loaded
