@@ -291,13 +291,18 @@ def Join.resolveFirst (j : Join α) (push : Item → BaseIO Unit) (v : α) : IO 
 
 /-- **Register, or run now.** An awaiter that arrives after the value did must not be left waiting: it runs
 immediately under its own context — the same worker's step, so nothing is deferred and no route is needed. That
-is also what makes awaiting a finished handle return at once instead of yielding. -/
+is also what makes awaiting a finished handle return at once instead of yielding.
+
+**Registration prepends, and that is deliberate.** Every waiter of a cell is delivered the same value, and the
+order their continuations are pushed in is read by no clause — a `JoinSet` promises no order, which is the same
+property that lets `Registry.add` cons. Prepending allocates one cons and copies no spine, where appending
+allocated that cons *and* a fresh one-element list and walked the list already there. -/
 def Join.onReady (j : Join α) (ctx : Ctx) (k : α → Ctx → IO Unit) : IO Unit := do
   let now? ← j.lock.atomically do
     let st ← get
     match st.1 with
     | some v => return some v
-    | none   => set (st.1, st.2 ++ [{ ctx := ctx, run := k }]); return none
+    | none   => set (st.1, { ctx := ctx, run := k } :: st.2); return none
   match now? with
   | some v => k v ctx
   | none   => pure ()
