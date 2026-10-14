@@ -815,6 +815,51 @@ Reproduce with the switch count from the row above: `./.lake/build/bin/server <p
 with `load.mjs` in keep-alive at one connection for 5 s, and sum `voluntary_ctxt_switches` over
 `/proc/<pid>/task/*` divided by `completed`.
 
+### The serving carrier drives the loop: the handoff removed
+
+The W16 path left the loop on its own thread and handed each readiness to a carrier as a scheduled item — the
+7.98 voluntary switches a keep-alive request cost, decomposed above as two shim operations at four switches
+each. The single-carrier entry now takes the loop over instead: `Runtime.run`'s driver (`blockOnIo`) calls
+`Io.driveOnce` on the serving carrier when its queues are empty, so the poll, the completion it records, and the
+handler that completion resumes all run on one thread, and there is no handoff left to price. The multi-carrier
+and `runVirtual` entries keep a pump thread — their carriers never take the loop over — and `driveOnce`'s
+nothing-to-drive test is split between the two shapes: the pump keeps serving while a listener is bound, because
+the accept that gives it work is registered by a task it has not yet run; the single-carrier driver, which *has*
+taken the loop over, condvar-parks on its own executor's work rather than on a listener another executor bound
+(SC20's idle accept is the first case, SC17's bare `Join` wait the second, and one test serving both is what
+broke each in turn).
+
+Same client and mode as the 7.98 row (`load.mjs`, keep-alive, echo handler, `quiet`), the merged driver against
+its **direct predecessor** `5e608ba` — the timing-wheel path with the loop still on its own thread — interleaved
+two reps each so neither sees a systematically fresher box:
+
+| | switches / request | p50 | req/s |
+|---|---|---|---|
+| C=1, predecessor | 4.82 / 4.81 | 122 / 122 µs | 6 262 / 6 579 |
+| C=1, merged | **0.15 / 0.15** | **82 / 78 µs** | **9 181 / 9 326** |
+| C=32, predecessor | 1.71 / 1.76 | 1 647 / 1 570 µs | 16 646 / 17 614 |
+| C=32, merged | **0.02 / 0.02** | **1 093 / 1 098 µs** | **27 438 / 26 684** |
+
+🟢 on every row. The predecessor's 4.81 reproduces the timing-wheel section's recorded 4.78 to inside this
+document's drift band, which is the method check rather than a coincidence: the switch count is the
+load-invariant instrument (§4's 7.98 row: it prices waiting, not work), and it says the handoff is **gone** —
+32× fewer switches at one connection, ~85× at 32, both **below Node's ~0.93–0.98** in the same shape. p50
+follows it (1.5× at both levels) and throughput rises (1.44× / 1.58×). Against Node, from the four-way run of
+§4's table re-run at this commit (`threeway.sh`), the remaining gap is p50 **2.1–2.4×** at one connection and
+**1.6×** at 32, and CPU per request **2.8×** (108 µs against 38 µs) — narrowed from the ~5× the W16 section
+recorded for the predecessor (118 µs against 24 µs). Both leanin figures scale from C=1 to C=32 here (the
+predecessor 2.7×, the merged 2.9×); the merged is the higher base at every level.
+
+Two driver bugs were found on the way, and the gate — not the benchmark — is the evidence for them: the shim
+reported libuv `EAGAIN` (`nread == 0`) as end-of-stream when only `UV_EOF` is one, which hung keep-alive
+teardown (SC20); and one nothing-to-drive test served both the pump and the single-carrier driver, which either
+stranded a `runVirtual` accept or loop-parked a bare `Join` wait (SC20 and SC17 respectively). The gate holds at
+**22/22** with the fix.
+
+Reproduce: `bash pred-compare.sh` (run notes) interleaves the two servers at each connection level; the
+predecessor is a worktree at `5e608ba`, built with `nix develop -c lake build server`. The switch count is
+`voluntary_ctxt_switches` summed over `/proc/<pid>/task/*` divided by `completed`, as in the 7.98 row.
+
 ## 5. ⚪ Rows that are about a pool, not about us
 
 These appear in the same diagnostics — Lean's pool's starvation shape, W4's blocking pool beside it, and the
