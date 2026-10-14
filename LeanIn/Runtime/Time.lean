@@ -16,13 +16,14 @@ is loud when that is broken, which is right for a normal completion and wrong fo
 the design and one of them must lose. `Join.resolveFirst` is that second law, and it is the whole of what this
 file adds to the task layer.
 
-**The timer is not cancelled when the computation wins.** A `withTimeout` that returns because its computation
-finished leaves the timer pending until it fires, which costs one parked task and nothing else. Cancelling it
-needs a handle on the timer — the promise and `Task` seam is where one would come from, and it is W7's item — and
-the operation that drops scheduled work, which is `Runtime.cancel` (W5). So this is a combinator that is correct
-about its *result* and honest about what it leaves behind: what it leaves is a timer that will fire with nobody
-waiting, rather than a cancellation.
--/
+**The timer is cancelled when the computation wins, and it was never a parked task.** The deadline is armed
+straight onto the clock's wheel as a fire that resolves the cell (`Clock.schedule`), not as a spawned task
+parked on a `sleep`, so there is no loser task to abandon. A winning computation sets the timer's token and the
+fire goes inert; what it leaves is one small cancelled wheel entry for the deadline to reap, not a task that
+lives out the interval. An earlier version armed the timer as a second background spawn and never cancelled it:
+every `withTimeout` left a parked task for the full timeout, which at one read per request on a keep-alive
+connection was the dominant per-request cost after the loop handoff was removed. The measurement that found it
+is in `docs/PERFORMANCE.md`. -/
 
 namespace LeanIn.Runtime
 
@@ -42,19 +43,23 @@ def never {α : Type} : Task.Async α :=
 /-- **`a`, or `none` if `d` elapses first.** The first writer wins — the computation's own value, or the
 timer's `none` — and the loser's write is ignored rather than being a defect.
 
-Each arm resolves the cell on its own step's route (`Task.Async.push`), so a waiter the resolution delivers is
-an item on the queue the resolving arm is running on. -/
+The deadline is armed straight onto the clock's wheel as a fire that resolves the cell (`Clock.schedule`), not
+as a spawned task parked on a `sleep`: a winning computation sets the timer's token and the fire goes inert, so
+a `withTimeout` that returns early leaves a small cancelled wheel entry for the deadline to reap, not a parked
+loser task that lives out the full interval. The read arm is the one background spawn — the computation itself
+must run on a carrier — and it resolves on its own route (`Task.Async.push`), so a waiter the resolution
+delivers is an item on the queue the resolving arm is running on. -/
 def withTimeout (c : Clock) (d : Std.Time.Millisecond.Offset) (a : Task.Async α) :
     Task.Async (Option α) := do
   let cell ← Task.Join.new
+  let shared ← Task.Async.resumeShared
+  let timerCancel ← (Task.Cancel.new : IO Task.Cancel)
+  c.schedule d timerCancel (Task.Join.resolveFirst cell shared none)
   Task.background (do
     let v ← a
     let push ← Task.Async.push
-    Task.Join.resolveFirst cell push (some v))
-  Task.background (do
-    sleep c d
-    let push ← Task.Async.push
-    Task.Join.resolveFirst cell push none)
+    Task.Join.resolveFirst cell push (some v)
+    Task.Cancel.set timerCancel)
   let token ← (Task.Cancel.new : IO Task.Cancel)
   Task.Async.await (show Task.Task (Option α) from ⟨cell, token⟩)
 

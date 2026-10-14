@@ -350,6 +350,11 @@ own route, and this is where a step running inside a computation gets it. The ro
 that is running, never captured earlier. -/
 def Async.push : Async (Item → BaseIO Unit) := ⟨fun k ctx => k ctx.resume ctx⟩
 
+/-- **The shared route**, for a resolution made by a thread that owns no queue — the loop thread firing a timer
+being the standing case. `Async.push` is the firing worker's *local* route, which only a step re-enqueuing
+itself may take; an event's delivery takes the inject, whose push unparks a parked waiter. -/
+def Async.resumeShared : Async (Item → BaseIO Unit) := ⟨fun k ctx => k ctx.resumeShared ctx⟩
+
 /-- **Run a computation under a local context.** The value is installed on the `Ctx` this computation's steps run
 with, and restored for the continuation: a `spawn` inside it therefore builds the child's `Ctx` from a parent
 that already carries it, which is how the child inherits the innermost enclosing value at its spawn site, while
