@@ -2,6 +2,7 @@ import Std
 import Std.Async.Timer
 import LeanIn.Runtime.Basic
 import LeanIn.Runtime.Leaf
+import LeanIn.Runtime.Io
 
 /-!
 # The clock seam
@@ -36,10 +37,21 @@ structure Clock where
   /-- A one-shot wait for `d` from now. -/
   sleep : Std.Time.Millisecond.Offset → Task.Async Unit
 
-/-- **The production clock**: the live reading and the libuv timer behind W1's seam. -/
-def Clock.live (hooks : Hooks) : Clock :=
+/-- **The production clock**: the live reading, and a `sleep` that parks the waiter and schedules its fire on
+the runtime's own timing wheel (`Io.liveSchedule`). The wheel is driven by the loop thread that also services
+socket completions, so a deadline ends the same park a socket does and no second thread services timers — the
+stdlib's `Std.Async.sleep` keeps a loop thread of its own, and that thread is what a per-request deadline was
+paying two context switches for. The step schedules the fire and returns without calling `k`, so the waiter
+parks on its own cell; the fire, run by the loop thread, is inert if its token is set (a winning read cancels
+the loser) and otherwise enqueues the waiter's continuation on the shared route, where a carrier runs it. -/
+def Clock.live (_hooks : Hooks) : Clock :=
   { now   := IO.monoNanosNow
-  , sleep := fun d => awaitAsync hooks (Std.Async.sleep d) }
+  , sleep := fun d => ⟨fun k ctx => do
+      let fire : IO Unit := do
+        unless ← Task.Cancel.isSet ctx.cancel do
+          ctx.resumeShared (Task.Item.ofDeferred ctx (k ()))
+      let now0 ← IO.monoNanosNow
+      Io.liveSchedule (now0 + d.toInt.toNat * 1000000) ctx.cancel fire⟩ }
 
 /-- The virtual clock's state: the current instant and its pending timers, sorted by instant and FIFO on
 ties. -/

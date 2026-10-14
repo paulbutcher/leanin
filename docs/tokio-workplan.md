@@ -885,6 +885,53 @@ cancellation, and `withTimeout` keeps no handle on either of its arms today, so 
 call sites that move are `Runtime.sleep` and `withTimeout` in `Runtime/Time.lean` — not `Clock.live` alone. Do not
 transcribe the registry again without it.
 
+### The timing wheel: a list, a pump, and the shape that landed
+
+Two attempts taught the two things the final shape rests on, and both are recorded because a third would have
+repeated them. The first put the timers in a shared sorted list and kept the pump a thread of its own: the
+list's O(n) walk on every insertion halved throughput and doubled p50, and the pump was a second worker — SC19
+and SC20 read `carrierThreads = 2` where the contract wants `1`, because the fire ran the waiter's continuation
+on the pump's own thread. The idea was right; the data structure was not, and neither was the thread.
+
+**The pump is the loop thread we already have.** A timing-wheel thread is a second carrier for these purposes:
+the fire has to be delivered through `resumeShared` onto a real carrier, and the thread that services socket
+completions is already parked on exactly the right `uv_run`. So the wheel is owned by the loop thread, driven
+from the same iteration that drains socket events, and two consequences had to be earned. A program that binds
+no listener still has timers — SC8's sixteen sleeps bind none — so the loop is started by the first
+`liveSchedule` as well as by `startListener`, and the shim's `uv_loop` is created on demand (`ensure_loop`)
+rather than only at bind. And a timer scheduled while that loop is parked with nothing armed strands without a
+wake — SC11's shape — so `liveSchedule` sends one unconditionally; gating it on a park state that could be read
+stale was a hang, not a saving, and the unreferenced `uv_async_t` keeps the wake from pinning a timer-only loop
+open.
+
+**The wheel is ordered, because the loop parks until the next deadline.** A flat list was the throughput bug:
+`withTimeout` never cancels its loser, so thousands of 12 s deadlines accumulate, and the loop's two per-iteration
+readings — the earliest deadline for the park timeout, the timers already due — each cost O(n). The wheel is a
+`Std.TreeMap Nat (Array WheelTimer)`: insertion is one `insert` per drained timer, the park timeout is a
+`minKey?`, firing is a pop-while-due, all O(log n), so the accumulated losers no longer inflate an iteration. A
+hashed wheel was the alternative and the wrong fit here: it answers "what fires this tick" in O(1) but not "what
+is the earliest deadline," which is the reading a park-until-next loop actually makes, and the slot bit-map and
+cascading it needs are more machinery for the same result.
+
+**The stop has to retire the loop, not restart it.** The shim's `uv_loop` is created on demand, so a naive stop
+leaves the next `run_once` to build a fresh loop for a leftover timer and park on it — a shutdown that hangs on
+`stallTimeout`. The stop branch returns a distinct code (2) so the loop thread exits instead, and `Io.stop`
+drops the queue.
+
+Measured against the 7.98 row in `docs/PERFORMANCE.md` (`load.mjs`, keep-alive, one connection, echo, 5 s):
+throughput 4 895 → **12 767 req/s**, p50 162 µs → **63 µs**, switches 7.98 → **4.78**, gate 22/22. The win is
+mostly the seam — the ~99 µs `awaitAsync` bridge off the read's critical path — with the switch reduction beside
+it, and it holds with the losers accumulating because the map is ordered.
+
+**Cancellation is a token, not a removal — and the handle the previous section called for was not needed.** That
+note prescribed growing a handle and changing `withTimeout`'s interface, on the registry attempt's two failures:
+the stale fire and the loser's cost. The landed shape answers both without it. The stale fire is a correctness
+bug, and the token settles it: the fire checks `isSet` and is inert, so a winning read's loser never resumes an
+already-completed computation. The loser's cost is a throughput question, and the ordered map settles that: the
+loser stays in the wheel until its own deadline — the deferred `withTimeout` cancellation decision (D20),
+unchanged here — but it is a relic the map absorbs at O(log n) rather than a scan the flat list paid O(n) for.
+So the interface grew nothing, and `Runtime.sleep`/`withTimeout` in `Runtime/Time.lean` did not move.
+
 **Gate discipline for these.** Bound each scenario at 600 s and no less — SC18 legitimately needs ~124 s on this
 machine, and a tighter wrapper manufactures failures that look like regressions. Print the load average and count
 stray `controls` children before and after: a killed scenario leaves its child running, and that is what loaded

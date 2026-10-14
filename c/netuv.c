@@ -111,6 +111,8 @@ typedef struct { uv_tcp_t handle; } reject_t;
 static uv_loop_t *g_loop = NULL;
 static uv_tcp_t g_server;
 static uv_async_t g_async;
+static uv_timer_t g_wheel_timer;
+static int g_wheel_timer_up = 0;
 static conn_t g_conns[MAX_CONN];
 /* The event queue grows: it holds the events of one loop iteration, and an iteration's worth of events is set by
    how many connections are ready at once, not by anything the shim can bound in advance. A fixed ring would have
@@ -236,6 +238,35 @@ static void on_async(uv_async_t *h) {
      `uv_run` whether or not this callback ran. A callback that did the work would be a second place submissions
      are applied, and only one of the two could be the one that ran. */
   (void)h;
+}
+
+static void on_wheel_timer(uv_timer_t *h) {
+  /* The wheel timer's only job is to end the poll at the deadline; the Lean loop thread fires the due timers
+     itself when `np_uv_run_once_timeout` returns, so there is nothing to do in the callback. */
+  (void)h;
+}
+
+/* Create the loop, its submission mutex and its async wake if they do not exist yet. Shared by the listener
+   path (`np_uv_start`) and the timer path (`np_uv_run_once_timeout`), because the wheel's timer needs a loop
+   even when nothing is listening. The async wake is unreferenced: a referenced one would keep a timer-only
+   loop alive forever, where it must instead drain and exit once no timer is armed. `uv_async_send` wakes an
+   unreferenced handle just the same, and a listening loop stays alive on its listening handle regardless.
+   Returns 1 when the loop is usable, 0 on failure. */
+static int ensure_loop(void) {
+  if (g_loop != NULL) return 1;
+  g_loop = malloc(sizeof(uv_loop_t));
+  if (g_loop == NULL) return 0;
+  if (uv_loop_init(g_loop) != 0) { free(g_loop); g_loop = NULL; return 0; }
+  if (!g_mutex_up) {
+    if (uv_mutex_init(&g_sub_lock) != 0) { uv_loop_close(g_loop); free(g_loop); g_loop = NULL; return 0; }
+    g_mutex_up = 1;
+  }
+  uv_async_init(g_loop, &g_async, on_async);
+  g_async_up = 1;
+  uv_unref((uv_handle_t *)&g_async);
+  uv_timer_init(g_loop, &g_wheel_timer);
+  g_wheel_timer_up = 1;
+  return 1;
 }
 
 static void on_conn(uv_stream_t *server, int status) {
@@ -418,6 +449,7 @@ static void apply_submits(void) {
 
 static void close_all(void) {
   if (g_async_up) { uv_close((uv_handle_t *)&g_async, NULL); g_async_up = 0; }
+  if (g_wheel_timer_up) { uv_close((uv_handle_t *)&g_wheel_timer, NULL); g_wheel_timer_up = 0; }
   if (g_listening) { uv_close((uv_handle_t *)&g_server, NULL); g_listening = 0; }
   for (int i = 0; i < MAX_CONN; i++)
     if (g_conns[i].used && !uv_is_closing((uv_handle_t *)&g_conns[i].handle))
@@ -432,16 +464,7 @@ static void destroy_loop(void) {
 
 LEAN_EXPORT lean_object *np_uv_start(uint32_t port) {
   if (g_loop != NULL) return lean_io_result_mk_ok(lean_box_uint32(0));   /* one loop at a time */
-  g_loop = malloc(sizeof(uv_loop_t));
-  if (g_loop == NULL) return lean_io_result_mk_ok(lean_box_uint32(0));
-  if (uv_loop_init(g_loop) != 0) { free(g_loop); g_loop = NULL; return lean_io_result_mk_ok(lean_box_uint32(0)); }
-  if (!g_mutex_up) {
-    if (uv_mutex_init(&g_sub_lock) != 0) { uv_loop_close(g_loop); free(g_loop); g_loop = NULL;
-                                           return lean_io_result_mk_ok(lean_box_uint32(0)); }
-    g_mutex_up = 1;
-  }
-  uv_async_init(g_loop, &g_async, on_async);
-  g_async_up = 1;
+  if (!ensure_loop()) return lean_io_result_mk_ok(lean_box_uint32(0));
   uv_tcp_init(g_loop, &g_server);
   struct sockaddr_in addr;
   uv_ip4_addr("127.0.0.1", (int)port, &addr);
@@ -460,8 +483,13 @@ LEAN_EXPORT lean_object *np_uv_start(uint32_t port) {
   return lean_io_result_mk_ok(lean_box_uint32((uint32_t)ntohs(addr.sin_port)));
 }
 
-LEAN_EXPORT lean_object *np_uv_run_once(void) {
-  if (g_loop == NULL) return lean_io_result_mk_ok(lean_box_uint32(0));
+/* One loop iteration with a park timeout, in milliseconds: the wheel timer is armed to fire after `timeout_ms`
+   so the loop wakes for a deadline exactly as it wakes for a socket or a submission, and the Lean side fires the
+   due timers itself when this returns. A `timeout_ms` of 0 arms no timer -- the loop parks only on I/O and
+   submissions, which is the listener's shape. The loop is created on demand (`ensure_loop`) so a timer-only
+   program has one without binding a listener. */
+LEAN_EXPORT lean_object *np_uv_run_once_timeout(uint32_t timeout_ms) {
+  if (!ensure_loop()) return lean_io_result_mk_ok(lean_box_uint32(0));
   g_cnt[CNT_ITER]++;
   report_counts();
   apply_submits();
@@ -469,12 +497,15 @@ LEAN_EXPORT lean_object *np_uv_run_once(void) {
     /* The stopped loop is closed and drained here, never by the thread that asked for the stop: the close
        callbacks would otherwise be run by a `uv_run` racing this one on the same loop. Everything is already
        closed, so the poll is given a zero timeout -- what is left to do is run those callbacks, and a poll with
-       nothing to wait for must not be allowed to wait. */
+       nothing to wait for must not be allowed to wait. A drained stop reports 2, not 0: 0 is "nothing armed"
+       (a timer-only loop may simply be idle and must decide by its wheel), while 2 tells the loop thread the
+       loop is gone for good so it exits rather than letting `ensure_loop` build a fresh one for a leftover
+       timer. */
     close_all();
     int active = 1;
     for (int i = 0; i < 8 && active != 0; i++) active = uv_run(g_loop, UV_RUN_NOWAIT);
-    if (active == 0) destroy_loop();
-    return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
+    if (active == 0) { destroy_loop(); return lean_io_result_mk_ok(lean_box_uint32(2)); }
+    return lean_io_result_mk_ok(lean_box_uint32(1));
   }
   /* Non-blocking iterations while submissions are queued: a submission landing during one is found by the next
      `apply_submits` in this same call, which is what makes skipping its wake safe. The blocking poll below runs
@@ -490,8 +521,18 @@ LEAN_EXPORT lean_object *np_uv_run_once(void) {
     g_loop_running = 0;
     apply_submits();
   }
+  if (timeout_ms > 0) uv_timer_start(&g_wheel_timer, on_wheel_timer, timeout_ms, 0);
   int active = uv_run(g_loop, UV_RUN_ONCE);
+  if (timeout_ms > 0) uv_timer_stop(&g_wheel_timer);
   return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
+}
+
+/* End the poll the loop is parked in so it re-reads the wheel: a timer scheduled with a deadline earlier than
+   the current park must be picked up now, not when the old park would have ended. Level-triggered, so a wake
+   raised while the loop is between iterations is still serviced. */
+LEAN_EXPORT lean_object *np_uv_wheel_wake(void) {
+  if (g_loop != NULL && !g_stopping && g_async_up && !g_loop_running) uv_async_send(&g_async);
+  return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_object *np_uv_events(void) {

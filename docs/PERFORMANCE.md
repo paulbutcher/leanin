@@ -781,6 +781,40 @@ req/s, and it is ⚪ here for a reason worth stating: it handled each request *o
 handoff at all, and it parsed no HTTP. Those figures are a ceiling for a different shape, not a target this one
 is failing to reach.
 
+### The read deadline's thread, removed: the timing wheel
+
+`Clock.live`'s `sleep` was `awaitAsync hooks (Std.Async.sleep d)`: every `withTimeout` on a read armed a libuv
+timer, a promise and a task on the standard library's own loop, and that loop's thread was a third worker the
+switch count could see — 2.02 of the 7.98 voluntary switches a keep-alive request cost — plus the seam itself,
+~99 µs to await a resolved promise through it against ~11 µs on our own `resumeShared`. The wheel replaces that
+with a `Std.TreeMap Nat (Array WheelTimer)` ordered on the deadline, owned by the loop thread that already
+services socket completions: a `sleep` is one `Array.push` onto a mutex hand-off queue, the loop thread drains it
+in one pointer swap into its own map, and it wakes for the earliest deadline exactly as it wakes for I/O, through
+one `uv_timer_t` armed to that deadline. There is no third thread, and no second worker appears in SC19's
+`carrierThreads`.
+
+Same client and mode as the 7.98 row above (`load.mjs`, keep-alive, one connection, echo handler, `quiet`, 5 s):
+
+| | baseline (`Std.Async.sleep`) | the timing wheel |
+|---|---|---|
+| throughput | 4 895 req/s | **12 767 req/s** |
+| p50 | 162 µs | **63 µs** |
+| p99 | 535 µs | **229 µs** |
+| voluntary switches / request | 7.98 | **4.78** |
+
+🟢 on every row, and the gate holds at 22/22. The 2.6× throughput is mostly the seam, not the switches: taking
+the ~99 µs `awaitAsync` bridge off the read's critical path is what moves p50 from 162 µs to 63 µs, and at one
+connection the throughput follows the latency. The switch figure is with the losers accumulating — `withTimeout`
+never cancels its loser (D20), so thousands of 12 s deadlines stay in the wheel through a run — and it is the
+ordered map that keeps that cheap: the loop's two per-iteration readings, the earliest deadline for the park
+timeout and the timers already due, are O(log n) where a flat list paid O(n) for the same pair, which is what
+halved an earlier flat-list attempt's throughput (3 809 req/s) and doubled its p50 (240 µs). The thread that
+parked only for timers is gone from the switch attribution entirely.
+
+Reproduce with the switch count from the row above: `./.lake/build/bin/server <port> static quiet`, drive it
+with `load.mjs` in keep-alive at one connection for 5 s, and sum `voluntary_ctxt_switches` over
+`/proc/<pid>/task/*` divided by `completed`.
+
 ## 5. ⚪ Rows that are about a pool, not about us
 
 These appear in the same diagnostics — Lean's pool's starvation shape, W4's blocking pool beside it, and the
