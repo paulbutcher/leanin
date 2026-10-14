@@ -1,5 +1,6 @@
 import Std
 import LeanIn.Task.Send
+import LeanIn.Runtime.Io
 
 /-!
 # The runtime: P carriers, and the driver on the calling thread
@@ -47,7 +48,13 @@ a carrier reaches the composition through this — `Handle.spawn`'s items, the s
 a resolution made off-carrier (`Join.resolve`'s `push`) — which is why those pushes need no wake flag of their
 own. It is also the `Ctx.resumeShared` every step carries. -/
 def sharedPush (e : Executor cap) : Task.Item → BaseIO Unit :=
-  fun it => e.pushInject (Task.Item.sendable it)
+  fun it => do
+    e.pushInject (Task.Item.sendable it)
+    -- A delivery from a thread that owns no queue — a stock-task completion, a `Handle.spawn`, an off-carrier
+    -- resolution — must also end the I/O loop's park, because a single-carrier driver parks on the loop, not on
+    -- the executor's condvar, and only this wake reaches it there. The shim fires it only when the loop is
+    -- genuinely parked, so a busy driver's own pushes are not woken spuriously.
+    npUvWheelWake
 
 /-- **The fire entry for an `ofIndexed` root**: run computation `a` on the worker whose index is `i`, with that
 worker's own route and the runtime's route *table* on the `Ctx`.
@@ -240,12 +247,47 @@ def blockOnWith (e : Executor cap) (now : IO Nat) (idle : IO Bool) (finished : I
         -- deadline, which is the caller's to impose and W7's to make cheap.
         e.waitForWork
 
+/-- **Drive worker `0`'s loop on the caller's thread, and the I/O loop with it** — the single-carrier entry, and
+the one the server runs through. When the queues are empty the driver does not park on the executor's condvar:
+it takes the loop over (`Io.takeover`) and *pumps* it (`Io.driveOnce`), so a socket completion or a timer is
+serviced by the same thread that runs the continuations it produces — the loop and the handler share one thread,
+with no handoff to a second worker. With nothing to drive — no listener, no timer — it falls back to the
+executor's own park, so a program that does no I/O behaves exactly as before. The flag is released on the way
+out so a later entry can start a pump again. -/
+def blockOnIo (e : Executor cap) (now : IO Nat) (finished : IO Bool) : IO Unit := do
+  Io.takeover
+  try
+    let mut go := true
+    while go do
+      if ← finished then
+        -- The program is done, but its last steps may have queued submissions the loop has not yet applied —
+        -- a final write or the `Io.close` that ends a connection. Flush them now, but only when a listener is
+        -- bound: an accepted connection is owed its bytes or its FIN, and a program with no listener has
+        -- nothing the loop owes anyone, so the flush would only build a loop nobody uses.
+        if (← Io.hasListener) then
+          let _ ← npUvRunNowait
+          let _ ← npUvRunNowait
+        go := false
+      else
+        match ← e.takeFor 0 with
+        | some it => fireAt e now it
+        | none   =>
+          -- Always pump when the queues are empty, stopping or not: a stop is a *drain*, and the in-flight
+          -- completions that finish it arrive only if the loop is still being driven. Parking on the condvar
+          -- here instead is the hang the two-thread shape avoided by keeping its loop thread alive through the
+          -- drain. Only when the pump reports the loop stopped or nothing to drive do we fall back to the
+          -- executor's own park.
+          let drove ← Io.driveOnce true
+          if !drove then e.waitForWork
+  finally
+    Io.releaseDriver
+
 /-- **Drive worker `0`'s loop on the caller's thread** until `finished` holds.
 
-`blockOnWith` with a hook that reports nothing and a clock that is never read — the driver `Runtime.run` uses,
-and the one every existing scenario runs through. -/
+The single-carrier driver — `blockOnIo` with a clock that is read for metering only — which every existing
+scenario runs through. -/
 def blockOn (e : Executor cap) (finished : IO Bool) : IO Unit :=
-  blockOnWith e IO.monoNanosNow (do return false) finished
+  blockOnIo e IO.monoNanosNow finished
 
 /-- Run one computation to completion on the caller's thread and return its value, driving it with `now` and
 `idle`: `idle` is the driver's own step when nothing in the queues can run, which is where a virtual clock
@@ -279,10 +321,21 @@ def runWith (e : Executor cap) (now : IO Nat) (idle : IO Bool) (a : Task.Async �
   | some v => return v
   | none   => throw (IO.userError "Runtime.run: the driver stopped before the computation finished")
 
-/-- Run one computation to completion on the caller's thread and return its value: `runWith` with the live clock
-reader and no idle step. -/
-def run (e : Executor cap) (a : Task.Async α) : IO α :=
-  runWith e IO.monoNanosNow (do return false) a
+/-- Run one computation to completion on the caller's thread and return its value: the single-carrier driver,
+which pumps the I/O loop itself (`blockOnIo`) rather than handing it to a second thread. -/
+def run (e : Executor cap) (a : Task.Async α) : IO α := do
+  let done ← Std.Mutex.new (none : Option α)
+  e.clearFinished
+  let cancel ← Task.Cancel.new
+  let finish : α → Task.Ctx → IO Unit := fun v _ => do
+    done.atomically do set (some v)
+    e.noteFinished
+  let it := Task.Item.ofIndexed (some cancel) (fired cancel e a finish)
+  e.pushInject (Task.Item.sendable it)
+  blockOnIo e IO.monoNanosNow (do return (← done.atomically do return (← get)).isSome)
+  match ← done.atomically do return (← get) with
+  | some v => return v
+  | none   => throw (IO.userError "Runtime.run: the driver stopped before the computation finished")
 
 /-- **The parallel entry**: run a computation and return the dedicated carriers that were started alongside it,
 so a caller can read what was started and stop it.

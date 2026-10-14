@@ -81,6 +81,7 @@
 #define SUB_SHUTDOWN 3
 #define SUB_CLOSE 4
 #define SUB_WRITEV 5
+#define SUB_SIGNAL 6
 
 typedef struct {
   uv_tcp_t handle;
@@ -113,6 +114,8 @@ static uv_tcp_t g_server;
 static uv_async_t g_async;
 static uv_timer_t g_wheel_timer;
 static int g_wheel_timer_up = 0;
+static uv_signal_t g_signal;
+static int g_signal_up = 0;
 static conn_t g_conns[MAX_CONN];
 /* The event queue grows: it holds the events of one loop iteration, and an iteration's worth of events is set by
    how many connections are ready at once, not by anything the shim can bound in advance. A fixed ring would have
@@ -129,6 +132,13 @@ static int g_ev_dropped = 0;
    the queue is only re-checked after the poll returns, which is what needed the wake. `uv_async_send` is
    level-triggered, so a wake raised in the window between an iteration and the poll is serviced, not lost. */
 static int g_loop_running = 0;
+/* Set only while the loop thread is inside the *blocking* poll of `np_uv_run_once_timeout`. This is the precise
+   "the loop is parked" signal a wake needs: `g_loop_running` marks the non-blocking drain iterations, and a
+   driver running tasks between iterations is in neither, so checking it would fire spuriously on every push a
+   busy driver makes. A wake fires only when the loop is genuinely asleep in `epoll_wait` -- which is the one
+   case a cross-thread push (a stock-task completion, a `Handle.spawn`, an off-carrier resolution) must end,
+   because nothing else will. */
+static volatile int g_loop_parked = 0;
 static submit_t g_sub[MAX_SUBMIT];
 static int g_sub_head = 0, g_sub_n = 0;
 static uv_mutex_t g_sub_lock;
@@ -316,16 +326,19 @@ static void alloc_cb(uv_handle_t *h, size_t suggested, uv_buf_t *out) {
 static void on_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b) {
   (void)b;
   conn_t *c = (conn_t *)s->data;
+  /* A zero `nread` is not end of stream: for a stream it is `EAGAIN`/`EWOULDBLOCK`, "no data right now", and the
+   * submission it fired for is still outstanding. End of stream arrives only as `UV_EOF` (-4095), a *negative*
+   * code. Report nothing here and leave the read started, so the callback fires again when the bytes (or the real
+   * `UV_EOF`) arrive. */
+  if (nread == 0)
+    return;
   /* One read per submission: stop here, and the next `np_uv_read` starts the next one. */
   uv_read_stop(s);
   c->want = 0;
   if (nread > 0) {
     c->len += (size_t)nread;
     push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)nread);
-  } else if (nread == 0 || nread == UV_EOF) {
-    /* End of stream, and it arrives as `UV_EOF` rather than as a zero length: libuv's `uv__stream_eof` calls the
-       read callback with `UV_EOF` (-4095), which is a *negative* code and so would otherwise read as a failure.
-       A zero length is treated the same way, because for a stream it can only mean the same thing. */
+  } else if (nread == UV_EOF) {
     push_ev(EV_READ, (uint64_t)c->idx, 0);
   } else {
     push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)(int64_t)nread);  /* a failure, the negated libuv code */
@@ -364,7 +377,28 @@ static int push_submit(int kind, uint32_t conn, char *p, size_t n, size_t want) 
   return 1;
 }
 
+#define EV_SIGNAL 7
+
+/* A signal the Lean side asked to watch: the callback only records it, and the loop thread that drains the
+   queue delivers it. libuv shares one disposition across watchers, so this coexists with the handler Lean's own
+   `Std.Async.Signal` may have installed for the same signal — both fire, and ours is the one the runtime reads.
+   A one-shot watch stops after the first fire; a repeating one stays armed. */
+static int g_signal_repeating = 0;
+static void on_signal(uv_signal_t *h, int signum) {
+  push_ev(EV_SIGNAL, (uint64_t)signum, 0);
+  if (!g_signal_repeating) uv_signal_stop(h);
+}
+
 static void apply_submit(submit_t *s) {
+  if (s->kind == SUB_SIGNAL) {
+    /* A signal watch: registered here, on the loop's own thread, which is the only thread that may touch a
+       libuv handle. `s->want` is the signal number, `s->n` the one-shot (0) or repeating (1) flag. */
+    if (!g_signal_up) { uv_signal_init(g_loop, &g_signal); g_signal_up = 1; }
+    g_signal_repeating = (int)s->n;
+    uv_signal_start(&g_signal, on_signal, (int)s->want);
+    free(s->p);
+    return;
+  }
   if (s->conn >= MAX_CONN) { free(s->p); return; }
   conn_t *c = &g_conns[s->conn];
   int dead = !c->used || uv_is_closing((uv_handle_t *)&c->handle);
@@ -450,6 +484,7 @@ static void apply_submits(void) {
 static void close_all(void) {
   if (g_async_up) { uv_close((uv_handle_t *)&g_async, NULL); g_async_up = 0; }
   if (g_wheel_timer_up) { uv_close((uv_handle_t *)&g_wheel_timer, NULL); g_wheel_timer_up = 0; }
+  if (g_signal_up) { uv_close((uv_handle_t *)&g_signal, NULL); g_signal_up = 0; }
   if (g_listening) { uv_close((uv_handle_t *)&g_server, NULL); g_listening = 0; }
   for (int i = 0; i < MAX_CONN; i++)
     if (g_conns[i].used && !uv_is_closing((uv_handle_t *)&g_conns[i].handle))
@@ -463,7 +498,10 @@ static void destroy_loop(void) {
 }
 
 LEAN_EXPORT lean_object *np_uv_start(uint32_t port) {
-  if (g_loop != NULL) return lean_io_result_mk_ok(lean_box_uint32(0));   /* one loop at a time */
+  /* One listener at a time, but not one loop: a bare connect or a timer may already have created the loop
+     (`ensure_loop`), and it has no listening handle, so it is reused rather than refused. `g_listening`, not
+     `g_loop`, is the thing a second bind would collide with. */
+  if (g_listening) return lean_io_result_mk_ok(lean_box_uint32(0));
   if (!ensure_loop()) return lean_io_result_mk_ok(lean_box_uint32(0));
   uv_tcp_init(g_loop, &g_server);
   struct sockaddr_in addr;
@@ -522,17 +560,56 @@ LEAN_EXPORT lean_object *np_uv_run_once_timeout(uint32_t timeout_ms) {
     apply_submits();
   }
   if (timeout_ms > 0) uv_timer_start(&g_wheel_timer, on_wheel_timer, timeout_ms, 0);
+  g_loop_parked = 1;
   int active = uv_run(g_loop, UV_RUN_ONCE);
+  g_loop_parked = 0;
   if (timeout_ms > 0) uv_timer_stop(&g_wheel_timer);
   return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
 }
 
-/* End the poll the loop is parked in so it re-reads the wheel: a timer scheduled with a deadline earlier than
-   the current park must be picked up now, not when the old park would have ended. Level-triggered, so a wake
-   raised while the loop is between iterations is still serviced. */
+/* Non-blocking drain and poll: apply the queued submissions, run non-blocking iterations until they are all
+   applied, then one UV_RUN_NOWAIT poll. Never parks -- the driver calls this when it has just produced work
+   itself (a fired timer's continuation is now in the executor's inject) and must harvest socket events without
+   sleeping, because the executor's queue is the thing it has to get back to, not the kernel's. */
+LEAN_EXPORT lean_object *np_uv_run_nowait(void) {
+  if (!ensure_loop()) return lean_io_result_mk_ok(lean_box_uint32(0));
+  apply_submits();
+  if (g_stopping) {
+    close_all();
+    int active = 1;
+    for (int i = 0; i < 8 && active != 0; i++) active = uv_run(g_loop, UV_RUN_NOWAIT);
+    if (active == 0) { destroy_loop(); return lean_io_result_mk_ok(lean_box_uint32(2)); }
+    return lean_io_result_mk_ok(lean_box_uint32(1));
+  }
+  for (;;) {
+    int queued;
+    uv_mutex_lock(&g_sub_lock);
+    queued = g_sub_head < g_sub_n;
+    uv_mutex_unlock(&g_sub_lock);
+    if (!queued) break;
+    g_loop_running = 1;
+    uv_run(g_loop, UV_RUN_NOWAIT);
+    g_loop_running = 0;
+    apply_submits();
+  }
+  int active = uv_run(g_loop, UV_RUN_NOWAIT);
+  return lean_io_result_mk_ok(lean_box_uint32(active ? 1 : 0));
+}
+
+/* End the poll the loop is parked in so it re-reads the wheel, and so a cross-thread push — a stock-task
+   completion, a `Handle.spawn`, an off-carrier resolution — reaches a driver that has no other reason to wake.
+   Fires only when the loop is genuinely parked (`g_loop_parked`), so a driver running tasks or dispatching its
+   own completions is not woken spuriously. Level-triggered, so a wake raised between iterations is serviced. */
 LEAN_EXPORT lean_object *np_uv_wheel_wake(void) {
-  if (g_loop != NULL && !g_stopping && g_async_up && !g_loop_running) uv_async_send(&g_async);
+  if (g_loop != NULL && !g_stopping && g_async_up && g_loop_parked) uv_async_send(&g_async);
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+/* Watch a signal, as a submission the loop applies on its own thread (the only place a libuv handle may be
+   touched): `uv_signal_start` for `signum`, recorded by `on_signal` and delivered by the loop exactly as a
+   socket or timer event. `repeating` 0 for one-shot, 1 to stay armed. The signal ends the loop's park itself. */
+LEAN_EXPORT lean_object *np_uv_signal_watch(uint32_t signum, uint32_t repeating) {
+  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)push_submit(SUB_SIGNAL, 0, NULL, repeating, signum)));
 }
 
 LEAN_EXPORT lean_object *np_uv_events(void) {

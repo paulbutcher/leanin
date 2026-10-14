@@ -86,8 +86,17 @@ drained — the loop thread's exit condition. -/
 @[extern "np_uv_run_once_timeout"] opaque npUvRunOnceTimeout (timeoutMs : UInt32) : IO UInt32
 
 /-- End the poll the loop is parked in so it re-reads the wheel: a timer scheduled with a deadline earlier than
-the current park is picked up at once rather than when the old park would have ended. -/
-@[extern "np_uv_wheel_wake"] opaque npUvWheelWake : IO Unit
+the current park is picked up at once rather than when the old park would have ended. Fires only when the loop
+is genuinely parked, so a busy driver's own pushes are not woken spuriously. -/
+@[extern "np_uv_wheel_wake"] opaque npUvWheelWake : BaseIO Unit
+
+/-- Watch a signal, as a submission the loop applies on its own thread: `signum` is the signal number,
+`repeating` 0 for one-shot or 1 to stay armed. Returns 1 on a successful submission. -/
+@[extern "np_uv_signal_watch"] opaque npUvSignalWatch (signum : UInt32) (repeating : UInt32) : IO UInt32
+
+/-- Drain submissions and run one **non-blocking** poll. Used when the driver has just produced work itself (a
+fired timer's continuation is in the executor's inject) and must harvest socket events without parking. -/
+@[extern "np_uv_run_nowait"] opaque npUvRunNowait : IO UInt32
 
 /-- Drain the shim's event queue: `(kind, conn, arg)` triples, flat in one array. -/
 @[extern "np_uv_events"] opaque npUvEvents : IO (Array UInt64)
@@ -164,13 +173,14 @@ structure Conn where
   parked: a retired listener's connection is a caller's error, and a hang would report it as a wait. -/
   private loop : Std.Mutex Table
 
-/-- The loop thread and the table it delivers through, when a loop is running. -/
-private structure Running where
-  table : Std.Mutex Table
-  thread : _root_.Task (Except IO.Error Unit)
+/-- The running loop's connection table, if a listener is bound: `startListener` replaces it, and `Io.stop`
+retires it. The table is what operations park on and what `dispatch` resolves; it is *not* the loop's driver. -/
+private initialize loopRef : IO.Ref (Option (Std.Mutex Table)) ← IO.mkRef none
 
-/-- The running loop, if any: `startListener` replaces it, and `stopLoop` retires it. -/
-private initialize loopRef : IO.Ref (Option Running) ← IO.mkRef none
+/-- The pump thread, when one is driving the loop. A single-carrier driver (`Runtime.run`) drives the loop
+itself and starts none; the multi-carrier and virtual-clock entries (`Io.ensurePump`) start one, because their
+carriers park on the executor's condvar rather than on the loop. -/
+private initialize pumpRef : IO.Ref (Option (_root_.Task (Except IO.Error Unit))) ← IO.mkRef none
 
 /-- A timer the loop thread fires when it comes due: a monotone-nanosecond deadline, the token a winning read
 sets to disarm the loser, and the fire — the parked waiter's own continuation, enqueued on the shared route so
@@ -180,11 +190,29 @@ private structure WheelTimer where
   cancel   : Task.Cancel
   fire     : IO Unit
 
-/-- The scheduling hand-off: timers carriers asked for (`liveSchedule`) and the loop thread has not yet taken
-into the wheel it owns. The wheel itself is loop-thread-local — appended to and scanned by that one thread with
-no lock — so a busy run does not pay a shared lock on every loop iteration; carriers touch only this queue,
-which is taken in one pointer swap. -/
+/-- The scheduling hand-off: timers carriers asked for (`liveSchedule`) and the driver has not yet taken into
+the wheel. Carriers touch only this queue, which is taken in one pointer swap. -/
 private initialize timerPending : Std.Mutex (Array WheelTimer) ← Std.Mutex.new #[]
+
+/-- The timing wheel, ordered on the deadline. Only the loop's *driver* touches it — the single-carrier driver
+or the pump thread, never both at once — so the lock is uncontended; it exists to keep the two from racing if
+an entry point changes which one drives, not because two threads share it. The driver drains `timerPending`
+into it and reads the earliest deadline and the due timers from it, both `O(log n)`. -/
+private initialize wheelRef : Std.Mutex (Std.TreeMap Nat (Array WheelTimer)) ← Std.Mutex.new Std.TreeMap.empty
+
+/-- A signal waiter: the signum it is for, the cell resolved with that signum when the shim's watcher fires, and
+the route the waiter was registered on. One watch at a time for now — the one the signal-driven drain uses. -/
+private initialize signalWaiterRef : Std.Mutex (Option (Nat × Task.Join Int × (Task.Item → BaseIO Unit))) ←
+  Std.Mutex.new none
+
+/-- Set while a single-carrier driver (`Runtime.run`'s `blockOnIo`) is driving the loop itself: `liveSchedule`
+and `startListener` must not start a pump thread, because the driver is the pump. Cleared when the driver
+finishes. -/
+private initialize driverActiveRef : IO.Ref Bool ← IO.mkRef false
+
+/-- Set to ask a running pump thread to yield to a taking-over driver — it exits without stopping the loop,
+which the driver then drives. Reset once the pump has yielded. -/
+private initialize pumpQuitRef : IO.Ref Bool ← IO.mkRef false
 
 namespace Io
 
@@ -296,6 +324,29 @@ private def opDone (loop : Std.Mutex Table) (idx : UInt32) (status : Int) (op : 
       unless (← npUvClose idx) == 1 do
         throw (IO.userError "Io: the shim refused to close a write-broken connection")
 
+/-- A watched signal fired: resolve the registered waiter with the signum, one watch at a time. The waiter's
+route was stored when it was registered, so the resumed step takes it exactly as a socket completion's would. -/
+private def signalFired (signum : Int) : IO Unit := do
+  let w ← signalWaiterRef.atomically do
+    let cur ← get
+    set (none : Option (Nat × Task.Join Int × (Task.Item → BaseIO Unit)))
+    return cur
+  match w with
+  | some (_, cell, push) => Task.Join.resolveFirst cell push signum
+  | none => pure ()
+
+/-- **Watch a signal**: submit a one-shot or repeating watch to the loop and register the cell the shim's
+`EV_SIGNAL` resolves with the signum when it fires. The watch is a submission the loop applies on its own
+thread, like every other operation on it; the signal itself ends the loop's park, so no separate wake is needed. -/
+def signalWatch (signum : Nat) (repeating : Bool) (cell : Task.Join Int) (push : Task.Item → BaseIO Unit) :
+    IO Unit := do
+  signalWaiterRef.atomically do
+    set (some (signum, cell, push) : Option (Nat × Task.Join Int × (Task.Item → BaseIO Unit)))
+  let ok ← npUvSignalWatch signum.toUInt32 (if repeating then 1 else 0)
+  unless ok == 1 do
+    signalWaiterRef.atomically do set (none : Option (Nat × Task.Join Int × (Task.Item → BaseIO Unit)))
+    throw (IO.userError "Io.signalWatch: the shim refused the signal watch")
+
 /-- **Deliver one batch of shim events**, in the order the shim recorded them. An unrecognised kind, or an
 overflowed queue, is a defect in this file's contract with `c/netuv.c` rather than a connection's behaviour, so
 it throws and the loop thread dies loudly instead of continuing with a queue it cannot read. -/
@@ -313,6 +364,7 @@ private def dispatch (loop : Std.Mutex Table) (evs : Array UInt64) : IO Unit := 
     | 4 => opDone loop conn.toUInt32 (signed arg) .shutdown             -- shutdown completed
     | 5 => throw (IO.userError "Io: the shim's event queue overflowed; the loop was not being drained")
     | 6 => noSlot loop                                                  -- no free connection slot
+    | 7 => signalFired (signed conn)                                    -- a watched signal fired (signum in conn)
     | k => throw (IO.userError s!"Io: unknown libuv event kind {k}")
 
 /-- Pop every wheel entry whose deadline has passed, earliest first, leaving only future timers. The map is
@@ -326,88 +378,129 @@ private partial def popDue (wheel : Std.TreeMap Nat (Array WheelTimer)) (now : N
     else (wheel, acc)
   | none => (wheel, acc)
 
-/-- The loop thread: take the timers carriers scheduled into the wheel this thread owns, fire every one that
-has come due, re-arm the park timeout to the earliest remaining deadline, run one shim iteration, and drain
-what it recorded. The wheel is this thread's alone, so a timer is serviced by the same iteration that services
-socket completions — there is no deadline thread — and a busy run pays no shared lock to read it.
+/-- **Is a listener bound?** Whether the loop has accepted connections whose final bytes it owes — the exit
+flush's condition. -/
+def hasListener : IO Bool := return (← loopRef.get).isSome
 
-The wheel is a `TreeMap` ordered on the deadline, not a flat list. A run's `withTimeout` losers are never
-cancelled, so they accumulate — thousands of them under load — and the operation this thread needs each
-iteration is the *earliest* deadline (for the park timeout) plus the timers *already due*, both of which an
-ordered map answers in `O(log n)`. A flat list paid `O(n)` for the same two readings on every iteration, which
-is what put the latency and throughput regression in: the work grew with the count of *waiting* timers whether
-or not any was due.
+/-- **One pump of the I/O loop**, the loop's only driver. Drain the timers carriers scheduled into the wheel,
+fire every one that has come due, run one shim iteration parked on the earliest remaining deadline, and dispatch
+what it records to the bound listener's table if there is one. The single-carrier driver (`blockOnIo`) calls
+this on its idle step; the pump thread the multi-carrier and virtual-clock entries start loops on it — never
+both at once.
 
-The exit check runs under the queue's lock so it is serialised against `liveSchedule`: the shim's `2` means the
-loop was stopped and drained, so the thread exits even with timers outstanding (a stopping program abandons
-them); a `0` means nothing is armed, so a timer-only loop exits only once neither its wheel nor the queue holds
-a timer — otherwise it would strand the deadline it was started for. A `liveSchedule` that lands as the loop
-hands itself back (`loopRef` to `none`) starts a fresh one. -/
-private partial def loopIterate (loop : Std.Mutex Table) (wheel : Std.TreeMap Nat (Array WheelTimer)) : IO Unit := do
+`ownedWorkOnly` selects the nothing-to-drive test (see below): `blockOnIo`, which has taken the loop over,
+passes `true` so it parks unless its *own* executor has loop work; the pump passes `false` so it keeps serving a
+bound listener. Returns `false` when the loop was stopped (the shim's `2`) or when there is nothing to drive, so
+a driver with its own park can fall back to it; `true` after a real pump. -/
+def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   let now ← IO.monoNanosNow
   let fresh ← timerPending.atomically do
     let ps ← get
     set (#[] : Array WheelTimer)
     return ps
-  let wheel := fresh.foldl (fun w t =>
-    match w.get? t.deadline with
-    | some ts => w.insert t.deadline (ts.push t)
-    | none    => w.insert t.deadline #[t]) wheel
-  let (wheel, due) := popDue wheel now #[]
+  wheelRef.atomically do
+    modify (fun w => fresh.foldl (fun acc t =>
+      match acc.get? t.deadline with
+      | some ts => acc.insert t.deadline (ts.push t)
+      | none    => acc.insert t.deadline #[t]) w)
+  let due ← wheelRef.atomically do
+    let w ← get
+    let (w', due) := popDue w now #[]
+    set w'
+    return due
   for t in due do
     unless ← Task.Cancel.isSet t.cancel do
       t.fire
-  let nextDue := wheel.minKey?
+  -- Firing a timer enqueued its continuation on the executor's inject. If any fired, that work is ready now, so
+  -- harvest socket events *without* parking and return: the driver runs those continuations before it would
+  -- block again. Parking here instead is the hang — the poll cannot see the executor's queue.
+  if !due.isEmpty then
+    let active ← npUvRunNowait
+    match ← loopRef.get with
+    | some table => dispatch table (← npUvEvents)
+    | none => pure ()
+    return active != 2
+  let nextDue ← wheelRef.atomically do return (← get).minKey?
+  -- What counts as "nothing to drive" depends on the driver. The **pump** exists to serve a *bound* listener for
+  -- a driver that never takes the loop over (`blockOnWith`, the virtual-clock entries): it must keep pumping
+  -- while a listener is bound, because the accept that gives it work is registered by a task the pump itself
+  -- has not yet run — parking on an empty `parked` table here would strand that accept forever. The
+  -- **single-carrier driver** (`blockOnIo`) *has* taken the loop over, so a bound listener it does not own — one
+  -- a drained executor left behind — is not work for it: it must condvar-park on its own executor's empty
+  -- queues (a bare `Join` wait, like the handlebench's), not loop-park on another executor's listener, or a
+  -- reader of the parked count spins on it.
+  let nothing ← if ownedWorkOnly then
+      match ← loopRef.get with
+      | none => pure true
+      | some table => table.atomically do pure (← get).parked.isEmpty
+    else
+      pure !(← hasListener)
+  if nothing && nextDue.isNone then
+    return false
   let timeoutMs : UInt32 := match nextDue with
     | some d => if d > now then (max 1 ((d - now) / 1000000)).toUInt32 else 1
     | none => 0
   let active ← npUvRunOnceTimeout timeoutMs
-  dispatch loop (← npUvEvents)
-  let again ← timerPending.atomically do
-    if active == 2 || (active == 0 && wheel.isEmpty && (← get).isEmpty) then
-      loopRef.set none
-      return false
-    else
-      return true
-  if again then loopIterate loop wheel else pure ()
+  match ← loopRef.get with
+  | some table => dispatch table (← npUvEvents)
+  | none => pure ()
+  return active != 2
+
+/-- The pump thread's loop: drive until the loop is stopped or there is nothing left to drive, or until a
+single-carrier driver takes it over (`pumpQuitRef`). -/
+private partial def pumpLoop : IO Unit := do
+  if ← pumpQuitRef.get then pure ()
+  else if ← driveOnce false then pumpLoop else pure ()
+
+/-- **Take the loop over for a single-carrier driver.** A pump thread started before the driver began — by the
+listener bind or a scheduled timer — is asked to yield (it exits without stopping the loop), and the driver flag
+is set so nothing starts another pump while this driver runs. -/
+def takeover : IO Unit := do
+  driverActiveRef.set true
+  pumpQuitRef.set true
+  npUvWheelWake
+  match ← pumpRef.get with
+  | some t =>
+      let _ ← IO.wait t
+      pumpRef.set none
+  | none => pure ()
+  pumpQuitRef.set false
+
+/-- **Release the loop** when a single-carrier driver finishes: the flag is cleared so a later listener or timer
+can start a pump again. -/
+def releaseDriver : IO Unit := driverActiveRef.set false
+
+/-- **Start a pump thread** for an entry whose carriers do not drive the loop — the multi-carrier entry and the
+virtual-clock driver, whose carriers park on the executor's condvar while real sockets still need a thread on
+the loop. No-op while a single-carrier driver is active or a pump is already running. -/
+def ensurePump : IO Unit := do
+  if ← driverActiveRef.get then pure ()
+  else
+    match ← pumpRef.get with
+    | some _ => pure ()
+    | none   =>
+        let t ← IO.asTask pumpLoop _root_.Task.Priority.dedicated
+        pumpRef.set (some t)
 
 /-- **Schedule a fire at a monotone-nanosecond deadline.** Callable from any carrier: the entry is appended to
-the hand-off queue and the loop is woken so a deadline earlier than its current park is picked up at once. The
-loop thread is started here when this timer is the first thing to need one — a program that binds no listener
-still has its timers serviced — and the check-and-start runs under the queue's lock so two carriers cannot
-start two loop threads on the one libuv loop. The wake is load-bearing, not an optimisation: a timer scheduled
-while the loop is parked with nothing armed — a standalone sleep against an idle listener, SC11's shape —
-strands without it, so it is sent unconditionally rather than gated on a park state that could be read stale.
-`startListener` and `liveSchedule` are not serialised against each other: a process binds its listeners before
-it schedules timers, or schedules no timers — every scenario's shape. -/
+the hand-off queue, and the loop is woken so a deadline earlier than its current park is picked up at once. A
+pump is started only if no single-carrier driver is active — when one is, it drains the queue on its own idle
+step. The wake is load-bearing, not an optimisation: a timer scheduled while the loop is parked with nothing
+armed strands without it (SC11's shape), so it is sent unconditionally rather than gated on a park state that
+could be read stale. -/
 def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit := do
-  timerPending.atomically do
-    modify (·.push { deadline, cancel, fire })
-    match ← loopRef.get with
-    | some _ => pure ()
-    | none   => do
-        let table ← Std.Mutex.new ({} : Table)
-        let thread ← IO.asTask (loopIterate table Std.TreeMap.empty) _root_.Task.Priority.dedicated
-        loopRef.set (some { table, thread })
+  timerPending.atomically (modify (·.push { deadline, cancel, fire }))
+  unless ← driverActiveRef.get do ensurePump
   npUvWheelWake
 
-/-- **Stop the running loop**: fail everything parked, ask the shim to stop, and wait for the loop thread to
-drain. The order matters — the table is marked stopped *before* the shim is asked — so an operation that
-registers after this point is refused at registration rather than parked on a loop that is going away.
-
-Two callers, and the second is why this is public. `startListener` stops the previous loop before binding its own,
-which is where a retired listener's operations fail loudly instead of parking. And a **program** stops the loop
-before it returns: Lean's task manager waits for every dedicated task when it shuts the runtime down
-(`~task_manager` waits on `m_num_dedicated_workers`), and the loop thread is a dedicated task that would
-otherwise be parked in `uv_run` for as long as the listener exists — so a program that bound a listener and does
-not stop it here finishes its work and then hangs in the runtime's own shutdown. Nothing else in the runtime can
-close that: there is no exit hook to register, and a process-level signal keeps its default disposition because
-Lean's own signal machinery owns those (see `c/netuv.c`'s header). -/
+/-- **Stop the running loop**: fail everything parked, drop the queued and wheeled timers, ask the shim to stop,
+and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
+(and has finished) or nothing did, the stop-drain is run here, because no other thread will. -/
 def stop : IO Unit := do
   match ← loopRef.get with
   | none => pure ()
-  | some r => do
-      let parked ← r.table.atomically do
+  | some table => do
+      let parked ← table.atomically do
         let t ← get
         let ps := t.parked
         set { t with parked := [], arrived := [], stopped := true }
@@ -415,22 +508,25 @@ def stop : IO Unit := do
       for p in parked do
         Task.Join.resolveFirst p.cell p.push
           (.error (.userError "Io: the libuv loop was stopped while an operation was parked"))
-      -- Drop timers carriers scheduled but the loop has not yet taken, before the shim is asked to stop: the
-      -- loop thread is about to abandon the wheel it owns (the shim's `2` retires it), so a timer left queued
-      -- here would otherwise sit unclaimed. Their waiters are a stopping program's own; nothing resumes them.
       timerPending.atomically (set (#[] : Array WheelTimer))
+      wheelRef.atomically (set (Std.TreeMap.empty : Std.TreeMap Nat (Array WheelTimer)))
       npUvStop
-      match ← IO.wait r.thread with
-      | .ok _    => pure ()
-      | .error e => throw e
+      match ← pumpRef.get with
+      | some t =>
+          let _ ← IO.wait t
+          pumpRef.set none
+      | none =>
+          let mut active ← npUvRunOnceTimeout 0
+          while active == 1 do
+            active ← npUvRunOnceTimeout 0
       loopRef.set none
 
-/-- **Bind a listener and start its loop.** The port must be an IPv4 loopback one: the shim binds `127.0.0.1`
-itself, so a different address is refused loudly rather than silently binding loopback. `backlog` is carried for
-the caller's signature and does not reach the shim, whose listen backlog is libuv's own argument.
+/-- **Bind a listener.** The port must be an IPv4 loopback one: the shim binds `127.0.0.1` itself, so a different
+address is refused loudly rather than silently binding loopback. A running loop is stopped first (`stop`), and
+every published operation on its listener and its connections then fails rather than hanging.
 
-A running loop is stopped first (`stop`), and every published operation on its listener and its connections
-then fails rather than hanging. -/
+A pump thread is started to drive the loop only if no single-carrier driver is active; when one is — the server
+under `Runtime.run` — it drives the loop itself and no second thread is started. -/
 def startListener (addr : Std.Net.SocketAddress) (_backlog : UInt32) : IO Listener := do
   let port ← match addr with
     | .v4 a =>
@@ -444,8 +540,8 @@ def startListener (addr : Std.Net.SocketAddress) (_backlog : UInt32) : IO Listen
   if bound == 0 then
     throw (IO.userError s!"Io.startListener: could not bind 127.0.0.1:{port}")
   let table ← Std.Mutex.new ({} : Table)
-  let thread ← IO.asTask (loopIterate table Std.TreeMap.empty) _root_.Task.Priority.dedicated
-  loopRef.set (some { table := table, thread := thread })
+  loopRef.set (some table)
+  unless ← driverActiveRef.get do ensurePump
   return ⟨.v4 ⟨⟨#v[127, 0, 0, 1]⟩, bound.toUInt16⟩, table⟩
 
 /-- The address this listener is bound to — the one libuv reported at bind time, so an ephemeral port is the one

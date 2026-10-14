@@ -168,7 +168,8 @@ private partial def serveUntilStoppedLoop (hooks : Hooks) (e : Sched.Executor Ta
     (clock : Clock) (interval : Std.Time.Millisecond.Offset) (body : Conn → Task.EAsync IO.Error Unit)
     (reg : Task.Registry (Except IO.Error Unit)) : Task.EAsync IO.Error Unit := do
   if ← monadLift (e.isStopping : IO Bool) then
-    Task.EAsync.ofAsync (Task.Registry.drain reg)
+    Task.EAsync.ofAsync (do
+      Task.Registry.drain reg)
   else
     match ← monadLift (Listener.tryAccept l : IO (Option Conn)) with
     | some client =>
@@ -176,7 +177,8 @@ private partial def serveUntilStoppedLoop (hooks : Hooks) (e : Sched.Executor Ta
       monadLift (Task.Registry.add reg h)
       serveUntilStoppedLoop hooks e l clock interval body reg
     | none =>
-      Task.EAsync.ofAsync (sleep clock interval)
+      Task.EAsync.ofAsync (do
+        sleep clock interval)
       serveUntilStoppedLoop hooks e l clock interval body reg
 
 /-- **Accept until the executor is stopping, then finish what is in flight and return.**

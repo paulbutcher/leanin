@@ -3162,7 +3162,8 @@ def runtimeService (bound : Nat) : IO UInt32 := do
     let a ← Runtime.Listener.sockName (← keep.get)
     addrRef.set (some a)
     startAt.set (← IO.monoNanosNow)
-    Runtime.serveBounded hooks (← keep.get) bound n body)) _root_.Task.Priority.dedicated
+    let r ← Runtime.serveBounded hooks (← keep.get) bound n body
+    return r)) _root_.Task.Priority.dedicated
   let addr ← do
     let mut a : Option Std.Net.SocketAddress := none
     while a.isNone do a ← addrRef.get
