@@ -1,7 +1,15 @@
 import LeanIn
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
+import LeanIn.Runtime.VMHttp
 open LeanIn
+
+/-- The echo handler, shared across modes. -/
+def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :=
+  let body := s!"hello from leanin\nmethod={head.method} path={head.uri} version={head.version}\n".toUTF8
+  let headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
+      (Std.Http.Header.Value.ofString! (toString body.size))
+  ({ status := .ok, version := .v11, headers }, body)
 
 /-- CPS echo: read, write back, recurse — every step through the `Join`-cell delivery (park, `Item`, carrier). -/
 partial def cpsEcho (hooks : Runtime.Hooks) (c : Runtime.Conn) : Task.EAsync IO.Error Unit := do
@@ -24,6 +32,8 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (Runtime.Io.defuncEcho c)
   else if mode == "vm" then
     monadLift (Runtime.VM.run (vmEcho c))
+  else if mode == "vmhttp" then
+    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c {} reply))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode

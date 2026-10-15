@@ -644,6 +644,12 @@ def sendRaw (c : Conn) (data : ByteArray) (resume : IO Unit) : IO Unit := do
 /-- **Close, raw** (experiment): close the connection's handle on the loop thread. -/
 def closeRaw (c : Conn) : IO Unit := discard (npUvClose c.idx)
 
+/-- **Send all chunks, raw** (experiment): a vectored write whose completion runs on the loop thread. -/
+def sendAllRaw (c : Conn) (chunks : Array ByteArray) (resume : IO Unit) : IO Unit := do
+  registerRaw c.idx .write (fun _ => resume)
+  unless (← npUvWritev c.idx chunks) != 0 do
+    pure ()
+
 /-- **A defunctionalized echo** (experiment): read the bytes, write them back, read again — every step a raw
 completion running on the loop thread. `partial` because a connection has no bound. -/
 partial def defuncEcho (c : Conn) : IO Unit :=
