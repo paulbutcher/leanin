@@ -2,6 +2,7 @@ import LeanIn
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
 import LeanIn.Runtime.VMHttp
+import LeanIn.Runtime.SmEcho
 open LeanIn
 
 /-- The echo handler, shared across modes. -/
@@ -36,6 +37,10 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 12000 {} reply))
   else if mode == "vmhttpS" then
     monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 400 {} reply))
+  else if mode == "smecho" then
+    monadLift (Runtime.SmEcho.spawnEchoStep (.reading c))
+  else if mode == "smdirect" then
+    monadLift (Runtime.SmEcho.directEchoStep (.reading c))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode

@@ -5,23 +5,71 @@ import LeanIn.Runtime.Clock
 /-!
 # A defunctionalizing task monad (experiment)
 
-`VM` is a free machine over the socket effects. A client writes ordinary `do` — it elaborates through the
-`Monad` instance into this data representation — and the incremental interpreter drives it by **raw loop-thread
-resume**: each effect's continuation runs *directly* in the completion, with no `Join` cell, `Item`, inject or
-carrier fire. A client's own `←` continuations become machine data delivered directly, rather than being
-re-wrapped through the generic completion path every suspension. It is the client-side half of the
-defunctionalization the raw echo measured: the client writes `do`, the engine resumes a machine.
+`VM` is a free machine over the engine's effects — reactor (`recv`/`send`/`sendAll`/`close`), timers
+(`recvTimeout`), and **tasks** (`spawn`/`await`/`race`). A client writes ordinary `do`; the incremental
+interpreter drives it by **raw resume**: socket completions on the loop thread, task completions through a raw
+cell, never a `Join`/`Item`/inject.
 
-The representation is a GADT with an explicit `then` node: `Monad.bind` is a constructor (O(1), structural),
-and the interpreter carries its own continuation (`runK`) to thread values through it. The effects are the
-socket operations; `sleep`/`spawn`/`select` are the later items that make it a concurrency engine rather than an
-echo.
+`spawn`/`await`/`race` make it a concurrency engine rather than a socket driver. On a single carrier they are
+*cooperative*: a spawned machine's effects resume on the same loop thread as the parent's, and its completion
+resolves a raw cell the awaiter is parked on — no second carrier, no parallelism, the single-carrier design.
+
+**The same-type shape.** `spawn`/`await`/`race` are uniform at `α` — the spawned machine, its cell, and the
+parent share one result type. That is the form a *parameterized* `VM α` admits without an existential: a fully
+general `spawn : VM β → VM (RawCell β)` needs an indexed `VM : Type → Type` whose existential constructors hit
+Lean's predicativity wall (an indexed free monad whose effects bind types and mention the monad or functions
+into it), which this session's attempts confirmed is a real obstacle, not a naming detail. The same-type form
+covers the common concurrency patterns — spawn a handler and join it, race two computations of one type —
+which is most of what a connection loop does. A worker producing a *different* type writes it into a shared
+cell the parent owns, returning `Unit` both ways.
+
+The representation is the parameterized free machine: `Monad.bind` is `partial` (O(depth) re-wrap, fine for
+connection loops), and `runK` interprets incrementally by raw resume.
 -/
 
 namespace LeanIn.Runtime
 
-/-- A defunctionalized computation. `pure`/`then` are the monad; `recv`/`send`/`close` are the effect nodes,
-whose continuation is the *next machine*, not a CPS closure re-wrapped per bind. -/
+/-- **A raw completion cell**: a result slot plus the raw waiters to run on resolution, first-wins. The task
+analogue of the socket layer's raw delivery — a `resolve` runs its waiters directly on the resolving thread,
+never through a `Join` cell's `Item`.
+
+**Single-carrier, so a plain `IO.Ref`, not a mutex.** Every access — a spawned machine's `resolve` on
+completion, a parent's `await` — runs on the one carrier thread, so there is no contention to exclude. And it
+is correct, not merely cheaper: a carrier's step runs to its next effect without yielding, so the
+read-modify-write in `resolve`/`await` is atomic on that thread — no other computation can interleave between
+the `get` and the `set`. A `Std.Mutex` would buy an atomic lock for a race that cannot occur, and would
+misstate the design (it would imply a second thread could hold the cell). If the engine ever grows a second
+carrier, this becomes a mutex again; today it is not. -/
+structure RawCellState (α : Type) where
+  result : Option α := none
+  waiters : List (α → IO Unit) := []
+
+structure RawCell (α : Type) where
+  state : IO.Ref (RawCellState α)
+
+namespace RawCell
+
+def new : IO (RawCell α) := return ⟨← IO.mkRef {}⟩
+
+/-- Resolve, first-wins: a later resolve is ignored (a race's loser, or a redundant completion). -/
+def resolve (cell : RawCell α) (v : α) : IO Unit := do
+  let st ← cell.state.get
+  match st.result with
+  | some _ => pure ()
+  | none   =>
+    cell.state.set { st with result := some v, waiters := [] }
+    for w in st.waiters do w v
+
+/-- Park a raw waiter, or run it now if the cell already holds a value. -/
+def await (cell : RawCell α) (resume : α → IO Unit) : IO Unit := do
+  let st ← cell.state.get
+  match st.result with
+  | some v => resume v
+  | none   => cell.state.set { st with waiters := st.waiters ++ [resume] }
+
+end RawCell
+
+/-- A defunctionalized computation. -/
 inductive VM (α : Type) where
   | pure (v : α)
   | recvE (c : Conn) (k : Option ByteArray → VM α)
@@ -60,10 +108,8 @@ def send (c : Conn) (bs : ByteArray) : VM Unit := .sendE c bs (.pure ())
 def sendAll (c : Conn) (chunks : Array ByteArray) : VM Unit := .sendAllE c chunks (.pure ())
 def close (c : Conn) : VM Unit := .closeE c (.pure ())
 
-/-- **The incremental interpreter**, in continuation-passing form so `then` threads its value. Each effect
-resumes by a raw loop-thread completion — the continuation runs *in* the completion, so a client's next step is
-delivered directly rather than scheduled through a cell and an item. `partial` because a connection loop has no
-bound: the recursion rides the lazy machine the client builds. -/
+/-- **The incremental interpreter**, in continuation-passing form. `partial` because a connection loop has no
+bound. -/
 partial def runK : VM α → (α → IO Unit) → IO Unit
   | .pure v, k      => k v
   | .recvE c kk, k   => Io.recvRaw c 65536 (fun r => runK (kk r) k)
@@ -75,6 +121,9 @@ partial def runK : VM α → (α → IO Unit) → IO Unit
 
 /-- **Run a connection loop** (fire-and-forget: the result is `Unit`). -/
 def run (m : VM Unit) : IO Unit := runK m (fun _ => (Pure.pure () : IO Unit))
+
+/-- **Run a machine to a raw cell** (drive it, resolve the cell on completion). -/
+def runToCell (m : VM α) (cell : RawCell α) : IO Unit := runK m (fun v => RawCell.resolve cell v)
 
 end VM
 
