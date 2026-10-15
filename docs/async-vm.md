@@ -8,8 +8,11 @@ transitions, threads the H1 machine across requests as a field, and routes const
 deadline, the handler) to **step parameters** like the connection. Validated end-to-end (GET, keep-alive, POST
 bodies, concurrent connections, **partial-read reassembly**, the **stall deadline**) and benchmarked: **~20×
 faster than the shipped `Std.Http.Server`** and **C=1 at/ahead of Node parity** (below). Pieces 1–2 (raw
-delivery, the `VM`) validated earlier. The remaining engine gaps are async handlers (the handler's own `await`)
-and `loop`.
+delivery, the `VM`) validated earlier. The handler is now a **`VM` computation** (`Head → VM (Response.Head ×
+ByteArray)`), so it may suspend — read a backend, wait — and its suspension joins the connection's machine
+through `VM.runAsync` (a fresh `RawCell` the sub-computation resolves); a handler that is pure is answered
+inside `pump` with no cell and no state hop, so the common case pays nothing for the async machinery being
+available. The remaining engine gap is `loop`.
 
 ## Goal
 
