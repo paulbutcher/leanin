@@ -48,3 +48,7 @@ moreLinkArgs = ["-lnetuv", "-luv"]
 name = "stdServer"
 root = "StdServer"
 moreLinkArgs = ["-luv"]
+
+[[lean_exe]]
+name = "h1bench"
+root = "H1Bench"

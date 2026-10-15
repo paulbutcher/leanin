@@ -1073,18 +1073,16 @@ def runtimeHttp : IO UInt32 := do
   -- deadline. The machine still sees `h1` alone, so no `Server` agent and no clock value can enter the encoder,
   -- and the response the client reads is a function of the request and the pinned head alone.
   let cfg : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks }
-  let respHead : Std.Http.Response.Head :=
-    { status := .ok, version := .v11,
-      headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
-        (Std.Http.Header.Value.ofString! "5") }
-  statusRef.set respHead.status.toCode.toNat
+  let respHead : Http.H1.ResponseHead :=
+    { status := 200, reason := "OK", headers := #[("Content-Length", "5")] }
+  statusRef.set respHead.status
   -- Our handler: it records the thread it ran on and answers with the pinned head and body. `serveConn` awaits
   -- it inline, so the thread it reads is the carrier the connection runs on.
   let handler : Runtime.Http.Handler := fun head => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids.modify (· ++ [tid]) : IO Unit)
     monadLift (methodRef.set (toString head.method) : IO Unit)
-    monadLift (uriRef.set (toString head.uri) : IO Unit)
+    monadLift (uriRef.set head.targetString : IO Unit)
     return (respHead, pinnedBody)
   -- the control: the pool holds work only until a carrier takes it, so the reader is shown a queue nothing is
   -- draining. These three no-op items are taken first when the driver starts, and they change nothing else.
@@ -1212,11 +1210,13 @@ Diagnostic: `lake exe controls --runtime-http-service`. -/
 def runtimeHttpService : IO UInt32 := do
   let request : ByteArray := "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".toUTF8
   let pinnedBody : ByteArray := "hello".toUTF8
-  let respHead : Std.Http.Response.Head :=
+  let wireHead : Std.Http.Response.Head :=
     { status := .ok, version := .v11,
       headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
         (Std.Http.Header.Value.ofString! "5") }
-  let expected := encodedResponse request respHead pinnedBody
+  let respHead : Http.H1.ResponseHead :=
+    { status := 200, reason := "OK", headers := #[("Content-Length", "5")] }
+  let expected := encodedResponse request wireHead pinnedBody
   let clientBound : Std.Time.Millisecond.Offset := 5000
   let clientTid ← IO.getTID
 

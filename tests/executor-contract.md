@@ -1427,12 +1427,12 @@ distinct-thread detector counts two on a two-distinct sample and collapses a rep
 value the `Then` wants.
 
 **Why.** A server that has to run on our carriers owns its loop, and that loop is the deliverable: a driver of
-ours over `Std.Http.Protocol.H1`'s machine, whose accept loop is reused from `Net.lean`. The two things checkable
+ours over `LeanIn.Http.H1`'s machine, whose accept loop is reused from `Net.lean`. The two things checkable
 from outside are the bytes the peer read and *where* the work ran, and a thread identity is the only way to check
 the second. The byte comparison is what keeps the first honest — a runtime that answered from another protocol
 version, another framing or another body could still report a plausible status line. The limits are this
 milestone's: one request per connection, no request or response body beyond the `Content-Length`-framed literal,
-no TLS, no routing, and keep-alive only as `H1.Config` gives it. The driver bounds each wait for request bytes
+no TLS, no routing, and keep-alive only as `LeanIn.Http.H1.Limits` gives it (`maxMessages`, the keep-alive quota it shares with the parser it replaces). The driver bounds each wait for request bytes
 with `Config.stallTimeout` through `Runtime.withTimeout` (D20), so this scenario's single read is bounded like every
 other read, and the losing timer that bound leaves is the relic noted above.
 
@@ -1448,7 +1448,7 @@ server side is `Runtime.Http.serveConn` under `Runtime.serveNJoin`, the accept l
 `lake exe controls --runtime-http-service`. The listener is bound by the invocation itself
 (`Runtime.loopback 0`), so the socket is inside the boundary rather than an external service. No fake transport,
 no faked clock reading and no network service is involved: the sockets are real, the accepted connections are
-real, the machine is the protocol's own, and the only non-production device is `HarnessClock` in clause three,
+real, the machine is `LeanIn.Http.H1`'s — the connection driver's own parser and machine, not a fake — and the only non-production device is `HarnessClock` in clause three,
 which SC17's clause three already uses.
 
 **When.** One invocation runs three clauses, each with its own listener and its own run.

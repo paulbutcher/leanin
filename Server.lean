@@ -19,15 +19,14 @@ absence is recorded in the runtime's own docstring as W7's, not hidden here.
 -/
 
 open LeanIn
+open LeanIn.Http
 
 /-- The reply to any request: the method, path and version echoed back in a small body. -/
-def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :=
+def reply (head : H1.Head) : H1.ResponseHead × ByteArray :=
   let body :=
-    s!"hello from leanin\nmethod={head.method} path={head.uri} version={head.version}\n".toUTF8
-  let headers :=
-    Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
-      (Std.Http.Header.Value.ofString! (toString body.size))
-  ({ status := .ok, version := .v11, headers }, body)
+    s!"hello from leanin\nmethod={head.method} path={head.targetString} version={head.version}\n".toUTF8
+  let headers := #[("Content-Length", toString body.size)]
+  ({ status := 200, reason := "OK", headers }, body)
 
 /-- Report the counters the executor already keeps, every 20 000 requests. `taken` is cumulative items served —
 every worker's pool plus the shared cell's — so `taken / requests` is the number of scheduling round-trips one
@@ -53,8 +52,10 @@ def main (args : List String) : IO UInt32 := do
   let workers := 1
   let e ← Sched.Executor.new LeanIn.Task.Item 256 workers
   let bigstall := args.contains "bigstall"
+  -- `maxMessages` bumped far past the default 100 so keep-alive is not closed mid-benchmark, as the client
+  -- harness (one connection, sequential keep-alive) would otherwise measure only the first 100 exchanges.
   let cfg : Runtime.Http.Config :=
-    { h1 := {}, clock := Runtime.Clock.live hooks,
+    { h1 := { maxMessages := 1000000000 }, clock := Runtime.Clock.live hooks,
       stallTimeout := if bigstall then 3600000 else 12000 }
   let quiet := args.contains "quiet"
   -- `metrics` reports, every 20 000 requests, the counters the executor already keeps: `taken` is cumulative
@@ -67,10 +68,8 @@ def main (args : List String) : IO UInt32 := do
   -- formatting the echoed body per request.
   let static := args.contains "static"
   let staticBody : ByteArray := "hello from leanin\nmethod=GET path=/bench version=HTTP/1.1\n".toUTF8
-  let staticHead : Std.Http.Response.Head :=
-    { status := .ok, version := .v11,
-      headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
-        (Std.Http.Header.Value.ofString! (toString staticBody.size)) }
+  let staticHead : H1.ResponseHead :=
+    { status := 200, reason := "OK", headers := #[("Content-Length", toString staticBody.size)] }
   let handler : Runtime.Http.Handler := fun head => do
     if metrics then
       monadLift (reportMetrics e hooks served metricsT0)
@@ -80,7 +79,7 @@ def main (args : List String) : IO UInt32 := do
       pure ()
     else
       let tid ← monadLift (IO.getTID : IO UInt64)
-      monadLift (IO.println s!"  {head.method} {head.uri} -> 200, on carrier {tid}")
+      monadLift (IO.println s!"  {head.method} {head.targetString} -> 200, on carrier {tid}")
     return reply head
   IO.println s!"leanin server listening on {addr}"
   let prog : LeanIn.Task.EAsync IO.Error Unit :=

@@ -1,5 +1,5 @@
-import Std.Http.Protocol.H1
 import Std.Http.Data
+import LeanIn.Http.H1
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Leaf
 import LeanIn.Runtime.Time
@@ -49,20 +49,22 @@ goes away mid-request ends the connection as an `error`. A failed socket operati
 loop and past `Conn.shutdown`; a *handler* failure no longer does, because it is answered inside the loop.
 -/
 
+open LeanIn.Http
+
 namespace LeanIn.Runtime.Http
 
 /-- A request handler of ours: the parsed request head to the response head and its fully-buffered body, in
 our task monad. A plain function rather than the shipped `Handler` class: the class's other members are
 streaming and 100-continue concerns this driver does not carry yet, while the call shape — dispatch on the
 parsed request head, return the response — is the same. -/
-abbrev Handler := Std.Http.Request.Head → Task.EAsync IO.Error (Std.Http.Response.Head × ByteArray)
+abbrev Handler := H1.Head → Task.EAsync IO.Error (H1.ResponseHead × ByteArray)
 
 /-- **The driver's own configuration**: the protocol's limits, the clock the read deadline is read from, and the
 deadline itself. `h1` is handed to the machine unchanged and is the only thing that reaches it; the clock is
 read by `withTimeout` alone, so no clock value — and therefore no `Date` header — can enter the encoder. -/
 structure Config where
   /-- The protocol's limits, defaults and all. -/
-  h1           : Std.Http.Protocol.H1.Config := {}
+  h1           : H1.Limits := {}
   /-- The clock `stallTimeout` is measured on. -/
   clock        : Clock
   /-- The longest a single read may wait for bytes or EOF. -/
@@ -80,7 +82,7 @@ even a machine the driver cannot advance cannot hold a carrier indefinitely.
 
 `partial` because a connection has no bound, and `Async` is `Inhabited`; the recursion is the loop. -/
 private partial def drive (hooks : Hooks) (cfg : Config) (c : Conn) (handler : Handler)
-    (machine : Std.Http.Protocol.H1.Machine .receiving) : Task.EAsync IO.Error Unit := do
+    (machine : H1.Machine) : Task.EAsync IO.Error Unit := do
   let (machine', step) := machine.step
   if step.output.size > 0 then
     Conn.sendAll c hooks step.output.data
@@ -93,17 +95,17 @@ private partial def drive (hooks : Hooks) (cfg : Config) (c : Conn) (handler : H
       let answered ← try
           let (respHead, body) ← handler head
           machine := machine.send respHead
-            |>.sendData #[Std.Http.Chunk.ofByteArray body]
+            |>.sendData #[body]
             |>.userClosedBody
           pure true
         catch _ => pure false
       if !answered then
-        machine := machine.closeWithError .internalServerError
+        machine := machine.closeWithError 500
     | _ => pure ()
   if machine.halted then
     pure ()
   else if step.output.size > 0 || step.events.any (fun e => match e with
-      | .needMoreData _ => false
+      | .needMoreData => false
       | _ => true) then
     drive hooks cfg c handler machine
   else
@@ -125,7 +127,7 @@ any `Std.Http.Transport` instance — `Transport` is typed over `Async`, which w
 socket and put the work back on the pool. -/
 def serveConn (hooks : Hooks) (config : Config) (c : Conn) (handler : Handler) :
     Task.EAsync IO.Error Unit := do
-  drive hooks config c handler ({ config := config.h1 } : Std.Http.Protocol.H1.Machine .receiving)
+  drive hooks config c handler ({ limits := config.h1 } : H1.Machine)
   Conn.shutdown c hooks
 
 end LeanIn.Runtime.Http
