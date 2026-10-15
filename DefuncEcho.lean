@@ -48,6 +48,15 @@ asyncMachine amHttp (c : LeanIn.Runtime.Conn) := do
   await (LeanIn.Runtime.Io.sendAllRaw c out)
   recurse
 
+-- A loop as a state machine: send `msg0..msg2` (each an `await`), then close — the loop counter `i` is the
+-- loop state's field, threaded across iterations. Exercises `while` in `asyncMachine`.
+asyncMachine amLoop (c : LeanIn.Runtime.Conn) := do
+  let i : Nat := 0
+  while i < 3 do
+    await (LeanIn.Runtime.Io.sendAllRaw c #[s!"msg{i}\n".toUTF8])
+    let i := i + 1
+  await (LeanIn.Runtime.Io.closeRaw c)
+
 /-- CPS echo: read, write back, recurse — every step through the `Join`-cell delivery (park, `Item`, carrier). -/
 partial def cpsEcho (hooks : Runtime.Hooks) (c : Runtime.Conn) : Task.EAsync IO.Error Unit := do
   try
@@ -81,6 +90,8 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (amEcho.run c)
   else if mode == "amhttp" then
     monadLift (amHttp.run c)
+  else if mode == "loop" then
+    monadLift (amLoop.run c)
   else if mode == "serveconn" then
     -- `maxMessages` bumped far past the default 100 so a keep-alive connection is not closed mid-benchmark
     -- (Node applies no per-connection request cap); the H1 machine threads the count across requests.

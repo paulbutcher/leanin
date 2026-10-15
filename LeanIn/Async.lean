@@ -33,12 +33,14 @@ open Lean Lean.Macro Lean.Parser.Term
 
 /-- A parsed do-item: a node in the body's tree. `contStmt` is internal — a hoisted continuation marker. -/
 private inductive Item where
-  | pureBind (pat : Syntax) (term : Syntax)      -- `let <pat> := e`
+  | pureBind (pat : Syntax) (ty? : Option Term) (term : Syntax)  -- `let <pat> := e` / `let <pat> : T := e`
   | pureStmt (term : Syntax)                     -- a bare `e`
   | await (bound? : Option Name) (term : Syntax) -- `let x := await e` / `await e`
   | if_ (cond : Syntax) (then_ else_ : List Item)
   | match_ (scrut : Syntax) (arms : List (Syntax × List Item))
+  | while_ (cond : Syntax) (body : List Item)    -- `while c do body`
   | recurse
+  | goto (idx : Nat) (args : List Name)          -- internal: jump to a specific state
   | contStmt (term : Term)                       -- internal: a hoisted continuation
   deriving Inhabited
 
@@ -69,8 +71,9 @@ private partial def parseItem (d : Syntax) : MacroM Item := do
   match d with
   | `(doElem| let $x:ident := await $e) => return .await (some x.getId) e
   | `(doElem| await $e) => return .await none e
-  | `(doElem| let $x:ident := $e) => return .pureBind x e
-  | `(doElem| let $p:term := $e) => return .pureBind p e   -- destructuring `let (a, b) := e`
+  | `(doElem| let $x:ident : $ty:term := $e) => return .pureBind x (some ⟨ty⟩) e
+  | `(doElem| let $x:ident := $e) => return .pureBind x none e
+  | `(doElem| let $p:term := $e) => return .pureBind p none e   -- destructuring `let (a, b) := e`
   | `(doElem| if $c:term then $t:doSeq else $e:doSeq) =>
     return .if_ c (← parseItems t) (← parseItems e)
   | `(doElem| if $c:term then $t:doSeq) =>
@@ -79,6 +82,8 @@ private partial def parseItem (d : Syntax) : MacroM Item := do
     -- Keep each `matchAlt` node whole; its body (arg 3) is parsed into items, its pattern (arg 1) is reused verbatim.
     let arms ← (matchAltNodesOf alts.raw).mapM (fun nd => do pure (nd, ← parseItems (nd.getArg 3)))
     return .match_ s arms
+  | `(doElem| while $c:term do $b:doSeq) =>
+    return .while_ c (← parseItems b)
   | `(doElem| recurse) => return .recurse
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"asyncMachine: unsupported do-item: {d}"
@@ -130,12 +135,14 @@ private partial def usedInItems (items : List Item) : List Name :=
   items.flatMap go
 where
   go : Item → List Name
-  | .pureBind _ e => usedNames e
+  | .pureBind _ _ e => usedNames e
   | .pureStmt e => usedNames e
   | .await _ e => usedNames e
   | .if_ c t e => usedNames c ++ usedInItems t ++ usedInItems e
   | .match_ s arms => usedNames s ++ arms.flatMap (fun (_, b) => usedInItems b)
+  | .while_ c b => usedNames c ++ usedInItems b
   | .recurse => []
+  | .goto _ args => args
   | .contStmt _ => []
 
 /-- The names **rebound** by `let x := …` in a list of items (recursively). A parameter that is rebound becomes
@@ -146,9 +153,10 @@ private partial def boundInItems (items : List Item) : List Name :=
   items.flatMap go
 where
   go : Item → List Name
-  | .pureBind pat _ => patBoundNames pat
+  | .pureBind pat _ _ => patBoundNames pat
   | .if_ _ t e => boundInItems t ++ boundInItems e
   | .match_ _ arms => arms.flatMap (fun (_, b) => boundInItems b)
+  | .while_ _ b => boundInItems b
   | _ => []
 
 /-- Whether a list of items suspends anywhere (decides inline-vs-new-state for a continuation). -/
@@ -157,6 +165,7 @@ private partial def hasAwait (items : List Item) : Bool :=
     | .await .. => true
     | .if_ _ t e => hasAwait t || hasAwait e
     | .match_ _ arms => arms.any (fun (_, b) => hasAwait b)
+    | .while_ _ b => hasAwait b
     | _ => false
 
 /-- A variable's binding, for field-type inference. -/
@@ -165,6 +174,7 @@ private inductive Bind where
   | threaded (ty : Term)          -- a threaded parameter (its signature type)
   | recvRes                       -- `recvRaw` result ⇒ `ByteArray`
   | recvTimeoutRes                -- `recvTimeoutRaw` result ⇒ `Option (Option ByteArray)`
+  | typed (ty : Term)             -- a pure binding with an ascription ⇒ its type
   | pureB                         -- pure-bound ⇒ inferred from use
 
 /-- A generated state: its index, its (typed) fields, and its body. -/
@@ -185,6 +195,10 @@ private abbrev CompileM := StateT (Nat × List GenState) MacroM
 existing binding — and its type; a genuinely new name is `.pureB` (its type inferred from use). -/
 private def extendScope (scope : List (Name × Bind)) (names : List Name) : List (Name × Bind) :=
   names.foldl (fun sc x => if sc.any (fun (n, _) => n == x) then sc else sc ++ [(x, .pureB)]) scope
+
+/-- As `extendScope`, but a genuinely new name takes binding `b` (an ascribed pure bind). -/
+private def extendScopeB (scope : List (Name × Bind)) (names : List Name) (b : Bind) : List (Name × Bind) :=
+  names.foldl (fun sc x => if sc.any (fun (n, _) => n == x) then sc else sc ++ [(x, b)]) scope
 
 private def freshIdx : CompileM Nat := do
   let (n, ss) ← get
@@ -214,6 +228,7 @@ where
      | _ => false)
   | .if_ _ t e => usesSendArg f t || usesSendArg f e
   | .match_ _ arms => arms.any (fun (_, b) => usesSendArg f b)
+  | .while_ _ b => usesSendArg f b
   | _ => false
 
 /-- Whether a pure-bound variable is used as an `if`-condition in the items. -/
@@ -223,6 +238,7 @@ where
   go : Item → Bool
   | .if_ c t e => (c.isIdent && c.getId == f) || usedAsCond f t || usedAsCond f e
   | .match_ _ arms => arms.any (fun (_, b) => usedAsCond f b)
+  | .while_ _ b => usedAsCond f b
   | _ => false
 
 /-- Whether a syntax subtree contains a reference to `f`. Application arguments are nested syntax nodes in
@@ -241,12 +257,13 @@ private partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Optio
 where
   sameName (a b : Name) : Bool := a.eraseMacroScopes == b.eraseMacroScopes
   goItem : Item → Option Term
-  | .pureBind _ e => goTerm e
+  | .pureBind _ _ e => goTerm e
   | .pureStmt e => goTerm e
   | .await _ e => goTerm e
   | .if_ c t e => (goTerm c).orElse (fun _ => findFnArg ctx f t |>.orElse (fun _ => findFnArg ctx f e))
   | .match_ s arms =>
     (goTerm s).orElse (fun _ => arms.foldl (fun a (_, b) => a.orElse (fun _ => findFnArg ctx f b)) none)
+  | .while_ c b => (goTerm c).orElse (fun _ => findFnArg ctx f b)
   | _ => none
   goTerm (s : Syntax) : Option Term :=
     match s with
@@ -271,6 +288,7 @@ private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : 
   | .threaded ty => pure ty
   | .recvRes => `($(mkIdent `ByteArray))
   | .recvTimeoutRes => `(Option (Option ByteArray))
+  | .typed ty => pure ty
   | .conn => Macro.throwError s!"asyncMachine: the connection `{f}` cannot be a state field"
   | .pureB =>
     if usesSendArg f rest then `(Array ByteArray)
@@ -331,11 +349,14 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
   | .recurse :: rest => do
     unless rest.isEmpty do Macro.throwError "asyncMachine: `recurse` must end a path"
     recurseTerm ctx
-  | .pureBind pat e :: rest => do
+  | .pureBind pat ty? e :: rest => do
     unless pat.isIdent do
       Macro.throwError "asyncMachine: destructuring `let` is not supported yet — bind components separately (e.g. `let out := t.2.1`)"
-    let inner ← compileBody ctx rest (extendScope scope (patBoundNames pat))
-    `(let $(⟨pat⟩) := $(⟨e⟩); $inner)
+    let b := match ty? with | some t => Bind.typed t | none => Bind.pureB
+    let inner ← compileBody ctx rest (extendScopeB scope (patBoundNames pat) b)
+    match ty? with
+    | some t => `(let $(⟨pat⟩) : $t := $(⟨e⟩); $inner)
+    | none => `(let $(⟨pat⟩) := $(⟨e⟩); $inner)
   | .pureStmt e :: rest => do
     let inner ← compileBody ctx rest scope
     `(let _ := $(⟨e⟩); $inner)
@@ -372,6 +393,24 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
       | _ => Macro.throwError "asyncMachine: malformed match alternative")
     let scrut : Term := ⟨s⟩
     `(match $scrut:term with $armTerms:matchAlt*)
+  | .while_ c body :: rest => do
+    -- The loop head is a fresh state L, and the current position jumps to it. L's body is
+    -- `if c then (body; goto L) else rest`, so a false condition falls through to the code after the loop, and a
+    -- true one runs the body and loops. L carries the loop variables — those in scope and used in the
+    -- condition, the body, or after the loop — which thread across iterations like any other state's fields.
+    let lIdx ← freshIdx
+    let all : List Item := .while_ c body :: rest
+    let used := (usedInItems all).map (·.eraseMacroScopes)
+    let loopScope := scope.filter (fun (n, _) => used.contains n.eraseMacroScopes)
+    let loopNames := loopScope.map (·.1)
+    let loopFields ← loopScope.mapM (fun (n, b) => do pure (n, ← fieldTypeFor ctx n b all))
+    let thenT ← compileBody ctx (body ++ [.goto lIdx loopNames]) loopScope
+    let elseT ← compileBody ctx rest loopScope
+    addState { idx := lIdx, fields := loopFields, body := ← `(if $(⟨c⟩) then $thenT else $elseT) }
+    jumpTerm ctx lIdx loopNames
+  | .goto idx args :: rest => do
+    unless rest.isEmpty do Macro.throwError "asyncMachine: an internal `goto` must end a path"
+    jumpTerm ctx idx args
 
 /-- The continuation after an `await`: inline pures+`recurse`/a hoisted marker; otherwise a new state. -/
 private partial def genCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Term := do

@@ -12,7 +12,10 @@ delivery, the `VM`) validated earlier. The handler is now a **`VM` computation**
 ByteArray)`), so it may suspend — read a backend, wait — and its suspension joins the connection's machine
 through `VM.runAsync` (a fresh `RawCell` the sub-computation resolves); a handler that is pure is answered
 inside `pump` with no cell and no state hop, so the common case pays nothing for the async machinery being
-available. The remaining engine gap is `loop`.
+available. `asyncMachine` also lowers **`while`**: the loop head is a state, the body's suspension chain ends in
+a back-edge to it, and the loop variables thread across iterations as that state's fields (a pure binding may
+carry a type ascription — `let i : Nat := 0` — to give a field its type when use alone can't). `for`/`loop`
+and `break`/`continue` are the follow-ups.
 
 ## Goal
 
