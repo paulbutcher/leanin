@@ -1,6 +1,9 @@
 # The defunctionalization approach (`async!` / the `VM`)
 
-Status: **experiment, uncommitted** — validated on the echo, not yet on `serveConn`.
+Status: **experiment** — the `async!` elaborator (as `asyncMachine`) now compiles the **real HTTP loop** to a
+per-function state machine, verified end-to-end and run against a Node baseline (below). Pieces 1–2 (raw
+delivery, the `VM`) validated earlier; piece 3 is now real for the connection-loop shape (straight-line body
+with `await`-marked suspensions, pure items inlined, liveness-carried fields).
 
 ## Goal
 
@@ -52,14 +55,31 @@ Lean obstacles hit and cleared: free-monad `bind` won't compile as `partial` (Le
 for the fallback), and a `bind`-constructor GADT hits a universe error on the indexed type. Working form:
 parameterized `VM` + `partial` bind + a default `.empty` constructor for the `Inhabited` the fallback needs.
 
-### 3. The `async!` elaborator — the plan
+### 3. The `async!` elaborator (`asyncMachine`) — done, on the HTTP loop
 
-The `VM` still keeps *function* continuations inside its nodes and pays a quadratic free-monad `bind`. The
-`async!` elaborator compiles a `do` block to a **flat state machine** — one inductive constructor per
-suspension point, carrying the live variables, plus a `step` function the driver matches on — resumed through
-the same raw delivery. That removes the remaining overhead and is the ergonomic interface. Suspensions are
-marked `await (e)` so the macro can split the block syntactically; liveness (which variables cross each
-suspension) is the part that needs a scenario gate.
+`LeanIn/Async.lean`: `asyncMachine name (c : Conn) := do …` compiles a `do` block to a **flat state machine** —
+one inductive constructor per suspension point, carrying the live variables, plus a `step` function the driver
+matches on — resumed through the same raw delivery. Suspensions are marked `await (e)` so the macro splits the
+block syntactically; a liveness analysis (`liveInto`) decides which variables each state carries as fields; the
+pure code between awaits is inlined into the state's step (`withPrefix`). That removes both the cell+item
+apparatus *and* the CPS closures, and is the ergonomic interface.
+
+Validated on the echo (keep-alive loop), then on the **real HTTP loop**: `amHttp` reads a request, responds
+through the H1 machine (`process`: a stateless fresh-machine feed + step + handler loop), writes it, recurses.
+Two milestones made it compile: dotted constructor patterns (a full-name term is misread as an application) and
+the liveness-correct jump (pass exactly the target's live variables — `nextLive`, which already includes the
+await's bound variable — not `nextLive ++ bv`, which doubled it). The remaining gaps are the connection-loop
+shape's edges: `if`/`match`/`loop` control flow, more effects (`recvTimeout`, `spawn`), and threading the H1
+machine across iterations (a partial read currently forces a fresh machine, correct only because the benchmark
+delivers complete requests).
+
+*Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, `amHttp` vs `bench/node-server.mjs`,
+5 s runs): at **C=1 the two sit in the same band** — 47 673 vs 42 578 req/s on a quiet run (leanin ahead
+~1.12×), but interleaved re-runs at load average ~5 on 8 cores read ~0.7–1.1× either way, inside this
+repository's documented ±30% drift, so no stable win is attributable; errors=0 throughout. At **C=8/C=32 the
+single-carrier ceiling shows** (39 240 / 43 368 against Node's 49 395 / 62 683), the known limitation rather
+than a regression — the loop thread does not yet double as a carrier and the per-request shim-operation count
+is uncounted, exactly as W16 recorded. A quiet-box re-run is owed for a stable C=1 figure.
 
 ## Where this lands against Node
 
