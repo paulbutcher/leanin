@@ -88,6 +88,7 @@ end
 private inductive Eff where
   | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
   | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
+  | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
   | sendAll (data : Term)
   | send (data : Term)
   | close
@@ -100,6 +101,7 @@ private partial def unparen (s : Syntax) : Syntax :=
 private def classify (e : Syntax) : Eff :=
   match unparen e with
   | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => .recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩
+  | `(LeanIn.Runtime.VM.runAsync $m) => .runVM ⟨m⟩
   | `(LeanIn.Runtime.Io.recvRaw $_ $_) => .recv
   | `(LeanIn.Runtime.Io.recvRaw $_) => .recv
   | `(LeanIn.Runtime.Io.sendAllRaw $_ $d) => .sendAll ⟨d⟩
@@ -223,8 +225,48 @@ where
   | .match_ _ arms => arms.any (fun (_, b) => usedAsCond f b)
   | _ => false
 
+/-- Whether a syntax subtree contains a reference to `f`. Application arguments are nested syntax nodes in
+Lean's parser, so a direct-identifier check misses `handler head`'s `head` operand. -/
+private partial def containsName (f : Name) (s : Syntax) : Bool :=
+  match s with
+  | .ident _ _ n _ => n.eraseMacroScopes == f.eraseMacroScopes || n.getRoot.eraseMacroScopes == f.eraseMacroScopes
+  | .node _ _ args => args.any (containsName f)
+  | _ => false
+
+ /-- A field's type when it is used as the argument of a step-parameter function: the function's domain. For
+example `handler head` ⇒ `Request.Head`, the handler's argument type — a field whose only use is passing it to
+a typed function, with no `sendAll`/`if` use to read its type off. -/
+private partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Option Term :=
+  items.foldl (fun acc it => acc.orElse (fun _ => goItem it)) none
+where
+  sameName (a b : Name) : Bool := a.eraseMacroScopes == b.eraseMacroScopes
+  goItem : Item → Option Term
+  | .pureBind _ e => goTerm e
+  | .pureStmt e => goTerm e
+  | .await _ e => goTerm e
+  | .if_ c t e => (goTerm c).orElse (fun _ => findFnArg ctx f t |>.orElse (fun _ => findFnArg ctx f e))
+  | .match_ s arms =>
+    (goTerm s).orElse (fun _ => arms.foldl (fun a (_, b) => a.orElse (fun _ => findFnArg ctx f b)) none)
+  | _ => none
+  goTerm (s : Syntax) : Option Term :=
+    match s with
+    | .node _ _ args =>
+      let direct :=
+        if args.size ≥ 2 && args[0]!.isIdent then
+          match ctx.stepParams.find? (fun p => sameName p.1 args[0]!.getId) with
+          | some (_, ty) =>
+            match unparen ty.raw with
+            | .node _ kk a =>
+              if kk == `Lean.Parser.Term.arrow && a.size ≥ 1 &&
+                 args[1:].toList.any (containsName f) then some ⟨a[0]!⟩ else none
+            | _ => none
+          | none => none
+        else none
+      direct.orElse (fun _ => args.foldl (fun a x => a.orElse (fun _ => goTerm x)) none)
+    | _ => none
+
 /-- The type of one state field, from its binding and (for pure-bound) how the continuation uses it. -/
-private def fieldTypeFor (f : Name) (b : Bind) (rest : List Item) : MacroM Term := do
+private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : MacroM Term := do
   match b with
   | .threaded ty => pure ty
   | .recvRes => `($(mkIdent `ByteArray))
@@ -233,7 +275,9 @@ private def fieldTypeFor (f : Name) (b : Bind) (rest : List Item) : MacroM Term 
   | .pureB =>
     if usesSendArg f rest then `(Array ByteArray)
     else if usedAsCond f rest then `($(mkIdent `Bool))
-    else `($(mkIdent `Unit))
+    else match findFnArg ctx f rest with
+      | some ty => pure ty
+      | none => `($(mkIdent `Unit))
 
 /-- A jump `name.step c sp… (name.St.s{idx} args…)`, passing the constant step parameters `sp…` and the state's
 live fields `args`. -/
@@ -268,6 +312,9 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
   | .recvTimeout sched d z =>
     let bv := bnd.getD `r
     `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z (fun $(mkIdent bv) => $cont))
+  | .runVM m =>
+    let bv := bnd.getD `v
+    `(LeanIn.Runtime.VM.runAsync $m (fun $(mkIdent bv) => $cont))
   | .sendAll d => `(LeanIn.Runtime.Io.sendAllRaw $c $d ($cont))
   | .send d => `(LeanIn.Runtime.Io.sendRaw $c $d ($cont))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
@@ -357,7 +404,7 @@ private partial def genState (ctx : Ctx) (rest : List Item) (scope : List (Name 
   let idx ← freshIdx
   let fieldTys ← liveNames ctx rest scope |>.mapM (fun f => do
     let b := scope.lookup f |>.getD .pureB
-    pure (f, ← fieldTypeFor f b rest))
+    pure (f, ← fieldTypeFor ctx f b rest))
   let body ← compileBody ctx rest (liveScope ctx rest scope)
   addState { idx := idx, fields := fieldTys, body := body }
   pure idx

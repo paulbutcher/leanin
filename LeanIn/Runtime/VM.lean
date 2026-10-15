@@ -78,6 +78,7 @@ inductive VM (α : Type) where
   | sendE (c : Conn) (bs : ByteArray) (k : VM α)
   | sendAllE (c : Conn) (chunks : Array ByteArray) (k : VM α)
   | closeE (c : Conn) (k : VM α)
+  | sleepE (clock : Clock) (d : Std.Time.Millisecond.Offset) (k : VM α)
   | empty
 
 namespace VM
@@ -93,6 +94,7 @@ protected partial def bind : VM α → (α → VM β) → VM β
   | .sendE c bs k, f => .sendE c bs (VM.bind k f)
   | .sendAllE c cs k, f => .sendAllE c cs (VM.bind k f)
   | .closeE c k, f => .closeE c (VM.bind k f)
+  | .sleepE cl d k, f => .sleepE cl d (VM.bind k f)
   | .empty, _ => .empty
 
 instance : Monad VM where
@@ -106,6 +108,7 @@ def recvTimeout (c : Conn) (clock : Clock) (d : Std.Time.Millisecond.Offset) :
     VM (Option (Option ByteArray)) := .recvTimeoutE c clock d .pure
 def send (c : Conn) (bs : ByteArray) : VM Unit := .sendE c bs (.pure ())
 def sendAll (c : Conn) (chunks : Array ByteArray) : VM Unit := .sendAllE c chunks (.pure ())
+def sleep (clock : Clock) (d : Std.Time.Millisecond.Offset) : VM Unit := .sleepE clock d (.pure ())
 def close (c : Conn) : VM Unit := .closeE c (.pure ())
 
 /-- **The incremental interpreter**, in continuation-passing form. `partial` because a connection loop has no
@@ -113,9 +116,12 @@ bound. -/
 partial def runK : VM α → (α → IO Unit) → IO Unit
   | .pure v, k      => k v
   | .recvE c kk, k   => Io.recvRaw c 65536 (fun r => runK (kk r) k)
-  | .recvTimeoutE c cl d kk, k => Io.recvTimeoutRaw c cl.schedule d 65536 (fun r => runK (kk r) k)
   | .sendE c bs kk, k => Io.sendRaw c bs (runK kk k)
   | .sendAllE c cs kk, k => Io.sendAllRaw c cs (runK kk k)
+  | .recvTimeoutE c cl d kk, k => Io.recvTimeoutRaw c cl.schedule d 65536 (fun r => runK (kk r) k)
+  | .sleepE cl d kk, k => do
+    let cancel ← Task.Cancel.new
+    cl.schedule d cancel (runK kk k)
   | .closeE c kk, k  => do Io.closeRaw c; runK kk k
   | .empty, _        => (Pure.pure () : IO Unit)
 
@@ -124,6 +130,18 @@ def run (m : VM Unit) : IO Unit := runK m (fun _ => (Pure.pure () : IO Unit))
 
 /-- **Run a machine to a raw cell** (drive it, resolve the cell on completion). -/
 def runToCell (m : VM α) (cell : RawCell α) : IO Unit := runK m (fun v => RawCell.resolve cell v)
+
+/-- **Spawn a machine and await its result** (run it to a fresh cell, park `resume` on it). This is the effect
+an `asyncMachine` uses to await a sub-computation — a handler that itself suspends: `runToCell` starts the
+machine (its effects resume on the loop thread) and `RawCell.await` parks the caller's continuation, which the
+machine's final `resolve` fires. -/
+def runAsync (m : VM α) (resume : α → IO Unit) : IO Unit :=
+  match m with
+  | .pure v => resume v      -- nothing to suspend on: no cell, no park
+  | _ => do
+    let cell ← RawCell.new
+    runToCell m cell
+    RawCell.await cell resume
 
 end VM
 

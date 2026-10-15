@@ -36,6 +36,12 @@ def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :
       (Std.Http.Header.Value.ofString! (toString body.size))
   ({ status := .ok, version := .v11, headers }, body)
 
+/-- An async variant used to exercise the handler suspension path: wait 10 ms on the server clock, then reply. -/
+def delayedReply (clock : Runtime.Clock) (head : Std.Http.Request.Head) :
+    Runtime.VM (Std.Http.Response.Head × ByteArray) := do
+  Runtime.VM.sleep clock 10
+  pure (reply head)
+
 asyncMachine amHttp (c : LeanIn.Runtime.Conn) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   let out := process reply bs
@@ -78,7 +84,10 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
   else if mode == "serveconn" then
     -- `maxMessages` bumped far past the default 100 so a keep-alive connection is not closed mid-benchmark
     -- (Node applies no per-connection request cap); the H1 machine threads the count across requests.
-    monadLift (Runtime.HttpServer.serveConn.run c (Runtime.Clock.live hooks) 12000 reply ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
+    monadLift (Runtime.HttpServer.serveConn.run c (Runtime.Clock.live hooks) 12000 (Runtime.HttpServer.Handler.ofPure reply) ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
+  else if mode == "asynchandler" then
+    let clock := Runtime.Clock.live hooks
+    monadLift (Runtime.HttpServer.serveConn.run c clock 12000 (delayedReply clock) ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode
