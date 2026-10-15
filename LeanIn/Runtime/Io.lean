@@ -245,6 +245,37 @@ private def withdraw (loop : Std.Mutex Table) (conn : UInt32) (op : Op) : IO Uni
     let (_, t') := (← get).takeWhere (fun p => p.op == op && p.conn == conn)
     set t'
 
+/-- **A raw completion** (defunctionalization experiment): a continuation the loop thread runs *directly* when
+the operation completes — no `Join` cell, no `Item`, no inject, no carrier hop. This is the delivery machinery a
+defunctionalized engine skips; the `Raw` paths measure what that skip is worth against the `Join`-cell path. -/
+private structure RawParked where
+  conn   : UInt32
+  op     : Op
+  resume : Except IO.Error Result → IO Unit
+
+private initialize rawRef : Std.Mutex (List RawParked) ← Std.Mutex.new []
+
+private def RawParked.take (l : List RawParked) (conn : UInt32) (op : Op)
+    : Option RawParked × List RawParked :=
+  let rec go : List RawParked → List RawParked → Option RawParked × List RawParked
+    | [], acc => (none, acc.reverse)
+    | x :: xs, acc => if x.op == op && x.conn == conn then (some x, acc.reverse ++ xs) else go xs (x :: acc)
+  go l []
+
+/-- **Park a raw completion** for the loop to run on completion (experiment path). -/
+def registerRaw (conn : UInt32) (op : Op) (resume : Except IO.Error Result → IO Unit) : IO Unit :=
+  rawRef.atomically do modify (· ++ [{ conn, op, resume }])
+
+/-- Take and run the raw completion for `conn`/`op`, if one is parked. -/
+private def rawResume (conn : UInt32) (op : Op) (res : Except IO.Error Result) : IO Unit := do
+  let r? ← rawRef.atomically do
+    let (found, rest) := RawParked.take (← get) conn op
+    set rest
+    return found
+  match r? with
+  | some rp => rp.resume res
+  | none    => pure ()
+
 /-- Hand an accepted connection to the oldest parked accept, or hold it until one registers. -/
 private def arrive (loop : Std.Mutex Table) (idx : UInt32) : IO Unit := do
   let taken? ← loop.atomically do
@@ -293,7 +324,7 @@ private def readDone (loop : Std.Mutex Table) (idx : UInt32) (n : Int) : IO Unit
     let e ← libuvError "a socket read failed" n
     match taken? with
     | some p => Task.Join.resolveFirst p.cell p.push (.error e)
-    | none   => pure ()
+    | none   => rawResume idx .read (.error e)
     if (← npUvClose idx) == 0 then
       throw (IO.userError "Io: the shim refused to close a read-broken connection")
   else
@@ -301,7 +332,7 @@ private def readDone (loop : Std.Mutex Table) (idx : UInt32) (n : Int) : IO Unit
     match taken? with
     | some p =>
       Task.Join.resolveFirst p.cell p.push (.ok (.read (if n == 0 then none else some bytes)))
-    | none => pure ()
+    | none => rawResume idx .read (.ok (.read (if n == 0 then none else some bytes)))
 
 /-- **A write or a shutdown completed.** A failed write closes the connection for the same reason a failed read
 does; a failed shutdown does not, because the shim closes the handle on a shutdown's completion either way. -/
@@ -313,13 +344,13 @@ private def opDone (loop : Std.Mutex Table) (idx : UInt32) (status : Int) (op : 
   if status == 0 then
     match taken? with
     | some p => Task.Join.resolveFirst p.cell p.push (.ok .done)
-    | none   => pure ()
+    | none   => rawResume idx op (.ok .done)
   else
     let e ← libuvError
       (if op == .write then "a socket write failed" else "shutting a socket's write side down failed") status
     match taken? with
     | some p => Task.Join.resolveFirst p.cell p.push (.error e)
-    | none   => pure ()
+    | none   => rawResume idx op (.error e)
     if op == .write then
       unless (← npUvClose idx) == 1 do
         throw (IO.userError "Io: the shim refused to close a write-broken connection")
@@ -593,6 +624,32 @@ def recv (c : Conn) (size : UInt64) : Task.EAsync IO.Error (Option ByteArray) :=
             | .ok (.read d) => .ok d
             | .ok _         => .error (.userError "Io.Conn.recv: the loop delivered a mismatched completion")
             | .error e      => .error e) ctx') ctx⟩
+
+/-- **Receive, raw** (defunctionalization experiment): like `recv`, but `resume` runs *on the loop thread* —
+no `Join` cell, `Item`, inject or carrier hop. The bytes arrive by the same `read`/`readDone` shim path; only the
+delivery is different. This and `sendRaw` measure what the `Join`-cell delivery costs against a direct resume. -/
+def recvRaw (c : Conn) (size : UInt64) (resume : Option ByteArray → IO Unit) : IO Unit := do
+  registerRaw c.idx .read (fun r => resume (match r with
+    | .ok (.read d) => d
+    | _             => none))
+  unless (← npUvRead c.idx size) != 0 do
+    resume none
+
+/-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. -/
+def sendRaw (c : Conn) (data : ByteArray) (resume : IO Unit) : IO Unit := do
+  registerRaw c.idx .write (fun _ => resume)
+  unless (← npUvWrite c.idx data) != 0 do
+    pure ()
+
+/-- **Close, raw** (experiment): close the connection's handle on the loop thread. -/
+def closeRaw (c : Conn) : IO Unit := discard (npUvClose c.idx)
+
+/-- **A defunctionalized echo** (experiment): read the bytes, write them back, read again — every step a raw
+completion running on the loop thread. `partial` because a connection has no bound. -/
+partial def defuncEcho (c : Conn) : IO Unit :=
+  recvRaw c 65536 fun
+    | some bs => sendRaw c bs (defuncEcho c)
+    | none    => discard (npUvClose c.idx)
 
 /-- **Send one buffer**, awaiting its completion. The bytes are copied into memory the write request owns at the
 submission, so the caller's buffer can go away before the write finishes. -/

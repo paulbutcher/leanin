@@ -38,3 +38,8 @@ root = "BridgeControls"
 name = "server"
 root = "Server"
 moreLinkArgs = ["-lnetuv", "-luv"]
+
+[[lean_exe]]
+name = "defuncEcho"
+root = "DefuncEcho"
+moreLinkArgs = ["-lnetuv", "-luv"]
