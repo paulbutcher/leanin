@@ -3,7 +3,13 @@ import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
 import LeanIn.Runtime.VMHttp
 import LeanIn.Runtime.SmEcho
+import LeanIn.Async
 open LeanIn
+
+asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
+  let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[req])
+  recurse
 
 /-- The echo handler, shared across modes. -/
 def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :=
@@ -41,6 +47,8 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (Runtime.SmEcho.spawnEchoStep (.reading c))
   else if mode == "smdirect" then
     monadLift (Runtime.SmEcho.directEchoStep (.reading c))
+  else if mode == "async" then
+    monadLift (amEcho.run c)
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode
