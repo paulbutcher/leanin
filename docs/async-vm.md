@@ -1,9 +1,10 @@
 # The defunctionalization approach (`async!` / the `VM`)
 
-Status: **experiment** — the `async!` elaborator (as `asyncMachine`) now compiles the **real HTTP loop** to a
-per-function state machine, verified end-to-end and run against a Node baseline (below). Pieces 1–2 (raw
-delivery, the `VM`) validated earlier; piece 3 is now real for the connection-loop shape (straight-line body
-with `await`-marked suspensions, pure items inlined, liveness-carried fields).
+Status: **experiment** — the `async!` elaborator (as `asyncMachine`) now compiles **`serveConn`'s actual
+connection drive** (with `if` control flow and the H1 machine threaded across requests) to a per-function state
+machine, verified end-to-end and run at **C=1 parity with Node** (below). Pieces 1–2 (raw delivery, the `VM`)
+validated earlier; piece 3 is now real for the connection-loop shape — `await`-marked suspensions, pure items
+inlined, `if` branches lowered to state transitions, liveness-carried fields. `match` and `recvTimeout` remain.
 
 ## Goal
 
@@ -55,31 +56,42 @@ Lean obstacles hit and cleared: free-monad `bind` won't compile as `partial` (Le
 for the fallback), and a `bind`-constructor GADT hits a universe error on the indexed type. Working form:
 parameterized `VM` + `partial` bind + a default `.empty` constructor for the `Inhabited` the fallback needs.
 
-### 3. The `async!` elaborator (`asyncMachine`) — done, on the HTTP loop
+### 3. The `async!` elaborator (`asyncMachine`) — done, with control flow, on the real drive
 
-`LeanIn/Async.lean`: `asyncMachine name (c : Conn) := do …` compiles a `do` block to a **flat state machine** —
-one inductive constructor per suspension point, carrying the live variables, plus a `step` function the driver
-matches on — resumed through the same raw delivery. Suspensions are marked `await (e)` so the macro splits the
-block syntactically; a liveness analysis (`liveInto`) decides which variables each state carries as fields; the
-pure code between awaits is inlined into the state's step (`withPrefix`). That removes both the cell+item
-apparatus *and* the CPS closures, and is the ergonomic interface.
+`LeanIn/Async.lean`: `asyncMachine name (c : Conn) (x : T) … := do …` compiles a `do` block to a **flat state
+machine** — one inductive constructor per suspension point, carrying the live variables, plus a `step` function
+the driver matches on — resumed through the same raw delivery. Suspensions are marked `await (e)`; the body is
+lowered **recursively**: pure code is inlined into the current state's step, each `await` suspends, and
+`if`/`recurse` become transitions between states. A **liveness analysis** decides which variables each state
+carries as fields. The first parameter `(c : Conn)` is the connection (a constant step parameter); further
+parameters are **threaded fields** — state 0 carries them and `recurse` passes their current values back, which
+is how the H1 machine is threaded across requests. A control-flow item mid-sequence hoists the rest into a
+*shared* continuation state, so converging paths compile once; field types are inferred without a general
+elaboration pass (a threaded parameter keeps its signature type, a `recvRaw` result is `ByteArray`, a
+`sendAllRaw` argument is `Array ByteArray`, an `if`-condition is `Bool`).
 
-Validated on the echo (keep-alive loop), then on the **real HTTP loop**: `amHttp` reads a request, responds
-through the H1 machine (`process`: a stateless fresh-machine feed + step + handler loop), writes it, recurses.
-Two milestones made it compile: dotted constructor patterns (a full-name term is misread as an application) and
-the liveness-correct jump (pass exactly the target's live variables — `nextLive`, which already includes the
-await's bound variable — not `nextLive ++ bv`, which doubled it). The remaining gaps are the connection-loop
-shape's edges: `if`/`match`/`loop` control flow, more effects (`recvTimeout`, `spawn`), and threading the H1
-machine across iterations (a partial read currently forces a fresh machine, correct only because the benchmark
-delivers complete requests).
+Validated on the echo (keep-alive), then on **`serveConn`'s actual connection drive** — not the stateless
+benchmark shape. `serveConn` pumps the H1 machine (`pump`: the pure step + `endHeaders`-handler + progress
+loop, the part of `vmDrive` between the socket effects), writes any output, then branches on `halted` to close
+or `recvRaw` → `feed` → `recurse`. Two macro-level bugs were the real work: dot-notation like `m.feed` is a
+single compound identifier, so the liveness had to collect each identifier's **root** (`m`) or it dropped the
+machine from a state's fields; and a shadowing pure bind (`let m := m.feed bs`) had to keep the threaded
+binding's type rather than reset it to the inference fallback. `match` and `recvTimeout` (with the stall
+`Clock`) are the remaining gaps; the `match` quotation needs the same array-splice form the step uses.
 
-*Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, `amHttp` vs `bench/node-server.mjs`,
-5 s runs): at **C=1 the two sit in the same band** — 47 673 vs 42 578 req/s on a quiet run (leanin ahead
-~1.12×), but interleaved re-runs at load average ~5 on 8 cores read ~0.7–1.1× either way, inside this
-repository's documented ±30% drift, so no stable win is attributable; errors=0 throughout. At **C=8/C=32 the
-single-carrier ceiling shows** (39 240 / 43 368 against Node's 49 395 / 62 683), the known limitation rather
-than a regression — the loop thread does not yet double as a carrier and the per-request shim-operation count
-is uncounted, exactly as W16 recorded. A quiet-box re-run is owed for a stable C=1 figure.
+*Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, compiled `serveConn` vs
+`bench/node-server.mjs`, 5 s runs, `maxMessages` raised past the H1 default of 100 — see below): **C=1 parity**
+— 46 149 vs 43 999 req/s on one run, and 0.81–0.95× across three interleaved re-runs, i.e. the same band as
+Node within this repository's ±30% drift; errors=0. **C=8 / C=32 Node pulls ahead** (87 255 / 76 296 against
+139 743 / 97 825, and Node itself swung 144k→98k at C=32 across runs), the single-carrier ceiling — the loop
+thread does not yet double as a carrier, exactly as W16 recorded.
+
+**The threading exposed a real behaviour difference, not a benchmark artefact.** The stateless `amHttp` built a
+fresh H1 machine per request, so its `messageCount` never accumulated; the threaded `serveConn` carries it, so
+at 100 requests the machine emitted `Connection: close` and closed — the H1 default `maxMessages = 100`, a
+production keep-alive cap, not a bug. The raw keep-alive probe (3 responses in 2 ms, then a stall at exactly
+request 100 with `Connection: close` on the wire) is what surfaced it. The benchmark config raises `maxMessages`
+to match Node, which applies no per-connection request cap.
 
 ## Where this lands against Node
 
