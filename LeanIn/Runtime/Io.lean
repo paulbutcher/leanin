@@ -118,7 +118,7 @@ private inductive Op where
   | read
   | write
   | shutdown
-  deriving DecidableEq, BEq
+  deriving DecidableEq, BEq, Hashable
 
 /-- What the loop delivers to a parked operation. -/
 private inductive Result where
@@ -246,42 +246,34 @@ private def withdraw (loop : Std.Mutex Table) (conn : UInt32) (op : Op) : IO Uni
     set t'
 
 /-- **A raw completion** (defunctionalization experiment): a continuation the loop thread runs *directly* when
-the operation completes — no `Join` cell, no `Item`, no inject, no carrier hop. This is the delivery machinery a
-defunctionalized engine skips; the `Raw` paths measure what that skip is worth against the `Join`-cell path. -/
-private structure RawParked where
-  conn   : UInt32
-  op     : Op
-  resume : Except IO.Error Result → IO Unit
+the operation completes — no `Join` cell, no `Item`, no inject, no carrier hop. The `Raw` paths measure what
+that skip is worth against the `Join`-cell path.
 
-private initialize rawRef : Std.Mutex (List RawParked) ← Std.Mutex.new []
+The table parks one completion per `(connection, op)`. It is a `HashMap`, not a list — a list makes every
+park/resume/withdraw **O(parked operations)**, i.e. O(concurrent connections), so the per-request cost grew with
+concurrency; here each is O(1). -/
+private abbrev RawTable := Std.HashMap (UInt32 × Op) (Except IO.Error Result → IO Unit)
 
-private def RawParked.take (l : List RawParked) (conn : UInt32) (op : Op)
-    : Option RawParked × List RawParked :=
-  let rec go : List RawParked → List RawParked → Option RawParked × List RawParked
-    | [], acc => (none, acc.reverse)
-    | x :: xs, acc => if x.op == op && x.conn == conn then (some x, acc.reverse ++ xs) else go xs (x :: acc)
-  go l []
+private initialize rawRef : Std.Mutex RawTable ← Std.Mutex.new {}
 
 /-- **Park a raw completion** for the loop to run on completion (experiment path). -/
 def registerRaw (conn : UInt32) (op : Op) (resume : Except IO.Error Result → IO Unit) : IO Unit :=
-  rawRef.atomically do modify (· ++ [{ conn, op, resume }])
+  rawRef.atomically do modify (·.insert (conn, op) resume)
 
 /-- Take and run the raw completion for `conn`/`op`, if one is parked. -/
 private def rawResume (conn : UInt32) (op : Op) (res : Except IO.Error Result) : IO Unit := do
   let r? ← rawRef.atomically do
-    let (found, rest) := RawParked.take (← get) conn op
-    set rest
-    return found
+    let m ← get
+    set (m.erase (conn, op))
+    return m.get? (conn, op)
   match r? with
-  | some rp => rp.resume res
-  | none    => pure ()
+  | some resume => resume res
+  | none        => pure ()
 
 /-- **Drop a raw registration** without completing it — the loser of a `recvTimeout` race, so a fired deadline
 does not leave a read parked that nobody will resume. -/
 def withdrawRaw (conn : UInt32) (op : Op) : IO Unit :=
-  rawRef.atomically do
-    let (_, rest) := RawParked.take (← get) conn op
-    set rest
+  rawRef.atomically do modify (·.erase (conn, op))
 
 /-- Hand an accepted connection to the oldest parked accept, or hold it until one registers. -/
 private def arrive (loop : Std.Mutex Table) (idx : UInt32) : IO Unit := do
