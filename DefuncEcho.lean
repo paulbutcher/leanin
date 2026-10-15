@@ -33,7 +33,9 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
   else if mode == "vm" then
     monadLift (Runtime.VM.run (vmEcho c))
   else if mode == "vmhttp" then
-    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c {} reply))
+    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 12000 {} reply))
+  else if mode == "vmhttpS" then
+    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 400 {} reply))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode

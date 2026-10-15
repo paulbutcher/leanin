@@ -276,6 +276,13 @@ private def rawResume (conn : UInt32) (op : Op) (res : Except IO.Error Result) :
   | some rp => rp.resume res
   | none    => pure ()
 
+/-- **Drop a raw registration** without completing it — the loser of a `recvTimeout` race, so a fired deadline
+does not leave a read parked that nobody will resume. -/
+def withdrawRaw (conn : UInt32) (op : Op) : IO Unit :=
+  rawRef.atomically do
+    let (_, rest) := RawParked.take (← get) conn op
+    set rest
+
 /-- Hand an accepted connection to the oldest parked accept, or hold it until one registers. -/
 private def arrive (loop : Std.Mutex Table) (idx : UInt32) : IO Unit := do
   let taken? ← loop.atomically do
@@ -643,6 +650,29 @@ def sendRaw (c : Conn) (data : ByteArray) (resume : IO Unit) : IO Unit := do
 
 /-- **Close, raw** (experiment): close the connection's handle on the loop thread. -/
 def closeRaw (c : Conn) : IO Unit := discard (npUvClose c.idx)
+
+/-- **Receive with a deadline, raw**: race a read against a timer armed via `schedule` (a clock's `schedule`,
+passed in so this file does not import the clock seam). The first to fire wins: a completed read cancels the
+timer and resumes `some result`; the deadline withdraws the parked read and resumes `none` (stalled). The
+`won` cell is the first-wins guard — the timer's fire and the read's completion can race on different threads
+(a live loop thread against a harness driver's advance). -/
+def recvTimeoutRaw (c : Conn)
+    (schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit)
+    (d : Std.Time.Millisecond.Offset) (size : UInt64)
+    (resume : Option (Option ByteArray) → IO Unit) : IO Unit := do
+  let won ← Std.Mutex.new false
+  let timerCancel ← Task.Cancel.new
+  schedule d timerCancel (do
+    let first ← won.atomically do
+      if ← get then pure false else do set true; pure true
+    if first then do
+      withdrawRaw c.idx .read
+      resume none)
+  recvRaw c size (fun r => do
+    Task.Cancel.set timerCancel
+    let first ← won.atomically do
+      if ← get then pure false else do set true; pure true
+    if first then resume (some r))
 
 /-- **Send all chunks, raw** (experiment): a vectored write whose completion runs on the loop thread. -/
 def sendAllRaw (c : Conn) (chunks : Array ByteArray) (resume : IO Unit) : IO Unit := do

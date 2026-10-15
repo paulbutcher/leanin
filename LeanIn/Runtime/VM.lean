@@ -1,5 +1,6 @@
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Io
+import LeanIn.Runtime.Clock
 
 /-!
 # A defunctionalizing task monad (experiment)
@@ -24,6 +25,8 @@ whose continuation is the *next machine*, not a CPS closure re-wrapped per bind.
 inductive VM (α : Type) where
   | pure (v : α)
   | recvE (c : Conn) (k : Option ByteArray → VM α)
+  | recvTimeoutE (c : Conn) (clock : Clock) (d : Std.Time.Millisecond.Offset)
+      (k : Option (Option ByteArray) → VM α)
   | sendE (c : Conn) (bs : ByteArray) (k : VM α)
   | sendAllE (c : Conn) (chunks : Array ByteArray) (k : VM α)
   | closeE (c : Conn) (k : VM α)
@@ -38,6 +41,7 @@ instance : Inhabited (VM α) where
 protected partial def bind : VM α → (α → VM β) → VM β
   | .pure v, f => f v
   | .recvE c k, f => .recvE c (fun r => VM.bind (k r) f)
+  | .recvTimeoutE c cl d k, f => .recvTimeoutE c cl d (fun r => VM.bind (k r) f)
   | .sendE c bs k, f => .sendE c bs (VM.bind k f)
   | .sendAllE c cs k, f => .sendAllE c cs (VM.bind k f)
   | .closeE c k, f => .closeE c (VM.bind k f)
@@ -49,6 +53,9 @@ instance : Monad VM where
 
 /-- The effects, as the operations a client writes with `←`. -/
 def recv (c : Conn) : VM (Option ByteArray) := .recvE c .pure
+/-- **Read with a deadline**: `none` if `d` elapses first (the peer stalled), `some result` for the read. -/
+def recvTimeout (c : Conn) (clock : Clock) (d : Std.Time.Millisecond.Offset) :
+    VM (Option (Option ByteArray)) := .recvTimeoutE c clock d .pure
 def send (c : Conn) (bs : ByteArray) : VM Unit := .sendE c bs (.pure ())
 def sendAll (c : Conn) (chunks : Array ByteArray) : VM Unit := .sendAllE c chunks (.pure ())
 def close (c : Conn) : VM Unit := .closeE c (.pure ())
@@ -60,6 +67,7 @@ bound: the recursion rides the lazy machine the client builds. -/
 partial def runK : VM α → (α → IO Unit) → IO Unit
   | .pure v, k      => k v
   | .recvE c kk, k   => Io.recvRaw c 65536 (fun r => runK (kk r) k)
+  | .recvTimeoutE c cl d kk, k => Io.recvTimeoutRaw c cl.schedule d 65536 (fun r => runK (kk r) k)
   | .sendE c bs kk, k => Io.sendRaw c bs (runK kk k)
   | .sendAllE c cs kk, k => Io.sendAllRaw c cs (runK kk k)
   | .closeE c kk, k  => do Io.closeRaw c; runK kk k

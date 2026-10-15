@@ -3,6 +3,7 @@ import Std.Http.Data
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Io
 import LeanIn.Runtime.VM
+import LeanIn.Runtime.Clock
 
 /-!
 # The HTTP/1.1 connection driver, in the `VM` monad (experiment)
@@ -39,8 +40,9 @@ machine re-emits on every starved step). Mirrors `drive`'s gate. -/
 def madeProgress (outputSize : Nat) (events : Array (Std.Http.Protocol.H1.Event .receiving)) : Bool :=
   outputSize > 0 || events.any (fun e => match e with | .needMoreData _ => false | _ => true)
 
-/-- **The read → step → dispatch → write cycle, in `VM`.** -/
-partial def vmDrive (c : Conn) (handler : PureHandler)
+/-- **The read → step → dispatch → write cycle, in `VM`.** The read carries the stall deadline: a peer that
+sends nothing within `stall` ends the connection with nothing written, matching `serveConn`. -/
+partial def vmDrive (c : Conn) (clock : Clock) (stall : Std.Time.Millisecond.Offset) (handler : PureHandler)
     (machine : Std.Http.Protocol.H1.Machine .receiving) : VM Unit := do
   let (machine', step) := machine.step
   if step.output.size > 0 then
@@ -49,15 +51,17 @@ partial def vmDrive (c : Conn) (handler : PureHandler)
   if machine''.halted then
     pure ()
   else if madeProgress step.output.size step.events then
-    vmDrive c handler machine''
+    vmDrive c clock stall handler machine''
   else
-    match ← VM.recv c with
-    | none    => vmDrive c handler machine''.noMoreInput
-    | some bs => vmDrive c handler (machine''.feed bs)
+    match ← VM.recvTimeout c clock stall with
+    | none           => pure ()  -- the peer stalled: end the connection, nothing written
+    | some none      => vmDrive c clock stall handler machine''.noMoreInput
+    | some (some bs) => vmDrive c clock stall handler (machine''.feed bs)
 
 /-- **Serve one connection in `VM`**: drive from a fresh machine, then close the write side. -/
-def vmServeConn (c : Conn) (h1 : Std.Http.Protocol.H1.Config) (handler : PureHandler) : VM Unit := do
-  vmDrive c handler ({ config := h1 } : Std.Http.Protocol.H1.Machine .receiving)
+def vmServeConn (c : Conn) (clock : Clock) (stall : Std.Time.Millisecond.Offset)
+    (h1 : Std.Http.Protocol.H1.Config) (handler : PureHandler) : VM Unit := do
+  vmDrive c clock stall handler ({ config := h1 } : Std.Http.Protocol.H1.Machine .receiving)
   VM.close c
 
 end LeanIn.Runtime.VMHttp
