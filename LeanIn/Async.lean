@@ -39,6 +39,9 @@ private inductive Item where
   | if_ (cond : Syntax) (then_ else_ : List Item)
   | match_ (scrut : Syntax) (arms : List (Syntax × List Item))
   | while_ (cond : Syntax) (body : List Item)    -- `while c do body`
+  | for_ (x : Ident) (xs : Syntax) (body : List Item)  -- `for x in xs do body`
+  | break_                                       -- `break` (innermost `while`)
+  | continue_                                    -- `continue` (innermost `while`)
   | recurse
   | goto (idx : Nat) (args : List Name)          -- internal: jump to a specific state
   | contStmt (term : Term)                       -- internal: a hoisted continuation
@@ -84,6 +87,10 @@ private partial def parseItem (d : Syntax) : MacroM Item := do
     return .match_ s arms
   | `(doElem| while $c:term do $b:doSeq) =>
     return .while_ c (← parseItems b)
+  | `(doElem| for $x:ident in $xs:term do $b:doSeq) =>
+    return .for_ x xs (← parseItems b)
+  | `(doElem| break) => return .break_
+  | `(doElem| continue) => return .continue_
   | `(doElem| recurse) => return .recurse
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"asyncMachine: unsupported do-item: {d}"
@@ -141,6 +148,9 @@ where
   | .if_ c t e => usedNames c ++ usedInItems t ++ usedInItems e
   | .match_ s arms => usedNames s ++ arms.flatMap (fun (_, b) => usedInItems b)
   | .while_ c b => usedNames c ++ usedInItems b
+  | .for_ _ xs b => usedNames xs ++ usedInItems b
+  | .break_ => []
+  | .continue_ => []
   | .recurse => []
   | .goto _ args => args
   | .contStmt _ => []
@@ -157,6 +167,7 @@ where
   | .if_ _ t e => boundInItems t ++ boundInItems e
   | .match_ _ arms => arms.flatMap (fun (_, b) => boundInItems b)
   | .while_ _ b => boundInItems b
+  | .for_ x _ b => x.getId :: boundInItems b
   | _ => []
 
 /-- Whether a list of items suspends anywhere (decides inline-vs-new-state for a continuation). -/
@@ -166,6 +177,7 @@ private partial def hasAwait (items : List Item) : Bool :=
     | .if_ _ t e => hasAwait t || hasAwait e
     | .match_ _ arms => arms.any (fun (_, b) => hasAwait b)
     | .while_ _ b => hasAwait b
+    | .for_ _ _ b => hasAwait b
     | _ => false
 
 /-- A variable's binding, for field-type inference. -/
@@ -183,11 +195,20 @@ private structure GenState where
   fields : List (Name × Term)
   body : Term
 
+/-- The innermost loop's jump targets, for `break`/`continue`: the head state (with the fields to pass back
+into it) and the exit state (with its fields). -/
+private structure LoopCtx where
+  head : Nat
+  headFields : List Name
+  exit : Nat
+  exitFields : List Name
+
 private structure Ctx where
   name : Name
   conn : Name
   threaded : List Name          -- the threaded field names (state 0's fields, rebound in the body)
   stepParams : List (Name × Term)  -- constant step parameters (never rebound), passed to `step` like the connection
+  loops : List LoopCtx := []    -- the enclosing `while` loops, innermost first
 
 private abbrev CompileM := StateT (Nat × List GenState) MacroM
 
@@ -229,6 +250,7 @@ where
   | .if_ _ t e => usesSendArg f t || usesSendArg f e
   | .match_ _ arms => arms.any (fun (_, b) => usesSendArg f b)
   | .while_ _ b => usesSendArg f b
+  | .for_ _ _ b => usesSendArg f b
   | _ => false
 
 /-- Whether a pure-bound variable is used as an `if`-condition in the items. -/
@@ -239,6 +261,7 @@ where
   | .if_ c t e => (c.isIdent && c.getId == f) || usedAsCond f t || usedAsCond f e
   | .match_ _ arms => arms.any (fun (_, b) => usedAsCond f b)
   | .while_ _ b => usedAsCond f b
+  | .for_ _ _ b => usedAsCond f b
   | _ => false
 
 /-- Whether a syntax subtree contains a reference to `f`. Application arguments are nested syntax nodes in
@@ -264,6 +287,7 @@ where
   | .match_ s arms =>
     (goTerm s).orElse (fun _ => arms.foldl (fun a (_, b) => a.orElse (fun _ => findFnArg ctx f b)) none)
   | .while_ c b => (goTerm c).orElse (fun _ => findFnArg ctx f b)
+  | .for_ _ xs b => (goTerm xs).orElse (fun _ => findFnArg ctx f b)
   | _ => none
   goTerm (s : Syntax) : Option Term :=
     match s with
@@ -337,6 +361,16 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
   | .send d => `(LeanIn.Runtime.Io.sendRaw $c $d ($cont))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
 
+/-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, or a close — so appending a
+continuation after it (the code following an `if`/loop body) would be unreachable and must be skipped. -/
+private def endsTerminal (items : List Item) : Bool :=
+  match items.getLast? with
+  | some .recurse => true
+  | some .break_ => true
+  | some .continue_ => true
+  | some (.await _ e) => (match classify e with | .close => true | _ => false)
+  | _ => false
+
 mutual
 /-- Compile a list of items into the body Term of a state (or an inline continuation). Generates any
 continuation states as a side effect. `scope` is the in-scope variables with their bindings. -/
@@ -373,15 +407,15 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
   | .if_ c t e :: rest => do
     let cont? ← hoistCont ctx rest scope
     let suffix := cont?.toList
-    let thenT ← compileBody ctx (t ++ suffix) scope
-    let elseT ← compileBody ctx (e ++ suffix) scope
+    let thenT ← compileBody ctx (if endsTerminal t then t else t ++ suffix) scope
+    let elseT ← compileBody ctx (if endsTerminal e then e else e ++ suffix) scope
     `(if $(⟨c⟩) then $thenT else $elseT)
   | .match_ s arms :: rest => do
     let cont? ← hoistCont ctx rest scope
     let suffix := cont?.toList
     let armTerms ← arms.toArray.mapM (fun (nd, body) => do
       let armScope := extendScope scope (patBoundNames (nd.getArg 1))
-      let t ← compileBody ctx (body ++ suffix) armScope
+      let t ← compileBody ctx (if endsTerminal body then body else body ++ suffix) armScope
       -- Rebuild the alternative as a term-level `matchAlt`, reusing the pattern (arg 1) verbatim and
       -- replacing only the body (arg 3) with the compiled continuation (a term, where the do-body was).
       match nd with
@@ -394,20 +428,50 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     let scrut : Term := ⟨s⟩
     `(match $scrut:term with $armTerms:matchAlt*)
   | .while_ c body :: rest => do
-    -- The loop head is a fresh state L, and the current position jumps to it. L's body is
-    -- `if c then (body; goto L) else rest`, so a false condition falls through to the code after the loop, and a
-    -- true one runs the body and loops. L carries the loop variables — those in scope and used in the
-    -- condition, the body, or after the loop — which thread across iterations like any other state's fields.
+    -- L is the loop head; R is the code after the loop, which is also `break`'s target. L's body is
+    -- `if c then (body; goto L) else goto R`, so a false condition falls through to R and a `break` jumps there.
     let lIdx ← freshIdx
+    let rIdx ← freshIdx
     let all : List Item := .while_ c body :: rest
     let used := (usedInItems all).map (·.eraseMacroScopes)
     let loopScope := scope.filter (fun (n, _) => used.contains n.eraseMacroScopes)
     let loopNames := loopScope.map (·.1)
     let loopFields ← loopScope.mapM (fun (n, b) => do pure (n, ← fieldTypeFor ctx n b all))
-    let thenT ← compileBody ctx (body ++ [.goto lIdx loopNames]) loopScope
-    let elseT ← compileBody ctx rest loopScope
+    let restUsed := (usedInItems rest).map (·.eraseMacroScopes)
+    let restScope := scope.filter (fun (n, _) => restUsed.contains n.eraseMacroScopes)
+    let restNames := restScope.map (·.1)
+    let restFields ← restScope.mapM (fun (n, b) => do pure (n, ← fieldTypeFor ctx n b rest))
+    let restBody ← compileBody ctx rest restScope
+    addState { idx := rIdx, fields := restFields, body := restBody }
+    let ctx' := { ctx with
+      loops := { head := lIdx, headFields := loopNames, exit := rIdx, exitFields := restNames } :: ctx.loops }
+    let thenT ← compileBody ctx' (if endsTerminal body then body else body ++ [.goto lIdx loopNames]) loopScope
+    let elseT ← jumpTerm ctx rIdx restNames
     addState { idx := lIdx, fields := loopFields, body := ← `(if $(⟨c⟩) then $thenT else $elseT) }
     jumpTerm ctx lIdx loopNames
+  | .for_ x xs body :: rest => do
+    -- Desugar to a counted loop: `let i := 0; let n := xs.size; while i < n do { let x := xs[i]!; body; i := i+1 }`.
+    let i := mkIdent `__for_i
+    let n := mkIdent `__for_n
+    let natT : Term := ⟨mkIdent `Nat⟩
+    let elem ← `(($(⟨xs⟩))[$i]!)
+    let inner : List Item :=
+      [.pureBind x none elem] ++ body ++ [.pureBind i none (← `($i + 1))]
+    let whileItem := .while_ (← `($i < $n)) inner
+    let setup : List Item :=
+      [ .pureBind i (some natT) (← `(0)),
+        .pureBind n (some natT) (← `(($(⟨xs⟩)).size)) ]
+    compileBody ctx (setup ++ [whileItem] ++ rest) scope
+  | .break_ :: rest => do
+    unless rest.isEmpty do Macro.throwError "asyncMachine: `break` must end a path"
+    match ctx.loops with
+    | l :: _ => jumpTerm ctx l.exit l.exitFields
+    | [] => Macro.throwError "asyncMachine: `break` used outside a `while`"
+  | .continue_ :: rest => do
+    unless rest.isEmpty do Macro.throwError "asyncMachine: `continue` must end a path"
+    match ctx.loops with
+    | l :: _ => jumpTerm ctx l.head l.headFields
+    | [] => Macro.throwError "asyncMachine: `continue` used outside a `while`"
   | .goto idx args :: rest => do
     unless rest.isEmpty do Macro.throwError "asyncMachine: an internal `goto` must end a path"
     jumpTerm ctx idx args

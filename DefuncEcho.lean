@@ -57,6 +57,30 @@ asyncMachine amLoop (c : LeanIn.Runtime.Conn) := do
     let i := i + 1
   await (LeanIn.Runtime.Io.closeRaw c)
 
+-- `for` over an array: send each element (an await per element), then close.
+asyncMachine amFor (c : LeanIn.Runtime.Conn) := do
+  for x in (#[s!"a\n".toUTF8, s!"b\n".toUTF8, s!"c\n".toUTF8] : Array ByteArray) do
+    await (LeanIn.Runtime.Io.sendAllRaw c #[x])
+  await (LeanIn.Runtime.Io.closeRaw c)
+
+-- `while` with `break`: send 0, 1, then break out and close.
+asyncMachine amBreak (c : LeanIn.Runtime.Conn) := do
+  let i : Nat := 0
+  while i < 10 do
+    if i == 2 then break
+    await (LeanIn.Runtime.Io.sendAllRaw c #[s!"{i}\n".toUTF8])
+    let i := i + 1
+  await (LeanIn.Runtime.Io.closeRaw c)
+
+-- `while` with `continue`: send the odd numbers 1,3,5, skipping even by `continue`.
+asyncMachine amContinue (c : LeanIn.Runtime.Conn) := do
+  let i : Nat := 0
+  while i < 5 do
+    let i := i + 1
+    if i % 2 == 0 then continue
+    await (LeanIn.Runtime.Io.sendAllRaw c #[s!"{i}\n".toUTF8])
+  await (LeanIn.Runtime.Io.closeRaw c)
+
 /-- CPS echo: read, write back, recurse — every step through the `Join`-cell delivery (park, `Item`, carrier). -/
 partial def cpsEcho (hooks : Runtime.Hooks) (c : Runtime.Conn) : Task.EAsync IO.Error Unit := do
   try
@@ -92,6 +116,12 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (amHttp.run c)
   else if mode == "loop" then
     monadLift (amLoop.run c)
+  else if mode == "for" then
+    monadLift (amFor.run c)
+  else if mode == "brk" then
+    monadLift (amBreak.run c)
+  else if mode == "cont" then
+    monadLift (amContinue.run c)
   else if mode == "serveconn" then
     -- `maxMessages` bumped far past the default 100 so a keep-alive connection is not closed mid-benchmark
     -- (Node applies no per-connection request cap); the H1 machine threads the count across requests.
