@@ -162,32 +162,45 @@ private def jumpTo (name : Name) (conn : Name) (j : Nat) (args : List Name) : Ma
   else
     `($step $(mkIdent conn) ($cn $argTs*))
 
-/-- The match arm for one state. `prefix` runs first (pure items inlined); then the suspension resumes to the
-next state. -/
+/-- Wrap `inner` with the pure items of a segment as `let`-bindings, in order. A pure binding `let x := e`
+introduces `x`; a bare statement `e` is sequenced with `let _ := e`. The pure code between awaits is inlined
+into the current state's step, before the suspension. -/
+private def withPrefix (pures : List PItem) (inner : Term) : MacroM Term :=
+  pures.foldrM (fun p acc => do
+    let e : Term := ⟨p.term⟩
+    match p.bound? with
+    | some x => `(let $(mkIdent x) := $e; $acc)
+    | none => `(let _ := $e; $acc)) inner
+
+/-- The match arm for one state: the segment's pure items are inlined first, then the suspension resumes to
+the next state. -/
 private def armOf (name : Name) (conn : Name) (st : SState) (nextIdx : Nat) (nextLive : List Name) : MacroM (TSyntax `Lean.Parser.Term.matchAltExpr) := do
   let c := mkIdent conn
   let pats := st.fields.toArray.map (fun (f, _) => (mkIdent f : Term))
   let cn := stLocalName st.idx
   let susp := st.seg.susp.getD { isAwait := true, bound? := none, term := Syntax.missing }
   let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
-  match classify susp.term with
-  | .recv =>
-    let bv := susp.bound?.getD `bs
-    -- The target's live vars (`nextLive`, from liveInto of `nextIdx`) already include `bv` when `bv` is used
-    -- later, so passing `nextLive` alone avoids doubling it; the continuation binds `bv` to fill that field.
-    let body ← jumpTo name conn nextIdx nextLive
-    `(matchAltExpr| | $patTerm => LeanIn.Runtime.Io.recvRaw $c 65536 (fun
-        | some $(mkIdent bv) => $body
-        | none => LeanIn.Runtime.Io.closeRaw $c))
-  | .sendAll d =>
-    let body ← jumpTo name conn nextIdx nextLive
-    `(matchAltExpr| | $patTerm => LeanIn.Runtime.Io.sendAllRaw $c $d ($body))
-  | .send d =>
-    let body ← jumpTo name conn nextIdx nextLive
-    `(matchAltExpr| | $patTerm => LeanIn.Runtime.Io.sendRaw $c $d ($body))
-  | .close =>
-    `(matchAltExpr| | $patTerm => LeanIn.Runtime.Io.closeRaw $c)
-  | .unknown => Macro.throwError "asyncMachine: unsupported effect in await"
+  let effBody ←
+    match classify susp.term with
+    | .recv =>
+      let bv := susp.bound?.getD `bs
+      -- The target's live vars (`nextLive`, from liveInto of `nextIdx`) already include `bv` when `bv` is used
+      -- later, so passing `nextLive` alone avoids doubling it; the continuation binds `bv` to fill that field.
+      let body ← jumpTo name conn nextIdx nextLive
+      `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
+          | some $(mkIdent bv) => $body
+          | none => LeanIn.Runtime.Io.closeRaw $c))
+    | .sendAll d =>
+      let body ← jumpTo name conn nextIdx nextLive
+      `(LeanIn.Runtime.Io.sendAllRaw $c $d ($body))
+    | .send d =>
+      let body ← jumpTo name conn nextIdx nextLive
+      `(LeanIn.Runtime.Io.sendRaw $c $d ($body))
+    | .close =>
+      `(LeanIn.Runtime.Io.closeRaw $c)
+    | .unknown => Macro.throwError "asyncMachine: unsupported effect in await"
+  let body ← withPrefix st.seg.pures effBody
+  `(matchAltExpr| | $patTerm => $body)
 
 /-- The effect term a live variable was bound by (for its field type). -/
 private def sourceEffect (segs : List Segment) (f : Name) : Syntax :=
