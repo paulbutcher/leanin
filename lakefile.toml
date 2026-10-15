@@ -43,3 +43,8 @@ moreLinkArgs = ["-lnetuv", "-luv"]
 name = "defuncEcho"
 root = "DefuncEcho"
 moreLinkArgs = ["-lnetuv", "-luv"]
+
+[[lean_exe]]
+name = "stdServer"
+root = "StdServer"
+moreLinkArgs = ["-luv"]

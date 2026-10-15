@@ -1,10 +1,15 @@
 # The defunctionalization approach (`async!` / the `VM`)
 
-Status: **experiment** — the `async!` elaborator (as `asyncMachine`) now compiles **`serveConn`'s actual
-connection drive** (with `if` control flow and the H1 machine threaded across requests) to a per-function state
-machine, verified end-to-end and run at **C=1 parity with Node** (below). Pieces 1–2 (raw delivery, the `VM`)
-validated earlier; piece 3 is now real for the connection-loop shape — `await`-marked suspensions, pure items
-inlined, `if` branches lowered to state transitions, liveness-carried fields. `match` and `recvTimeout` remain.
+Status: **a working `Std.Http` replacement.** `LeanIn/Runtime/HttpServer.lean` is an HTTP/1.1 server on the
+`asyncMachine` engine — each connection's `serveConn` compiles the full H1 drive (the `vmDrive` shape: `pump`
+the machine, write, then `halted`? close : `recvTimeout` → EOF/stalled/feed) to a per-function state machine.
+`asyncMachine` lowers `await`-suspensions, inlines pure code, and lowers `if`/`match` control flow to state
+transitions, threads the H1 machine across requests as a field, and routes constant parameters (the clock, the
+deadline, the handler) to **step parameters** like the connection. Validated end-to-end (GET, keep-alive, POST
+bodies, concurrent connections, **partial-read reassembly**, the **stall deadline**) and benchmarked: **~20×
+faster than the shipped `Std.Http.Server`** and **C=1 at/ahead of Node parity** (below). Pieces 1–2 (raw
+delivery, the `VM`) validated earlier. The remaining engine gaps are async handlers (the handler's own `await`)
+and `loop`.
 
 ## Goal
 
@@ -79,19 +84,31 @@ machine from a state's fields; and a shadowing pure bind (`let m := m.feed bs`) 
 binding's type rather than reset it to the inference fallback. `match` and `recvTimeout` (with the stall
 `Clock`) are the remaining gaps; the `match` quotation needs the same array-splice form the step uses.
 
-*Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, compiled `serveConn` vs
-`bench/node-server.mjs`, 5 s runs, `maxMessages` raised past the H1 default of 100 — see below): **C=1 parity**
-— 46 149 vs 43 999 req/s on one run, and 0.81–0.95× across three interleaved re-runs, i.e. the same band as
-Node within this repository's ±30% drift; errors=0. **C=8 / C=32 Node pulls ahead** (87 255 / 76 296 against
-139 743 / 97 825, and Node itself swung 144k→98k at C=32 across runs), the single-carrier ceiling — the loop
-thread does not yet double as a carrier, exactly as W16 recorded.
+*Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, 5 s runs, `maxMessages`/`maxRequests`
+raised past the H1 default of 100 on both Lean servers — see below). The replacement
+(`LeanIn/Runtime/HttpServer.serveConn`) against the shipped **`Std.Http.Server`** (`StdServer.lean`) and Node
+(`bench/node-server.mjs`):
 
-**The threading exposed a real behaviour difference, not a benchmark artefact.** The stateless `amHttp` built a
-fresh H1 machine per request, so its `messageCount` never accumulated; the threaded `serveConn` carries it, so
-at 100 requests the machine emitted `Connection: close` and closed — the H1 default `maxMessages = 100`, a
-production keep-alive cap, not a bug. The raw keep-alive probe (3 responses in 2 ms, then a stall at exactly
-request 100 with `Connection: close` on the wire) is what surfaced it. The benchmark config raises `maxMessages`
-to match Node, which applies no per-connection request cap.
+| C | leanin `HttpServer` | shipped `Std.Http.Server` | Node |
+|---|---|---|---|
+| 1 | **50 300** | 2 333 | 45 466 |
+| 8 | **39 414** | 3 190 | 81 441 |
+| 32 | **58 096** | 3 285 | 102 598 |
+
+**The replacement is ~18–22× faster than the shipped `Std.Http.Server`** at every level (the shipped server is
+on the stock task pool, whose priority deques sit behind one mutex — see `docs/PERFORMANCE.md`), and **at C=1 it
+is at/ahead of Node parity** (1.11× here; earlier interleaved runs read 0.81–1.05×, i.e. the same band within
+this repository's ±30% drift). At C=8/C=32 Node pulls ahead (the single-carrier ceiling, as W16 recorded).
+errors=0 throughout. Correctness beyond throughput: keep-alive, POST bodies, 20 concurrent connections,
+**partial-read reassembly** (a request split across three TCP segments), and the **stall deadline** (an idle
+connection closed at the deadline, confirmed on the wire).
+
+**Threading the machine surfaced a real behaviour difference, not a benchmark artefact.** The stateless `amHttp`
+built a fresh H1 machine per request, so its `messageCount` never accumulated; the threaded `serveConn` carries
+it, so at 100 requests the machine emits `Connection: close` and closes — the H1 default `maxMessages = 100`, a
+production keep-alive cap. The *shipped* `Std.Http.Server` has the same cap (`maxRequests = 100` →
+`maxMessages`), so at the default it reads ~20 req/s here (100 requests then close); the benchmark raises both
+caps to match Node, which applies no per-connection request cap.
 
 ## Where this lands against Node
 

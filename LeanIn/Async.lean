@@ -37,6 +37,7 @@ private inductive Item where
   | pureStmt (term : Syntax)                     -- a bare `e`
   | await (bound? : Option Name) (term : Syntax) -- `let x := await e` / `await e`
   | if_ (cond : Syntax) (then_ else_ : List Item)
+  | match_ (scrut : Syntax) (arms : List (Syntax × List Item))
   | recurse
   | contStmt (term : Term)                       -- internal: a hoisted continuation
   deriving Inhabited
@@ -51,8 +52,15 @@ private partial def doElemsOf (s : Syntax) : List Syntax :=
   | `null => s.getArgs.toList.flatMap doElemsOf
   | _ => if s.isAtom then [] else [s]
 
+/-- Collect the `matchAlt` nodes from a `matchAlts` node. -/
+private partial def matchAltNodesOf (s : Syntax) : List Syntax :=
+  if s.isOfKind `Lean.Parser.Term.matchAlt then [s]
+  else
+    match s with
+    | .node _ _ args => args.toList.flatMap matchAltNodesOf
+    | _ => []
+
 mutual
-/-- Parse a whole do-block (a `doSeq`) into items. -/
 private partial def parseItems (stx : Syntax) : MacroM (List Item) :=
   (doElemsOf stx).mapM parseItem
 
@@ -67,6 +75,10 @@ private partial def parseItem (d : Syntax) : MacroM Item := do
     return .if_ c (← parseItems t) (← parseItems e)
   | `(doElem| if $c:term then $t:doSeq) =>
     return .if_ c (← parseItems t) []
+  | `(doElem| match $s:term with $alts:matchAlts) =>
+    -- Keep each `matchAlt` node whole; its body (arg 3) is parsed into items, its pattern (arg 1) is reused verbatim.
+    let arms ← (matchAltNodesOf alts.raw).mapM (fun nd => do pure (nd, ← parseItems (nd.getArg 3)))
+    return .match_ s arms
   | `(doElem| recurse) => return .recurse
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"asyncMachine: unsupported do-item: {d}"
@@ -75,6 +87,7 @@ end
 /-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
 private inductive Eff where
   | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
+  | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
   | sendAll (data : Term)
   | send (data : Term)
   | close
@@ -86,6 +99,7 @@ private partial def unparen (s : Syntax) : Syntax :=
 
 private def classify (e : Syntax) : Eff :=
   match unparen e with
+  | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => .recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩
   | `(LeanIn.Runtime.Io.recvRaw $_ $_) => .recv
   | `(LeanIn.Runtime.Io.recvRaw $_) => .recv
   | `(LeanIn.Runtime.Io.sendAllRaw $_ $d) => .sendAll ⟨d⟩
@@ -118,14 +132,29 @@ where
   | .pureStmt e => usedNames e
   | .await _ e => usedNames e
   | .if_ c t e => usedNames c ++ usedInItems t ++ usedInItems e
+  | .match_ s arms => usedNames s ++ arms.flatMap (fun (_, b) => usedInItems b)
   | .recurse => []
   | .contStmt _ => []
+
+/-- The names **rebound** by `let x := …` in a list of items (recursively). A parameter that is rebound becomes
+a threaded field; one that is only *referenced* (never rebound) stays a constant step parameter — a field
+binding and a bare reference to it can carry different macro scopes and fail to resolve, while a step
+parameter (like the connection) resolves cleanly. -/
+private partial def boundInItems (items : List Item) : List Name :=
+  items.flatMap go
+where
+  go : Item → List Name
+  | .pureBind pat _ => patBoundNames pat
+  | .if_ _ t e => boundInItems t ++ boundInItems e
+  | .match_ _ arms => arms.flatMap (fun (_, b) => boundInItems b)
+  | _ => []
 
 /-- Whether a list of items suspends anywhere (decides inline-vs-new-state for a continuation). -/
 private partial def hasAwait (items : List Item) : Bool :=
   items.any fun
     | .await .. => true
     | .if_ _ t e => hasAwait t || hasAwait e
+    | .match_ _ arms => arms.any (fun (_, b) => hasAwait b)
     | _ => false
 
 /-- A variable's binding, for field-type inference. -/
@@ -133,6 +162,7 @@ private inductive Bind where
   | conn                          -- the connection (a step parameter, never a field)
   | threaded (ty : Term)          -- a threaded parameter (its signature type)
   | recvRes                       -- `recvRaw` result ⇒ `ByteArray`
+  | recvTimeoutRes                -- `recvTimeoutRaw` result ⇒ `Option (Option ByteArray)`
   | pureB                         -- pure-bound ⇒ inferred from use
 
 /-- A generated state: its index, its (typed) fields, and its body. -/
@@ -144,7 +174,8 @@ private structure GenState where
 private structure Ctx where
   name : Name
   conn : Name
-  threaded : List Name          -- the threaded parameter names (state 0's fields)
+  threaded : List Name          -- the threaded field names (state 0's fields, rebound in the body)
+  stepParams : List (Name × Term)  -- constant step parameters (never rebound), passed to `step` like the connection
 
 private abbrev CompileM := StateT (Nat × List GenState) MacroM
 
@@ -180,6 +211,7 @@ where
      | .sendAll d | .send d => d.raw.isIdent && d.raw.getId == f
      | _ => false)
   | .if_ _ t e => usesSendArg f t || usesSendArg f e
+  | .match_ _ arms => arms.any (fun (_, b) => usesSendArg f b)
   | _ => false
 
 /-- Whether a pure-bound variable is used as an `if`-condition in the items. -/
@@ -188,6 +220,7 @@ private partial def usedAsCond (f : Name) (items : List Item) : Bool :=
 where
   go : Item → Bool
   | .if_ c t e => (c.isIdent && c.getId == f) || usedAsCond f t || usedAsCond f e
+  | .match_ _ arms => arms.any (fun (_, b) => usedAsCond f b)
   | _ => false
 
 /-- The type of one state field, from its binding and (for pure-bound) how the continuation uses it. -/
@@ -195,19 +228,22 @@ private def fieldTypeFor (f : Name) (b : Bind) (rest : List Item) : MacroM Term 
   match b with
   | .threaded ty => pure ty
   | .recvRes => `($(mkIdent `ByteArray))
+  | .recvTimeoutRes => `(Option (Option ByteArray))
   | .conn => Macro.throwError s!"asyncMachine: the connection `{f}` cannot be a state field"
   | .pureB =>
     if usesSendArg f rest then `(Array ByteArray)
     else if usedAsCond f rest then `($(mkIdent `Bool))
     else `($(mkIdent `Unit))
 
-/-- A jump `name.step c (name.St.s{idx} args…)`, passing `args` (the state's live fields). -/
+/-- A jump `name.step c sp… (name.St.s{idx} args…)`, passing the constant step parameters `sp…` and the state's
+live fields `args`. -/
 private def jumpTerm (ctx : Ctx) (idx : Nat) (args : List Name) : MacroM Term := do
   let step := mkIdent (ctx.name ++ `step)
   let cn := stIdent ctx.name idx
   let c := mkIdent ctx.conn
+  let spArgs := ctx.stepParams.toArray.map (fun (x, _) => (mkIdent x : Term))
   let argTs := args.toArray.map (fun a => (mkIdent a : Term))
-  if argTs.isEmpty then `($step $c $cn) else `($step $c ($cn $argTs*))
+  if argTs.isEmpty then `($step $c $spArgs* $cn) else `($step $c $spArgs* ($cn $argTs*))
 
 /-- The `recurse` jump: back to state 0 with the threaded parameters' current values. -/
 private def recurseTerm (ctx : Ctx) : MacroM Term :=
@@ -217,6 +253,7 @@ private def recurseTerm (ctx : Ctx) : MacroM Term :=
 private def resultBind (eff : Eff) : Bind :=
   match eff with
   | .recv => .recvRes
+  | .recvTimeout .. => .recvTimeoutRes
   | _ => .pureB
 
 /-- The suspension for one effect, with continuation `cont`. -/
@@ -228,6 +265,9 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
     `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
         | some $(mkIdent bv) => $cont
         | none => LeanIn.Runtime.Io.closeRaw $c))
+  | .recvTimeout sched d z =>
+    let bv := bnd.getD `r
+    `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z (fun $(mkIdent bv) => $cont))
   | .sendAll d => `(LeanIn.Runtime.Io.sendAllRaw $c $d ($cont))
   | .send d => `(LeanIn.Runtime.Io.sendRaw $c $d ($cont))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
@@ -268,6 +308,23 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     let thenT ← compileBody ctx (t ++ suffix) scope
     let elseT ← compileBody ctx (e ++ suffix) scope
     `(if $(⟨c⟩) then $thenT else $elseT)
+  | .match_ s arms :: rest => do
+    let cont? ← hoistCont ctx rest scope
+    let suffix := cont?.toList
+    let armTerms ← arms.toArray.mapM (fun (nd, body) => do
+      let armScope := extendScope scope (patBoundNames (nd.getArg 1))
+      let t ← compileBody ctx (body ++ suffix) armScope
+      -- Rebuild the alternative as a term-level `matchAlt`, reusing the pattern (arg 1) verbatim and
+      -- replacing only the body (arg 3) with the compiled continuation (a term, where the do-body was).
+      match nd with
+      | .node info _ args =>
+        if args.size ≥ 4 then
+          let newAlt : Syntax := .node info `Lean.Parser.Term.matchAlt (args.set! 3 t.raw)
+          pure (⟨newAlt⟩ : TSyntax `Lean.Parser.Term.matchAlt)
+        else Macro.throwError "asyncMachine: malformed match alternative"
+      | _ => Macro.throwError "asyncMachine: malformed match alternative")
+    let scrut : Term := ⟨s⟩
+    `(match $scrut:term with $armTerms:matchAlt*)
 
 /-- The continuation after an `await`: inline pures+`recurse`/a hoisted marker; otherwise a new state. -/
 private partial def genCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Term := do
@@ -320,15 +377,21 @@ end
 
 /-- `asyncMachine name (c : Conn) (x : T) … := do …` — lower the body to a state machine. -/
 elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedBinder* " := " body:doSeq : command => do
-  -- The threaded parameters (each `(x : T)`), with their signature types.
+  -- The threaded parameters (each `(x : T)`), with their signature types. The names are scope-erased: a
+  -- `bracketedBinder` parameter and the body's references to it can carry different macro scopes (an
+  -- inline-parsed parameter like the connection does not), which would leave a state field unresolvable.
   let threadedInfo ← params.toList.mapM fun p =>
     match p.raw with
-    | `(bracketedBinder| ( $x:ident : $ty:term )) => pure (x.getId, (ty : Term))
+    | `(bracketedBinder| ( $x:ident : $ty:term )) => pure (x.getId.eraseMacroScopes, (ty : Term))
     | _ => throwError "asyncMachine: parameters must be `(x : T)`"
   let threaded := threadedInfo.map (·.1)
   let items ← Lean.Elab.liftMacroM (parseItems body)
-  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threaded }
-  let initScope : List (Name × Bind) := threadedInfo.map (fun (x, ty) => (x, .threaded ty))
+  -- Split: parameters rebound in the body are threaded fields; the rest are constant step parameters.
+  let rebound := boundInItems items
+  let stepParams := threadedInfo.filter (fun (x, _) => !rebound.contains x)
+  let threadedFields := threadedInfo.filter (fun (x, _) => rebound.contains x)
+  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threadedFields.map (·.1), stepParams := stepParams }
+  let initScope : List (Name × Bind) := threadedFields.map (fun (x, ty) => (x, .threaded ty))
   -- Run the compiler, seeding state 0 as the entry (its fields are the threaded parameters).
   let s0fields ← initScope.mapM (fun (x, b) => do
     match b with
@@ -353,15 +416,18 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
     let cn := stLocalName st.idx
     let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
     `(matchAltExpr| | $patTerm => $(st.body)))
-  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) : $sn → IO Unit :=
+  -- The step takes the connection and the constant step parameters; the threaded fields live in the states.
+  let stepBinders ← stepParams.toArray.mapM (fun (x, ty) => `(bracketedBinder| ($(mkIdent x) : $ty)))
+  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $stepBinders* : $sn → IO Unit :=
     fun st => match st with
       $matchAlts:matchAlt*)
   Lean.Elab.Command.elabCommand stepCmd
-  -- The run passes the connection and the threaded parameters to state 0.
-  let s0args := threaded.toArray.map (fun x => (mkIdent x : Term))
-  let s0app ← if s0args.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $s0args*)
+  -- The run passes the connection and step parameters to `step`, and the threaded fields to state 0.
+  let stepArgs := stepParams.toArray.map (fun (x, _) => (mkIdent x : Term))
+  let tfArgs := threadedFields.toArray.map (fun (x, _) => (mkIdent x : Term))
+  let s0app ← if tfArgs.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $tfArgs*)
   let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $params* : IO Unit :=
-    $stepn $(mkIdent c.getId) $s0app)
+    $stepn $(mkIdent c.getId) $stepArgs* $s0app)
   Lean.Elab.Command.elabCommand runCmd
 
 end LeanIn.Async

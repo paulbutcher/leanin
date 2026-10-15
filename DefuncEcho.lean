@@ -3,6 +3,7 @@ import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
 import LeanIn.Runtime.VMHttp
 import LeanIn.Runtime.SmEcho
+import LeanIn.Runtime.HttpServer
 import LeanIn.Async
 open LeanIn
 
@@ -41,39 +42,6 @@ asyncMachine amHttp (c : LeanIn.Runtime.Conn) := do
   await (LeanIn.Runtime.Io.sendAllRaw c out)
   recurse
 
-/-- The H1 connection driver, pure: step the machine, run the handler on `endHeaders`, and keep stepping while
-it makes progress, returning the updated machine, the accumulated output to write, and whether it halted. This
-is `vmDrive`'s pure core — the part between the socket effects — folded into one function so `asyncMachine` can
-suspend only on the reads and writes. -/
-partial def pump (handler : Runtime.VMHttp.PureHandler) (m : Std.Http.Protocol.H1.Machine .receiving) :
-    Std.Http.Protocol.H1.Machine .receiving × Array ByteArray × Bool :=
-  go m #[]
-where
-  go (m : Std.Http.Protocol.H1.Machine .receiving) (acc : Array ByteArray) :
-      Std.Http.Protocol.H1.Machine .receiving × Array ByteArray × Bool :=
-    if m.halted then (m, acc, true)
-    else
-      let (m', step) := m.step
-      let acc := acc ++ step.output.data
-      let m'' := Runtime.VMHttp.processEvents m' step.events handler
-      if m''.halted then (m'', acc, true)
-      else if Runtime.VMHttp.madeProgress step.output.size step.events then go m'' acc
-      else (m'', acc, false)
-
-asyncMachine serveConn (c : LeanIn.Runtime.Conn) (m : Std.Http.Protocol.H1.Machine .receiving) := do
-  let t := pump reply m
-  let m := t.1
-  let out := t.2.1
-  let halted := t.2.2
-  if out.size > 0 then
-    await (LeanIn.Runtime.Io.sendAllRaw c out)
-  if halted then
-    await (LeanIn.Runtime.Io.closeRaw c)
-  else
-    let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
-    let m := m.feed bs
-    recurse
-
 /-- CPS echo: read, write back, recurse — every step through the `Join`-cell delivery (park, `Item`, carrier). -/
 partial def cpsEcho (hooks : Runtime.Hooks) (c : Runtime.Conn) : Task.EAsync IO.Error Unit := do
   try
@@ -96,7 +64,7 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
   else if mode == "vm" then
     monadLift (Runtime.VM.run (vmEcho c))
   else if mode == "vmhttp" then
-    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 12000 {} reply))
+    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 1500 {} reply))
   else if mode == "vmhttpS" then
     monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 400 {} reply))
   else if mode == "smecho" then
@@ -110,7 +78,7 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
   else if mode == "serveconn" then
     -- `maxMessages` bumped far past the default 100 so a keep-alive connection is not closed mid-benchmark
     -- (Node applies no per-connection request cap); the H1 machine threads the count across requests.
-    monadLift (serveConn.run c ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
+    monadLift (Runtime.HttpServer.serveConn.run c (Runtime.Clock.live hooks) 12000 reply ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode
