@@ -7,6 +7,10 @@ package leanin where
   keywords := #["concurrency", "scheduler", "async", "runtime", "software-verification", "ffi"]
   license := "Apache-2.0"
   licenseFiles := #["LICENSE", "NOTICE"]
+  /- The library needs this toolchain and no other: `Std.WP`, which the proof strategy leans on, does not exist
+  before 4.35. Saying so makes `lake update` prefer it for downstream packages rather than resolving them onto a
+  toolchain the library cannot build on. -/
+  fixedToolchain := true
 
 @[default_target] lean_lib LeanIn
 
