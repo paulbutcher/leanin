@@ -39,9 +39,13 @@ Liberal borrowing, named so that each claim is checkable rather than remembered:
   path.
 - **Node** — the I/O completion model. Our socket layer is a libuv loop of our own (`c/netuv.c`), so what a
   completion *is*, and where it resumes, has Node's shape.
-- **Conor McBride** — the framing that makes the compilation below the natural target rather than a trick:
-  *one-hole contexts*, the derivative of a regular type. Suspend a computation and what is left is a value with a
-  hole where its answer belongs. That context **is** the machine state, and resuming is filling the hole.
+- **Frank** — the direction, from Lindley, McBride and McLaughlin's *Do be do be do*
+  ([`arXiv:1611.09259`](https://arxiv.org/abs/1611.09259)), which builds the language around Plotkin and
+  Pretnar's effect handlers and makes a *function* the special case of an **operator** that interprets no
+  commands — so effectful and pure code are one mechanism, with no separate handling construct. That is the shape
+  this engine is built towards: `asyncMachine` compiles a `do` block into a machine that interprets its own
+  suspensions, and the handler that suspends nowhere is the operator that interprets no commands, answered
+  inline with no cell and no state hop.
 
 ## The state machine async — the important part
 
