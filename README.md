@@ -28,7 +28,7 @@ real connections on carriers of our own, which is what the table above measures.
 
 ## Where the design comes from
 
-Liberal borrowing, named so that each claim is checkable rather than remembered:
+Two borrowings and one influence, named so that each claim is checkable rather than remembered:
 
 - **Tokio** — the scheduler architecture, taken component by component from the Rust source. The reference copy
   is `Vendor/tokio/`, and [`docs/tokio-map.md`](docs/tokio-map.md) anchors every borrowing to a line in it: the
@@ -39,13 +39,10 @@ Liberal borrowing, named so that each claim is checkable rather than remembered:
   path.
 - **Node** — the I/O completion model. Our socket layer is a libuv loop of our own (`c/netuv.c`), so what a
   completion *is*, and where it resumes, has Node's shape.
-- **Frank** — the direction, from Lindley, McBride and McLaughlin's *Do be do be do*
-  ([`arXiv:1611.09259`](https://arxiv.org/abs/1611.09259)), which builds the language around Plotkin and
-  Pretnar's effect handlers and makes a *function* the special case of an **operator** that interprets no
-  commands — so effectful and pure code are one mechanism, with no separate handling construct. That is the shape
-  this engine is built towards: `asyncMachine` compiles a `do` block into a machine that interprets its own
-  suspensions, and the handler that suspends nowhere is the operator that interprets no commands, answered
-  inline with no cell and no state hop.
+- **Frank** — an influence. Lindley, McBride and McLaughlin's *Do be do be do*
+  ([`arXiv:1611.09259`](https://arxiv.org/abs/1611.09259)) designs a language around effect handlers, with a
+  *function* as the special case of an **operator** that interprets no commands, so effectful and pure code are
+  one mechanism with no separate handling construct. The async here is aimed at that shape.
 
 ## The state machine async — the important part
 
