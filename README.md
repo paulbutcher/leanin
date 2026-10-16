@@ -2,13 +2,15 @@
   <img src="docs/assets/LeanIn.png" alt="leanin" width="720">
 </p>
 
-# `leanin`
+# `LeanIn`
 
-A concurrency runtime and work-stealing scheduler for **Lean 4**, built so that the properties that matter are
-machine-checked and the steady-state cost of async code is **data, not closures**.
+LeanIn is a concurrency runtime with a work-stealing scheduler for **Lean 4**. The basic thrust is that we can use
+techniques found in tokio and node to get a runtime for concurrency that is on par with other highly concurrent
+languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
+defunctionalisation rather than vanilla `do`.
 
-The engine is general; the vehicle is an HTTP/1.1 server. On one box, in one run, 5 s per point, keep-alive with
-a per-request handler (`bench/threeway.sh`):
+The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which gives
+you a flavour of our current performance, we should a keep-alive with a per-request handler (`bench/threeway.sh`):
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
@@ -16,41 +18,36 @@ a per-request handler (`bench/threeway.sh`):
 | **leanin** | **29 932** | **42 241** | **37 705** |
 | shipped `Std.Http.Server` | 2 166 | 3 363 | 2 687 |
 
-**~14× the Lean HTTP server that ships with the toolchain**, and within 1.5× of Node at one connection. What we
-are worse at — and there is a list — is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4, next to the
-instrument's own ±30 % noise.
+**~14× the Lean HTTP server that ships with the toolchain**, and within 1.5× of Node at one connection. We
+still have some work to hit Node 22 performance, but is within spitting distance. More details here: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
-Status: **M2 closed, M3 under way** ([`PLAN.md`](docs/PLAN.md) §0, [`docs/decisions.md`](docs/decisions.md)). The
+## Development Status
+
+**M2 closed, M3 under way** ([`PLAN.md`](docs/PLAN.md) §0, [`docs/decisions.md`](docs/decisions.md)). The
 pure model is implemented and machine-checked (`LeanIn/Model/`, `LeanIn/Theory/World.lean`) with an executable
 probe for its vacuity; `LeanIn/Theory/Bridge.lean` states the nine primitive contracts about the native
 operations, each with a control and three with native trace scenarios under `tests/`; and the runtime serves
 real connections on carriers of our own, which is what the table above measures.
 
-## Where the design comes from
+## Design
 
-Two borrowings and one influence, named so that each claim is checkable rather than remembered:
+Our current focus is a single threaded carrier with high concurrency. In order to achieve that we borrow liberally
+from the following:
 
 - **Tokio** — the scheduler architecture, taken component by component from the Rust source. The reference copy
   is `Vendor/tokio/`, and [`docs/tokio-map.md`](docs/tokio-map.md) anchors every borrowing to a line in it: the
   multi-thread work-stealing flavour (per-worker local queue, shared inject queue, stealing), the LIFO slot, the
-  current-thread flavour, the blocking pool, `defer`, `block_in_place`. One thing that document exists to
-  correct: Tokio's queue is **not** a Chase–Lev deque — Tokio replaced crossbeam's with one adapted from the Go
-  runtime, because dynamic growth needs epoch-based reclamation and reclamation costs two atomic RMWs on the hot
-  path.
-- **Node** — the I/O completion model. Our socket layer is a libuv loop of our own (`c/netuv.c`), so what a
-  completion *is*, and where it resumes, has Node's shape.
-- **Frank** — an influence. Lindley, McBride and McLaughlin's *Do be do be do*
-  ([`arXiv:1611.09259`](https://arxiv.org/abs/1611.09259)) designs a language around effect handlers, with a
-  *function* as the special case of an **operator** that interprets no commands, so effectful and pure code are
-  one mechanism with no separate handling construct. The async here is aimed at that shape.
+  current-thread flavour, the blocking pool, `defer`, `block_in_place`.
+- **Node** — the I/O completion model. Our socket layer is a libuv loop of our own (`c/netuv.c`) but has Node's
+  shape.
 
-## The state machine async — the important part
+## Stat Machines for async
 
-Client code reads like async — `do`, with `←` for a suspension — and it is **compiled**, not threaded through
-closures.
+Our client code reads like a monadic async similar to what ships with Lean — `do`, with `←` for a suspension — but
+our version is **compiled** and not threaded through closures with `bind`.
 
-`asyncMachine` (`LeanIn/Async.lean`) lowers a `do` block to a **flat state machine**: one constructor per
-suspension point, carrying exactly the variables live across it (a liveness analysis decides which); a `step`
+`asyncMachine` (`LeanIn/Async.lean`) lowers a `do` block to a **flat state machine**: with one constructor per
+suspension point, carrying the variables which live across invocations as *data* (after a liveness analysis); a `step`
 function the driver matches on; pure code inlined into the current state; and `if`, `while`, `for`, `break` and
 `continue` lowered to transitions between states. Suspensions are marked `await`. Parameters are either constant
 **step parameters** (the connection, the clock, the handler) or **threaded fields** (the H1 machine — state 0
@@ -59,23 +56,11 @@ carries it and `recurse` passes its current value back, which is how keep-alive 
 A suspension allocates no `Join` cell, `Item`, inject or carrier fire. A completion **resumes its continuation
 on the loop thread** — raw delivery — so resuming is a direct call rather than a wakeup round trip.
 
-Why this is the important part is a measurement, not a preference. Profiling the serving path: **~47 % of
-instructions are memory management** (allocation, free, refcount, GC mark) and ~9 % closure application, while
-the HTTP parse and the response write together are **under 2 %**. The churn is the continuations themselves —
-every `←` in a `do` block is a `bind` allocating a fresh closure, which cannot be hand-optimised per loop, only
-defunctionalised:
-
-| echo path | instructions/request | against CPS |
-|---|---|---|
-| CPS closures | 67 400 | — |
-| raw delivery — a completion resumes in place | 29 700 | −56 % |
-| the same echo written as ordinary `do` in `VM` | 30 900 | −54 %, within ~6 % of the hand-written raw echo |
-
-Details, including the two Lean obstacles this ran into, are in [`docs/async-vm.md`](docs/async-vm.md).
+Details are in [`docs/async-vm.md`](docs/async-vm.md).
 
 ## Install
 
-The toolchain is named in **two places that must agree**:
+The toolchain uses both lake and nix.
 
 | File | For | Toolchain |
 |---|---|---|
