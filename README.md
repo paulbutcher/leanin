@@ -169,3 +169,10 @@ and §4 carries the settled re-run beside it.
 
 `Vendor/tokio/` is a read-only copy of the Tokio source, kept so that "this algorithm came from Tokio" is
 checkable line by line. It is outside the build and carries Tokio's own licence.
+
+## Licence
+
+Apache License 2.0 — the full text is [`LICENSE`](LICENSE), and the attribution it asks for is in
+[`NOTICE`](NOTICE).
+
+Copyright 2026 Scidonia Limited.
