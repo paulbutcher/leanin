@@ -736,6 +736,23 @@ earlier reading of 2 072–2 148 µs against 17 µs) to **~5×**. **The load ave
 Node's own row sits below its recorded 41 195 / 95 800, so the absolute figures are depressed and the ratios are
 what to read; a settled re-run is owed for the record.**
 
+**That re-run, at the four-way's own levels** — `bench/threeway.sh`, which is this driver committed rather than
+kept in run notes, so the rows below are re-runnable from the tree (`nix develop -c bash bench/threeway.sh 1 8
+32`). Load average **2.59**, echo handler, one invocation, 5 s per point:
+
+| server | C=1 | C=8 | C=32 |
+|---|---|---|---|
+| Node 22 | 45 380 (p50 20 µs) | 139 857 | 101 042 |
+| leanin (this commit) | 29 932 (p50 29 µs) | 42 241 | 37 705 |
+| shipped `Std.Http.Server` | 2 166 (p50 400 µs) | 3 363 | 2 687 |
+
+The shape is the contended run's, less the depression the paragraph above names. Against the shipped server ours
+reads **13.8× / 12.6× / 14.0×**; against Node we are **1.5× / 3.3× / 2.7×** behind at the three levels. That
+last direction is neither the parser nor the driver: `Server.lean` runs `workers := 1`, one carrier, so added
+connections queue on a single thread while Node's one event loop stays ahead by not paying the handoffs. The
+`e2b2988` row above is left as history and not re-read — it is a superseded commit, and re-reading it costs a
+build of that commit for a path nothing runs now.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
