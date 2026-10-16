@@ -10,7 +10,7 @@ languages but which lives in a proof assistant. The basic trick is to use **data
 defunctionalisation rather than vanilla `do`.
 
 The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which gives
-you a flavour of our current performance, we should a keep-alive with a per-request handler (`bench/threeway.sh`):
+you a flavour of our current performance: a keep-alive with a per-request handler (`bench/threeway.sh`):
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
