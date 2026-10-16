@@ -1,5 +1,16 @@
 name = "leanin"
 version = "0.1.0"
+description = "A concurrency runtime and work-stealing scheduler for Lean 4: Tokio's algorithms, an async that compiles to data rather than closures, and machine-checked proofs for the properties that matter."
+keywords = [
+  "concurrency",
+  "scheduler",
+  "async",
+  "runtime",
+  "software-verification",
+  "ffi",
+]
+license = "Apache-2.0"
+licenseFiles = ["LICENSE", "NOTICE"]
 defaultTargets = [
   "LeanIn",
   "spike",
