@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/LeanIn.png" alt="leanin" width="720">
+</p>
+
 # `leanin`
 
 A concurrency runtime and work-stealing scheduler for **Lean 4**, built so that the properties that matter are
