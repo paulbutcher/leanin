@@ -3,7 +3,7 @@
 What would have to be built, and what evidence would have to exist, before `leanin` is something you could
 write a network service on. Ordered so that each item unblocks the next, with the Tokio-like aspects first.
 
-This extends [`PLAN.md`](../PLAN.md) rather than replacing it: **W4 is its M4** (the blocking pool) and **W8 is
+This extends [`PLAN.md`](PLAN.md) rather than replacing it: **W4 is its M4** (the blocking pool) and **W8 is
 its M5** (multi-carrier and stealing). Everything else is new, and the milestone numbering here is deliberately
 separate so the two can be read side by side.
 

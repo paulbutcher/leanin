@@ -47,7 +47,7 @@ ______________________________________________________________________
 
 ## 2. Measured: what Lean 4.35's scheduler actually does
 
-Harness: `Spike.lean`, built and run as `lake exe spike`. It spawns tasks, samples
+Harness: `LeanIn/Exe/Spike.lean`, built and run as `lake exe spike`. It spawns tasks, samples
 `IO.getTID`, and times blocking vs. non-blocking sleeps under contention.
 Output, verbatim (single run, idle machine):
 
@@ -173,7 +173,7 @@ ______________________________________________________________________
 
 ## 5. Measured: the `Task`-as-waker bridge
 
-Harness: `WakerSpike.lean`, run through the nix dev shell. Reproduces the O3 spike behind D10 in
+Harness: `LeanIn/Exe/WakerSpike.lean`, run through the nix dev shell. Reproduces the O3 spike behind D10 in
 [`decisions.md`](decisions.md).
 
 ```

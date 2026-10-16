@@ -93,7 +93,7 @@ binding's type rather than reset it to the inference fallback. `match` and `recv
 
 *Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, 5 s runs, `maxMessages`/`maxRequests`
 raised past the H1 default of 100 on both Lean servers — see below). The replacement
-(`LeanIn/Runtime/HttpServer.serveConn`) against the shipped **`Std.Http.Server`** (`StdServer.lean`) and Node
+(`LeanIn/Runtime/HttpServer.serveConn`) against the shipped **`Std.Http.Server`** (`LeanIn/Exe/StdServer.lean`) and Node
 (`bench/node-server.mjs`):
 
 | C | leanin `HttpServer` | shipped `Std.Http.Server` | Node |
@@ -149,4 +149,4 @@ per-request decomposition of `serveConn` (from the echo experiment + timeout spi
   its *percentage* win is smaller — the per-suspension machinery is identical.
 - The VM's interpreter runs the client on the loop thread (right for the single-carrier driver; multi-carrier
   needs thought). Raw delivery parks the loop per op; a batching VM would keep switches low.
-- All of this is experiment-quality (`VM.lean`, the raw path in `Io.lean`, `DefuncEcho.lean`); gate holds 22/22.
+- All of this is experiment-quality (`VM.lean`, the raw path in `Io.lean`, `LeanIn/Exe/DefuncEcho.lean`); gate holds 22/22.

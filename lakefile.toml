@@ -15,40 +15,40 @@ name = "LeanIn"
 
 [[lean_exe]]
 name = "spike"
-root = "Spike"
+root = "LeanIn.Exe.Spike"
 
 [[lean_exe]]
 name = "wakerspike"
-root = "WakerSpike"
+root = "LeanIn.Exe.WakerSpike"
 
 [[lean_exe]]
 name = "controls"
-root = "Controls"
+root = "LeanIn.Exe.Controls"
 moreLinkArgs = ["-lnetuv", "-luv"]
 
 [[lean_exe]]
 name = "dynamics"
-root = "Dynamics"
+root = "LeanIn.Exe.Dynamics"
 
 [[lean_exe]]
 name = "bridgecontrols"
-root = "BridgeControls"
+root = "LeanIn.Exe.BridgeControls"
 
 [[lean_exe]]
 name = "server"
-root = "Server"
+root = "LeanIn.Exe.Server"
 moreLinkArgs = ["-lnetuv", "-luv"]
 
 [[lean_exe]]
 name = "defuncEcho"
-root = "DefuncEcho"
+root = "LeanIn.Exe.DefuncEcho"
 moreLinkArgs = ["-lnetuv", "-luv"]
 
 [[lean_exe]]
 name = "stdServer"
-root = "StdServer"
+root = "LeanIn.Exe.StdServer"
 moreLinkArgs = ["-luv"]
 
 [[lean_exe]]
 name = "h1bench"
-root = "H1Bench"
+root = "LeanIn.Exe.H1Bench"

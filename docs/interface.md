@@ -428,7 +428,7 @@ Each of these is a decision, not an oversight:
   line; D9's trigger is met by it, and the interface freeze this bullet was blocking is no longer
   blocked *on this item*: it is blocked on the convention half being a documented convention rather than
   a claim. The control for the marker is an elaboration check, run as the `#check`/`#check_failure` pair
-  (`LeanIn/Test/Send.lean`, compiled into the gate by `Controls.lean`) rather than the `#guard_msgs` form
+  (`LeanIn/Test/Send.lean`, compiled into the gate by `LeanIn/Exe/Controls.lean`) rather than the `#guard_msgs` form
   first considered — the toolchain's expected-message format did not have to be pinned, and the pair fails the
   build when the marker stops blocking. The `Handle` of §4 is not an exception, and the cross-carrier half of the task-local context's
   inheritance law is now stated for P carriers (D16).

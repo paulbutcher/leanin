@@ -173,7 +173,7 @@ ______________________________________________________________________
 **Exit criteria — met**
 
 - D8 and D9 recorded with their reasons; **D10 spiked with a passing observation**
-  (`WakerSpike.lean`, three runs, all checks true).
+  (`LeanIn/Exe/WakerSpike.lean`, three runs, all checks true).
 - `nix develop -c lake exe spike` reproduces the baseline in [`evidence.md`](evidence.md).
 
 ______________________________________________________________________

@@ -86,7 +86,7 @@ ______________________________________________________________________
 
 ## 3. How to use Lean concurrency today
 
-Idioms, all exercised in `Spike.lean` **[M]**:
+Idioms, all exercised in `LeanIn/Exe/Spike.lean` **[M]**:
 
 ```lean
 -- Spawn and join. `IO.asTask` takes an `IO` action; result is `Task (Except IO.Error α)`.

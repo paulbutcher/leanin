@@ -159,7 +159,7 @@ seen use.
 
 ### D10 — The `Task`-as-waker bridge works. O3 closed.
 
-Spiked, not assumed. `WakerSpike.lean`, run three times:
+Spiked, not assumed. `LeanIn/Exe/WakerSpike.lean`, run three times:
 
 ```
   carrier  tid=3185064  consumed "event:ok: 7" (waker tid=3185065)
@@ -296,7 +296,7 @@ normalises with `Nat.mod_add_mod` and splits on whether each argument is below o
 `≥ cap` branch must carry its side condition out of the split:** `Nat` subtraction saturates, so a bare
 `m % cap = m - cap` is satisfiable at `m = cap = 0` and refutes nothing. With that, the `%`-indexed
 formulation — exactly Tokio's scheme — is what shipped, and the compaction alternative is unnecessary.
-See M2b in [`PLAN.md`](../PLAN.md).
+See M2b in [`PLAN.md`](PLAN.md).
 
 **Consequence for the plan.** `Ring` is a pure, provable obligation and belongs *before* M3's
 concurrency, since the concurrent queue is a `Ring` under a mutex. It is scheduled as **M2b**.

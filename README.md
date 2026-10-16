@@ -16,7 +16,7 @@ a per-request handler (`bench/threeway.sh`):
 are worse at — and there is a list — is in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4, next to the
 instrument's own ±30 % noise.
 
-Status: **M2 closed, M3 under way** ([`PLAN.md`](PLAN.md) §0, [`docs/decisions.md`](docs/decisions.md)). The
+Status: **M2 closed, M3 under way** ([`PLAN.md`](docs/PLAN.md) §0, [`docs/decisions.md`](docs/decisions.md)). The
 pure model is implemented and machine-checked (`LeanIn/Model/`, `LeanIn/Theory/World.lean`) with an executable
 probe for its vacuity; `LeanIn/Theory/Bridge.lean` states the nine primitive contracts about the native
 operations, each with a control and three with native trace scenarios under `tests/`; and the runtime serves
@@ -147,7 +147,7 @@ and §4 carries the settled re-run beside it.
 
 | Document | Contents |
 |---|---|
-| [`PLAN.md`](PLAN.md) | The plan, the roadmap, and the status |
+| [`PLAN.md`](docs/PLAN.md) | The plan, the roadmap, and the status |
 | [`docs/decisions.md`](docs/decisions.md) | D0–D22, all closed, each with its evidence — and the limits each entry leaves open |
 | [`docs/interface.md`](docs/interface.md) | The fixed interface: one spec, two implementations |
 | [`docs/tokio-workplan.md`](docs/tokio-workplan.md) | The nine deliverables of the current milestone, with the evidence each requires |

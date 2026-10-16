@@ -14,7 +14,7 @@
   `lean-toolchain` names, which `elan` provides at the same version,
   and say which of the two ran.
 - Follow the executable-control idiom in `LeanIn/Test/Control.lean`
-  and `Controls.lean`: run `nix develop -c lake exe controls` for
+  and `LeanIn/Exe/Controls.lean`: run `nix develop -c lake exe controls` for
   primitive bridge observations, retain each control's stated
   limits, and observe the executor through a public executable
   client rather than writing its queue internals. The model side has
