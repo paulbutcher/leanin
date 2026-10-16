@@ -90,6 +90,11 @@ resolved, and `nix flake update` advances it.
 nix develop -c lake build          # the library, the theory, and every harness below
 ```
 
+That build also compiles the socket shim: `c/netuv.c` is an `extern_lib`, so Lake compiles and archives it and
+links it into the executables that use the socket layer. It needs **libuv** — `uv.h` to compile, `-luv` to link —
+which is the one dependency outside the Lean toolchain. The dev shell provides it; a build outside the shell
+needs `libuv` and its development headers installed.
+
 4.35 rather than 4.34 is deliberate: `Std.WP`, the weakest-precondition framework the proof strategy leans on,
 does not exist before 4.35.
 

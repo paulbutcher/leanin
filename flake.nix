@@ -72,29 +72,9 @@
             exec ${pkgs.coreutils}/bin/nice -n 19 ${lean4}/bin/lake "$@"
           '';
 
-          # The C shim as a library rather than an object someone compiled by hand. The point is that the thing
-          # `lake build` links is a store path: it changes whenever the source does, where an object left in
-          # `.lake/build/` would keep being linked after the C changed, silently.
-          #
-          # `src` is `c/` and not `./` deliberately: the whole worktree as a build input would make this rebuild
-          # whenever anything in the repository changed, including `flake.nix` itself.
-          netuvLib = pkgs.stdenv.mkDerivation {
-            pname = "netuv";
-            version = "0.1.0";
-            src = ./c;
-            buildInputs = [ pkgs.libuv ];
-            dontConfigure = true;
-            dontFixup = true;
-            buildPhase = ''
-              runHook preBuild
-              mkdir -p $out/lib
-              $CC -c -O2 -fPIC -o netuv.o netuv.c -I ${lean4}/include
-              ar rcs $out/lib/libnetuv.a netuv.o
-              runHook postBuild
-            '';
-            dontInstall = true;
-          };
-
+          # The C shim is **not** built here: `lakefile.lean` declares it as an `extern_lib` and compiles it with
+          # Lake, so a plain `lake build` produces `libnetuv.a` and links it. Lake traces the source hash, so
+          # editing `c/netuv.c` rebuilds the object and relinks the executables that use it.
           leaninShell = pkgs.mkShell {
             name = "leanin";
 
@@ -117,9 +97,6 @@
               # request's CPU goes without the I/O waits a wall-clock run is dominated by. In the shell rather than
               # fetched ad hoc, so a profile in `docs/PERFORMANCE.md` is reproducible as printed.
               pkgs.valgrind
-              # The I/O shim itself. It is here so the compiler and linker can find it by name (`-lnetuv`), with
-              # no store path written into any build flag.
-              netuvLib
               config.treefmt.build.wrapper
             ];
 
@@ -162,7 +139,7 @@
           };
 
           packages = {
-            inherit lean4 netuvLib;
+            inherit lean4;
             default = leaninShell;
           };
         };
