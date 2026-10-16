@@ -16,6 +16,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# The two binaries this drives are not default targets -- every executable in the package links the socket shim,
+# which needs libuv, so a bare `lake build` does not produce one -- and so they are built here explicitly.
+lake build server stdServer >/dev/null || exit 1
+
 if [ "$#" -gt 0 ]; then levels=("$@"); else levels=(1 8 32); fi
 
 run_arm() { # <label> <port> <cmd...>

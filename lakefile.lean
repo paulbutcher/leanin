@@ -27,19 +27,25 @@ extern_lib netuv pkg := do
 the `libuv` it wraps, which stays a system dependency -- `uv.h` and `-luv` are needed to link it at all. -/
 def netuvLinkArgs : Array String := #["-L", ".lake/build/lib", "-lnetuv", "-luv"]
 
-@[default_target] lean_exe spike where root := `LeanIn.Exe.Spike
+/- The library is the only default target, and that is deliberate. Every executable of this package links the
+socket shim, so building **any** of them needs `libuv` -- a bare `lake build` is what a registry and a
+first-time user run, and it must not need anything outside the Lean toolchain. The executables, and the shim
+with them, are built on demand: `lake exe controls`, `lake exe server`, and so on, which is how the fixtures
+and `bench/threeway.sh` already reach them. -/
 
-@[default_target] lean_exe wakerspike where root := `LeanIn.Exe.WakerSpike
+lean_exe spike where root := `LeanIn.Exe.Spike
 
-@[default_target] lean_exe controls where
+lean_exe wakerspike where root := `LeanIn.Exe.WakerSpike
+
+lean_exe controls where
   root := `LeanIn.Exe.Controls
   moreLinkArgs := netuvLinkArgs
 
-@[default_target] lean_exe dynamics where root := `LeanIn.Exe.Dynamics
+lean_exe dynamics where root := `LeanIn.Exe.Dynamics
 
-@[default_target] lean_exe bridgecontrols where root := `LeanIn.Exe.BridgeControls
+lean_exe bridgecontrols where root := `LeanIn.Exe.BridgeControls
 
-@[default_target] lean_exe server where
+lean_exe server where
   root := `LeanIn.Exe.Server
   moreLinkArgs := netuvLinkArgs
 

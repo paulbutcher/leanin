@@ -3,7 +3,11 @@
 ## Lean controls and behavior checks
 
 - Use the pinned toolchain with `nix develop -c lake build` to
-  compile library, model, proofs and executables. A build is not
+  compile the library, the model and the proofs. The executables are
+  not default targets -- every one of them links the socket shim, so
+  building one needs libuv -- and are built on demand:
+  `nix develop -c lake exe controls`, `nix develop -c lake exe server`.
+  A build is not
   evidence that runtime behavior or the Lean source-to-IO
   correspondence is proved.
 - The flake's `lean4` is an `overrideAttrs` of nixpkgs' derivation,

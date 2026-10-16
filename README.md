@@ -4,6 +4,8 @@
 
 # `LeanIn`
 
+[![CI](https://github.com/scidonia/leanin/actions/workflows/ci.yml/badge.svg)](https://github.com/scidonia/leanin/actions/workflows/ci.yml)
+
 LeanIn is a concurrency runtime with a work-stealing scheduler for **Lean 4**. The basic thrust is that we can use
 techniques found in tokio and node to get a runtime for concurrency that is on par with other highly concurrent
 languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
@@ -41,7 +43,7 @@ from the following:
 - **Node** — the I/O completion model. Our socket layer is a libuv loop of our own (`c/netuv.c`) but has Node's
   shape.
 
-## Stat Machines for async
+## State machines for async
 
 Our client code reads like a monadic async similar to what ships with Lean — `do`, with `←` for a suspension — but
 our version is **compiled** and not threaded through closures with `bind`.
@@ -73,13 +75,14 @@ tracks `nixos-unstable` with no revision written in the flake: `flake.lock` reco
 resolved, and `nix flake update` advances it.
 
 ```sh
-nix develop -c lake build          # the library, the theory, and every harness below
+nix develop -c lake build          # the library and its proofs; nothing else is a default target
 ```
 
-That build also compiles the socket shim: `c/netuv.c` is an `extern_lib`, so Lake compiles and archives it and
-links it into the executables that use the socket layer. It needs **libuv** — `uv.h` to compile, `-luv` to link —
-which is the one dependency outside the Lean toolchain. The dev shell provides it; a build outside the shell
-needs `libuv` and its development headers installed.
+That build needs nothing but the Lean toolchain. The executables are built on demand — `lake exe controls`,
+`lake exe server` — and **those** need one thing more: `c/netuv.c`, the socket shim, is an `extern_lib`, so Lake
+compiles it, archives it and links it into every executable of this package, which needs **libuv** (`uv.h` to
+compile, `-luv` to link). It is the only dependency outside the toolchain; the dev shell provides it, and a
+build without it still gets the library.
 
 4.35 rather than 4.34 is deliberate: `Std.WP`, the weakest-precondition framework the proof strategy leans on,
 does not exist before 4.35.

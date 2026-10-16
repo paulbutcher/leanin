@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  # The gate. A bare `lake build` here is the library and its proofs and nothing else, so it needs nothing but
+  # the Lean toolchain -- which is what a package registry and a first-time user run. The eligibility check is
+  # the same one Reservoir applies, and `lean-action` ships it.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          check-reservoir-eligibility: true
+
+  # The scenarios. These build executables, and every executable of this package links the socket shim, so they
+  # need libuv -- the one dependency outside the toolchain, and the reason the executables are not default
+  # targets. Each scenario is one invocation of its fixture.
+  scenarios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+      - name: libuv, for the socket shim
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev
+      - name: the executor scenarios
+        run: |
+          for s in SC1 SC2 SC3 SC4 SC5 SC6 SC7 SC8 SC9 SC10 SC11 \
+                   SC12 SC13 SC14 SC15 SC16 SC17 SC18 SC19 SC20 SC21 SC22; do
+            echo "== $s =="
+            bash tests/executor-contract.sh "$s"
+          done
+      - name: the bridge scenarios
+        run: |
+          for s in BT1 BT2 BT3; do
+            echo "== $s =="
+            bash tests/bridge-contract.sh "$s"
+          done
