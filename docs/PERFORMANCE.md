@@ -737,8 +737,9 @@ Node's own row sits below its recorded 41 195 / 95 800, so the absolute figures 
 what to read; a settled re-run is owed for the record.**
 
 **That re-run, at the four-way's own levels** — `bench/threeway.sh`, which is this driver committed rather than
-kept in run notes, so the rows below are re-runnable from the tree (`nix develop -c bash bench/threeway.sh 1 8
-32`). Load average **2.59**, echo handler, one invocation, 5 s per point:
+kept in run notes, so the rows below are re-runnable from the tree
+(`nix develop -c bash bench/threeway.sh 1 8 32`). Load average **2.59**, echo handler, one invocation, 5 s per
+point:
 
 | server | C=1 | C=8 | C=32 |
 |---|---|---|---|
