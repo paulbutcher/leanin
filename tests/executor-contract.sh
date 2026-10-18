@@ -4611,6 +4611,91 @@ check_sc22() {
     "$x_wp" "$x_chid" "$x_crounds" "$x_held" "$bound"
 }
 
+# --- SC23 — composition: a parent machine awaits a child machine over a real socket ————————————
+# The server is the public `defuncEcho` executable in its `parentT` mode: `amParentT` awaits `amChunkT` twice
+# on one connection (a machine awaiting a machine, the child's `onDone` being the parent's own continuation),
+# then sends what it was answered, and both machines report thread ids as they run. The client is a shell
+# pipeline — deliberately not ours. The records asserted on: the wire's own byte stream with the read's own
+# bound (`bounded` — in SC20-O3's idiom: the bound is an invocation bound, recorded, and asserted never to
+# have fired), and the server's `sc23|` tid records — the resume thread being the child's own completion
+# thread (a raw resume, no carrier hop), never the accept loop's.
+check_sc23() {
+  local stream status bounded pid i accept_tid
+  local -a child_tids resume_tids
+  lake build defuncEcho >/dev/null 2>&1 ||
+    setup_error "SC23: defuncEcho did not build" \
+      "invocation: lake build defuncEcho"
+  # The port must be this server's: anything already listening would silently answer the readiness poll with
+  # stale behavior — a red about nothing. Never kill the owner; refuse instead.
+  if (exec 3<>/dev/tcp/127.0.0.1/8390) 2>/dev/null; then
+    exec 3>&- 3<&-
+    setup_error "SC23: port 8390 is already owned before the server starts" \
+      "a leftover or unrelated listener; the check does not kill what it did not start"
+  fi
+  # Cleanup is owed on every exit path (an assertion failure or setup error exits the script), and targets
+  # only this invocation's child. `pid` is initialized for the trap's guard and never cleared before cleanup.
+  pid=""
+  ./.lake/build/bin/defuncEcho 8390 parentT >/tmp/sc23_server.log 2>&1 &
+  pid=$!
+  trap '[ -n "${pid:-}" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; }' EXIT
+  local ready=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8390) 2>/dev/null; then exec 3>&- 3<&-; ready=1; break; fi
+    sleep 0.25
+  done
+  [ "$ready" = 1 ] || {
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    setup_error "SC23: the server did not listen on 8390 in time" \
+      "log: $(tail -2 /tmp/sc23_server.log)"
+  }
+  { printf 'AAAA'; sleep 0.3; printf 'BBBB'; sleep 0.3; } | timeout 5 nc 127.0.0.1 8390 | head -c 16 > /tmp/sc23_stream
+  status=${PIPESTATUS[1]}
+  stream="$(cat /tmp/sc23_stream)"
+  if [ "$status" = 124 ]; then bounded=yes; else bounded=no; fi
+  # The completed-stream conjunct first: a composition that never resumed produces a prefix and this bound.
+  [ "$bounded" = no ] ||
+    fail "SC23 Then: the composed exchange did not complete (bounded=$bounded)" \
+      "the read's own bound fired: the stream never carried the parent's resend, so the child's onDone did not resume the parent" \
+      "observed prefix: [$stream]"
+  [ "$stream" = "AAAABBBBAAAABBBB" ] ||
+    fail "SC23 Then: a parent machine awaiting a child machine was not answered in order" \
+      "expected AAAABBBBAAAABBBB (the child's two echoes, then the parent's combined resend — the resend's presence is the child's onDone having resumed the parent with both answers)" \
+      "observed: [$stream]"
+  mapfile -t child_tids < <(grep -o 'sc23|childStepTid=[0-9]*' /tmp/sc23_server.log | cut -d= -f2)
+  mapfile -t resume_tids < <(grep -o 'sc23|resumeTid=[0-9]*' /tmp/sc23_server.log | cut -d= -f2)
+  accept_tid="$(grep -o 'sc23|acceptTid=[0-9]*' /tmp/sc23_server.log | head -1 | cut -d= -f2)"
+  main_tid="$(grep -o 'sc23|mainTid=[0-9]*' /tmp/sc23_server.log | head -1 | cut -d= -f2)"
+  dedicated_tid="$(grep -o 'sc23|dedicatedTid=[0-9]*' /tmp/sc23_server.log | head -1 | cut -d= -f2)"
+  [ "${#child_tids[@]}" -eq 2 ] && [ "${#resume_tids[@]}" -eq 2 ] && [ -n "$accept_tid" ] && [ -n "$main_tid" ] && [ -n "$dedicated_tid" ] ||
+    setup_error "SC23: the tid records are not two childStepTid, two resumeTid, acceptTid, mainTid and dedicatedTid" \
+      "childStepTid: ${#child_tids[@]}, resumeTid: ${#resume_tids[@]}, acceptTid: [${accept_tid:-}], mainTid: [${main_tid:-}], dedicatedTid: [${dedicated_tid:-}]" \
+      "a defect of the invocation, not the SC23 Then"
+  # The detectors' affirmative controls, in this run: the bound detector must report bounded=yes on a real
+  # timeout (a silent connection still open, read under a 1 s bound), and the tid detector must read two
+  # thread kinds differently — so the absences and equalities below are readings, not detectors that cannot
+  # differ.
+  printf '' | timeout 1 nc 127.0.0.1 8390 >/dev/null 2>&1
+  [ "$?" = 124 ] ||
+    setup_error "SC23: the bound detector did not report a timeout on a silent connection" \
+      "expected exit 124 from a 1 s bound on a connection that stays open and silent"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+  # Explicit cleanup done: disarm the trap rather than let it signal a reused pid at exit.
+  trap - EXIT
+  [ "$dedicated_tid" != "$main_tid" ] ||
+    setup_error "SC23: the tid detector cannot distinguish threads in this run" \
+      "mainTid=$main_tid dedicatedTid=$dedicated_tid"
+  [ "${child_tids[0]}" = "${resume_tids[0]}" ] && [ "${child_tids[1]}" = "${resume_tids[1]}" ] ||
+    fail "SC23 Then: the parent did not resume on the child's own completion thread" \
+      "childStepTid=${child_tids[*]} resumeTid=${resume_tids[*]} — a resume through a cell or a carrier hop lands elsewhere" \
+      "the raw-resume composition promises resume thread == completion thread"
+  [ "${child_tids[0]}" = "$main_tid" ] && [ "${child_tids[1]}" = "$main_tid" ] && [ "${resume_tids[0]}" = "$main_tid" ] && [ "${resume_tids[1]}" = "$main_tid" ] && [ "$accept_tid" = "$main_tid" ] ||
+    fail "SC23 Then: the composition left the single-carrier driver thread" \
+      "childStepTid=${child_tids[*]} resumeTid=${resume_tids[*]} acceptTid=$accept_tid mainTid=$main_tid dedicatedTid=$dedicated_tid" \
+      "in the single-carrier driver the accept loop, the connection's effects and every resume are one thread; a hop to another thread is a delivery, not a resume"
+  printf 'SC23 ok: stream in order (bounded=no); resume thread == child completion thread (%s) == the single-carrier driver; detector control dedicatedTid=%s differs\n' \
+    "${child_tids[0]}" "$dedicated_tid"
+}
+
 case "${1:-}" in
 SC1) check_sc1 ;;
 SC2) check_sc2 ;;
@@ -4634,8 +4719,9 @@ SC19) check_sc19 ;;
 SC20) check_sc20 ;;
 SC21) check_sc21 ;;
 SC22) check_sc22 ;;
+SC23) check_sc23 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23\n' >&2
   exit 2
   ;;
 esac

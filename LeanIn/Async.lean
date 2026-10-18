@@ -1,5 +1,6 @@
 import Lean
 import Lean.Parser.Term
+import LeanIn.Async.Attr
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Io
 import LeanIn.Runtime.VM
@@ -27,13 +28,18 @@ Grammar:
   converging paths are compiled once.
 - `while c do B` (desugared through the same transitions), `for x in xs do B`, `break`, `continue`.
 - `recurse` — jump back to state 0 (must end a path). A close ends a path too; only pure statements may
-  follow it, and they run after the socket goes (a completion signal is the use).
+  follow it, and they run after the socket goes (a completion signal is the use). `halt` ends a path as a
+  return — the machine stops; a callable machine invokes its `onDone` parameter and then `halt`s.
 
 Effects this cut resumes: `Io.recvRaw` (the byte payload continues on `.ok (some …)`; an end of stream or a
 failure closes), `Io.recvTimeoutRaw` (the full race outcome is delivered: `none` stalled, `some (.ok …)` read,
 `some (.error …)` failed), `Io.sendAllRaw`/`Io.sendRaw` (the `Except` is delivered when the result is bound; an
-unbound write failure closes), `Io.closeRaw`, and `VM.runAsync` (a sub-computation's result is delivered to the
-bind). Field types are inferred without a general elaboration pass: a threaded parameter keeps its signature
+unbound write failure closes), `Io.closeRaw`, `VM.runAsync` (a sub-computation's result is delivered to the
+bind), and **machine calls**: any `*.run` application suspends on the callee, whose `run` must declare its
+continuation last — an `onDone`-style parameter the callee invokes with its result; the generator fills that
+slot with the caller's continuation, so a machine awaiting a machine is a raw resume and **no cell**, exactly
+as `Runtime.Http.drive`'s `onClose` works. Field types are inferred without a general elaboration pass: a
+threaded parameter keeps its signature
 type, a `recvRaw`-bound variable is `ByteArray`, a `recvTimeoutRaw`-bound one is
 `Option (Except IO.Error (Option ByteArray))`, a `sendRaw`/`sendAllRaw`-bound one is `Except IO.Error Unit`,
 an ascribed binding keeps its type, and any other pure-bound field is read off its use —
@@ -49,7 +55,7 @@ open Lean Lean.Macro Lean.Parser.Term
 private inductive Item where
   | pureBind (pat : Syntax) (ty? : Option Term) (term : Syntax)  -- `let <pat> := e` / `let <pat> : T := e`
   | pureStmt (term : Syntax)                     -- a bare `e`
-  | await (bound? : Option Name) (term : Syntax) -- `let x := await e` / `await e`
+  | await (bound? : Option Name) (ty? : Option Term) (term : Syntax) -- `let x := await e` / `let x : T := await e` / `await e`
   | if_ (cond : Syntax) (then_ else_ : List Item)
   | match_ (scrut : Syntax) (arms : List (Syntax × List Item))
   | while_ (cond : Syntax) (body : List Item)    -- `while c do body`
@@ -57,6 +63,7 @@ private inductive Item where
   | break_                                       -- `break` (innermost `while`)
   | continue_                                    -- `continue` (innermost `while`)
   | recurse
+  | halt                                         -- `halt` (the machine returns, must end a path)
   | goto (idx : Nat) (args : List Name)          -- internal: jump to a specific state
   | contStmt (term : Term)                       -- internal: a hoisted continuation
   deriving Inhabited
@@ -86,8 +93,9 @@ private partial def parseItems (stx : Syntax) : MacroM (List Item) :=
 /-- Parse one do-item, recursing into `if` branches. -/
 private partial def parseItem (d : Syntax) : MacroM Item := do
   match d with
-  | `(doElem| let $x:ident := await $e) => return .await (some x.getId) e
-  | `(doElem| await $e) => return .await none e
+  | `(doElem| let $x:ident : $ty:term := await $e) => return .await (some x.getId) (some ⟨ty⟩) e
+  | `(doElem| let $x:ident := await $e) => return .await (some x.getId) none e
+  | `(doElem| await $e) => return .await none none e
   | `(doElem| let $x:ident : $ty:term := $e) => return .pureBind x (some ⟨ty⟩) e
   | `(doElem| let $x:ident := $e) => return .pureBind x none e
   | `(doElem| let $p:term := $e) => return .pureBind p none e   -- destructuring `let (a, b) := e`
@@ -106,34 +114,10 @@ private partial def parseItem (d : Syntax) : MacroM Item := do
   | `(doElem| break) => return .break_
   | `(doElem| continue) => return .continue_
   | `(doElem| recurse) => return .recurse
+  | `(doElem| halt) => return .halt
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"asyncMachine: unsupported do-item: {d}"
 end
-
-/-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
-private inductive Eff where
-  | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
-  | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
-  | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
-  | sendAll (data : Term)
-  | send (data : Term)
-  | close
-  | unknown
-
-/-- Strip a `Term.paren` wrapper: `(e)` becomes `e`. -/
-private partial def unparen (s : Syntax) : Syntax :=
-  if s.getKind == `Lean.Parser.Term.paren && s.getArgs.size ≥ 2 then unparen s[1]! else s
-
-private def classify (e : Syntax) : Eff :=
-  match unparen e with
-  | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => .recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩
-  | `(LeanIn.Runtime.VM.runAsync $m) => .runVM ⟨m⟩
-  | `(LeanIn.Runtime.Io.recvRaw $_ $_) => .recv
-  | `(LeanIn.Runtime.Io.recvRaw $_) => .recv
-  | `(LeanIn.Runtime.Io.sendAllRaw $_ $d) => .sendAll ⟨d⟩
-  | `(LeanIn.Runtime.Io.sendRaw $_ $d) => .send ⟨d⟩
-  | `(LeanIn.Runtime.Io.closeRaw $_) => .close
-  | _ => .unknown
 
 /-- The names used anywhere in a term (free variables a state might need). Dot-notation like `m.feed` is a
 single compound identifier, so we collect each identifier's **root** as well as its full form — the root is the
@@ -158,7 +142,7 @@ where
   go : Item → List Name
   | .pureBind _ _ e => usedNames e
   | .pureStmt e => usedNames e
-  | .await _ e => usedNames e
+  | .await _ _ e => usedNames e
   | .if_ c t e => usedNames c ++ usedInItems t ++ usedInItems e
   | .match_ s arms => usedNames s ++ arms.flatMap (fun (_, b) => usedInItems b)
   | .while_ c b => usedNames c ++ usedInItems b
@@ -166,6 +150,7 @@ where
   | .break_ => []
   | .continue_ => []
   | .recurse => []
+  | .halt => []
   | .goto _ args => args
   -- A hoisted continuation is a jump term: the fields it passes are used exactly here.
   | .contStmt t => usedNames t
@@ -209,7 +194,66 @@ private structure Ctx where
   conn : Name
   threaded : List Name          -- the threaded field names (state 0's fields: every parameter)
   paramTys : List (Name × Term) -- every parameter with its signature type (for use-inference)
+  env : Lean.Environment        -- the environment at elaboration (machine-runner checks: `.St` lookup)
+  ns : Name                     -- the current namespace (relative machine names resolve against it)
   loops : List LoopCtx := []    -- the enclosing `while` loops, innermost first
+/-- The leading parameter count of a `run`'s type, and whether its last parameter is a function. -/
+private partial def piShape (e : Lean.Expr) : Nat × Bool :=
+  go e 0 where
+  go : Lean.Expr → Nat → Nat × Bool
+    | .forallE _ t b _, n =>
+      if b.isForall then go b (n + 1) else (n + 1, t.isArrow || t.isForall)
+    | _, n => (n, false)
+
+/-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
+private inductive Eff where
+  | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
+  | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
+  | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
+  | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's `onDone` payload
+  | sendAll (data : Term)
+  | send (data : Term)
+  | close
+  | unknown
+
+/-- Strip a `Term.paren` wrapper: `(e)` becomes `e`. -/
+private partial def unparen (s : Syntax) : Syntax :=
+  if s.getKind == `Lean.Parser.Term.paren && s.getArgs.size ≥ 2 then unparen s[1]! else s
+
+private def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
+  match unparen e with
+  | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => pure (.recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩)
+  | `(LeanIn.Runtime.VM.runAsync $m) => pure (.runVM ⟨m⟩)
+  | `(LeanIn.Runtime.Io.recvRaw $_ $_) => pure .recv
+  | `(LeanIn.Runtime.Io.recvRaw $_) => pure .recv
+  | `(LeanIn.Runtime.Io.sendAllRaw $_ $d) => pure (.sendAll ⟨d⟩)
+  | `(LeanIn.Runtime.Io.sendRaw $_ $d) => pure (.send ⟨d⟩)
+  | `(LeanIn.Runtime.Io.closeRaw $_) => pure .close
+  -- A machine call: any `*.run` application — but only a machine's: the name must resolve to a declaration
+  -- beside a generated `.St`, its ordinary arguments must be complete (the continuation is the one
+  -- parameter the generator fills, last), and that last parameter must be a function.
+  | `($fn:ident $args*) =>
+    if fn.getId.getString! == "run" then do
+      let candidates := [ctx.ns ++ fn.getId, fn.getId]
+      match candidates.find? ctx.env.contains with
+      | none =>
+        Macro.throwError s!"asyncMachine: unknown machine run `{fn.getId}` — neither `{candidates[0]!}` nor `{candidates[1]!}` exists"
+      | some resolved =>
+        -- Provenance, not shape: the tag `asyncMachine` itself marks every `run` it generates. A
+        -- hand-written `Foo.run` beside any `Foo.St` is rejected; `VM.run` is rejected.
+        unless LeanIn.Async.machineAttr.hasTag ctx.env resolved do
+          Macro.throwError s!"asyncMachine: `{resolved}` is not the `run` of a compiled machine (it is not tagged with `machineAttr`) — a machine call awaits the `run` of a machine compiled by `asyncMachine`"
+        let some info := ctx.env.find? resolved
+          | Macro.throwError s!"asyncMachine: internal: `{resolved}` exists and does not"
+        let (pis, lastIsFn) := piShape info.type
+        unless lastIsFn do
+          Macro.throwError s!"asyncMachine: the machine call `{resolved}` does not end in a continuation parameter — a callable machine declares its `onDone`-style parameter last, of function type"
+        unless args.size + 1 == pis do
+          Macro.throwError s!"asyncMachine: the machine call `{resolved}` takes {pis - 1} ordinary arguments before its continuation, but {args.size} were supplied"
+        pure (.runMachine fn args.toList)
+    else pure .unknown
+  | _ => pure .unknown
+
 
 private abbrev CompileM := StateT (Nat × List GenState) MacroM
 
@@ -240,19 +284,21 @@ private def stLocalName (i : Nat) : Ident :=
   mkIdent ((Name.mkSimple s!"s{i}").eraseMacroScopes)
 
 /-- Whether a pure-bound variable is used as a `sendAllRaw`/`sendRaw` data argument in the items. -/
-private partial def usesSendArg (f : Name) (items : List Item) : Bool :=
-  items.any go
+private partial def usesSendArg (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
+  items.anyM go
 where
-  go : Item → Bool
-  | .await _ e =>
-    (match classify e with
+  go : Item → MacroM Bool := fun
+  | .await _ _ e => do
+    let eff ← classify ctx e
+    pure (match eff with
      | .sendAll d | .send d => d.raw.isIdent && d.raw.getId == f
      | _ => false)
-  | .if_ _ t e => usesSendArg f t || usesSendArg f e
-  | .match_ _ arms => arms.any (fun (_, b) => usesSendArg f b)
-  | .while_ _ b => usesSendArg f b
-  | .for_ _ _ b => usesSendArg f b
-  | _ => false
+  | .if_ _ t e => do
+    if (← usesSendArg ctx f t) then pure true else usesSendArg ctx f e
+  | .match_ _ arms => arms.anyM (fun (_, b) => usesSendArg ctx f b)
+  | .while_ _ b => usesSendArg ctx f b
+  | .for_ _ _ b => usesSendArg ctx f b
+  | _ => pure false
 
 /-- Whether a pure-bound variable is used as an `if`-condition in the items. -/
 private partial def usedAsCond (f : Name) (items : List Item) : Bool :=
@@ -273,7 +319,28 @@ private partial def containsName (f : Name) (s : Syntax) : Bool :=
   | .node _ _ args => args.any (containsName f)
   | _ => false
 
- /-- A field's type when it is used as the argument of a parameter function: the function's domain. For
+/-- Whether a pure-bound variable appears inside an **array-literal** `sendAllRaw`/`sendRaw` argument
+(`#[x]` ⇒ the element, a `ByteArray`). -/
+private partial def usesSendElem (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
+  items.anyM go
+where
+  go : Item → MacroM Bool := fun
+  | .await _ _ e => do
+    let eff ← classify ctx e
+    pure (match eff with
+     | .sendAll d | .send d =>
+       (match d.raw[0]? with
+        | some a => a.isAtom && a.getAtomVal == "#[" && containsName f d.raw
+        | none => false)
+     | _ => false)
+  | .if_ _ t e => do
+    if (← usesSendElem ctx f t) then pure true else usesSendElem ctx f e
+  | .match_ _ arms => arms.anyM (fun (_, b) => usesSendElem ctx f b)
+  | .while_ _ b => usesSendElem ctx f b
+  | .for_ _ _ b => usesSendElem ctx f b
+  | _ => pure false
+
+/-- A field's type when it is used as the argument of a parameter function: the function's domain. For
 example `handler head` ⇒ `Request.Head`, the handler's argument type — a field whose only use is passing it to
 a typed function, with no `sendAll`/`if` use to read its type off. -/
 private partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Option Term :=
@@ -283,7 +350,7 @@ where
   goItem : Item → Option Term
   | .pureBind _ _ e => goTerm e
   | .pureStmt e => goTerm e
-  | .await _ e => goTerm e
+  | .await _ _ e => goTerm e
   | .if_ c t e => (goTerm c).orElse (fun _ => findFnArg ctx f t |>.orElse (fun _ => findFnArg ctx f e))
   | .match_ s arms =>
     (goTerm s).orElse (fun _ => arms.foldl (fun a (_, b) => a.orElse (fun _ => findFnArg ctx f b)) none)
@@ -317,7 +384,8 @@ private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : 
   | .typed ty => pure ty
   | .conn => Macro.throwError s!"asyncMachine: the connection `{f}` cannot be a state field"
   | .pureB =>
-    if usesSendArg f rest then `(Array ByteArray)
+    if (← usesSendArg ctx f rest) then `(Array ByteArray)
+    else if (← usesSendElem ctx f rest) then `($(mkIdent `ByteArray))
     else if usedAsCond f rest then `($(mkIdent `Bool))
     else match findFnArg ctx f rest with
       | some ty => pure ty
@@ -344,6 +412,7 @@ private def resultBind (eff : Eff) : Bind :=
   | .recv => .recvRes
   | .recvTimeout .. => .recvTimeoutRes
   | .sendAll .. | .send .. => .sendRes
+  | .runMachine .. => .pureB
   | _ => .pureB
 
 /-- The suspension for one effect, with continuation `cont`. -/
@@ -366,6 +435,10 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
   | .runVM m =>
     let bv := bnd.getD `v
     `(LeanIn.Runtime.VM.runAsync $m (fun $(mkIdent bv) => $cont))
+  | .runMachine fn args =>
+    let bv := bnd.getD `v
+    let argTs := args.toArray
+    `($fn $argTs* (fun $(mkIdent bv) => $cont))
   -- A failed write ends the connection rather than continuing as if the bytes were sent — unless the body
   -- bound the effect's result (`let r := await …`), in which case the whole `Except` is delivered and the
   -- body owns the outcome.
@@ -385,17 +458,31 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
           | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
 
-/-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, or a close — so appending a
-continuation after it (the code following an `if`/loop body) would be unreachable and must be skipped. -/
-private partial def endsTerminal (items : List Item) : Bool :=
+/-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, `halt`, or a close — so
+appending a continuation after it (the code following an `if`/loop body) would be unreachable and must be
+skipped. -/
+private partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM Bool :=
   match items.getLast? with
-  | some .recurse => true
-  | some .break_ => true
-  | some .continue_ => true
-  | some (.await _ e) => (match classify e with | .close => true | _ => false)
+  | some .recurse => pure true
+  | some .break_ => pure true
+  | some .continue_ => pure true
+  | some .halt => pure true
+  | some (.await _ _ e) => do
+    let eff ← classify ctx e
+    pure (match eff with | .close => true | _ => false)
   -- A close may be followed by a pure tail, so the check looks past pure items for the terminal.
-  | some (.pureStmt _) | some (.pureBind ..) => endsTerminal items.dropLast
-  | _ => false
+  | some (.pureStmt _) | some (.pureBind ..) => endsTerminal ctx items.dropLast
+  | _ => pure false
+
+/-- Rewrite `continue` items at a `for` body's own level to take the loop's increment first — a skipped
+iteration owes the counter too, or the loop never advances. A `continue` inside a nested loop belongs to that
+loop and is left alone (the recursion enters `if`/`match` but never `while`/`for`). -/
+private partial def incContinues (i : Ident) (inc : Term) : List Item → List Item
+  | [] => []
+  | .continue_ :: rest => .pureBind i none inc :: .continue_ :: incContinues i inc rest
+  | .if_ c t e :: rest => .if_ c (incContinues i inc t) (incContinues i inc e) :: incContinues i inc rest
+  | .match_ s arms :: rest => .match_ s (arms.map (fun (nd, b) => (nd, incContinues i inc b))) :: incContinues i inc rest
+  | item :: rest => item :: incContinues i inc rest
 
 /-- The pure tail a close may be followed by: every statement runs after the socket goes, so nothing that
 suspends is allowed -- a completion signal (the `onClose` of a served connection) is the use. -/
@@ -417,7 +504,10 @@ mutual
 continuation states as a side effect. `scope` is the in-scope variables with their bindings. -/
 private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (Name × Bind)) : CompileM Term := do
   match items with
-  | [] => Macro.throwError "asyncMachine: a path does not end in `recurse` or a close"
+  | [] => Macro.throwError "asyncMachine: a path does not end in `recurse`, a close, or `halt`"
+  | .halt :: rest => do
+    unless rest.isEmpty do Macro.throwError "asyncMachine: `halt` must end a path"
+    `(pure ())
   | .contStmt t :: rest => do
     unless rest.isEmpty do Macro.throwError "asyncMachine: internal continuation marker must end a path"
     pure t
@@ -437,34 +527,38 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     -- bind the action as a value and silently never run it.
     let inner ← compileBody ctx rest scope
     `($(⟨e⟩) >>= fun _ => $inner)
-  | .await bnd e :: rest => do
-    match classify e with
+  | .await bnd ty? e :: rest => do
+    match (← classify ctx e) with
     | .close => do
       let tail ← closeTail rest
-      match bnd with
-      | some bv => `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun $(mkIdent bv) => $tail)
+      match bnd, ty? with
+      | some bv, some t =>
+        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun ($(mkIdent bv) : $t) => $tail)
+      | some bv, none =>
+        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun $(mkIdent bv) => $tail)
       -- An unbound close has no outcome channel, so a refusal is loud instead of silently unclosed.
-      | none    =>
+      | none, _ =>
         `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun accepted =>
           if accepted then $tail
           else throw (IO.userError "asyncMachine: the loop refused the connection's close submission"))
     | .unknown => Macro.throwError "asyncMachine: unsupported effect in await"
     | eff => do
-      let scope' := scope ++ bnd.toList.map (·, resultBind eff)
+      let scope' := scope ++ bnd.toList.map (fun n =>
+        (n, match ty? with | some t => .typed t | none => resultBind eff))
       let cont ← genCont ctx rest scope'
       suspendTerm ctx eff bnd cont
   | .if_ c t e :: rest => do
     let cont? ← hoistCont ctx rest scope
     let suffix := cont?.toList
-    let thenT ← compileBody ctx (if endsTerminal t then t else t ++ suffix) scope
-    let elseT ← compileBody ctx (if endsTerminal e then e else e ++ suffix) scope
+    let thenT ← compileBody ctx (if (← endsTerminal ctx t) then t else t ++ suffix) scope
+    let elseT ← compileBody ctx (if (← endsTerminal ctx e) then e else e ++ suffix) scope
     `(if $(⟨c⟩) then $thenT else $elseT)
   | .match_ s arms :: rest => do
     let cont? ← hoistCont ctx rest scope
     let suffix := cont?.toList
     let armTerms ← arms.toArray.mapM (fun (nd, body) => do
       let armScope := extendScope scope (patBoundNames (nd.getArg 1))
-      let t ← compileBody ctx (if endsTerminal body then body else body ++ suffix) armScope
+      let t ← compileBody ctx (if (← endsTerminal ctx body) then body else body ++ suffix) armScope
       -- Rebuild the alternative as a term-level `matchAlt`, reusing the pattern (arg 1) verbatim and
       -- replacing only the body (arg 3) with the compiled continuation (a term, where the do-body was).
       match nd with
@@ -494,7 +588,7 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     addState { idx := rIdx, fields := restFields, body := restBody }
     let ctx' := { ctx with
       loops := { head := lIdx, headFields := loopNames, exit := rIdx, exitFields := restNames } :: ctx.loops }
-    let thenT ← compileBody ctx' (if endsTerminal body then body else body ++ [.goto lIdx loopNames]) loopScope
+    let thenT ← compileBody ctx' (if (← endsTerminal ctx body) then body else body ++ [.goto lIdx loopNames]) loopScope
     let elseT ← jumpTerm ctx rIdx restNames
     addState { idx := lIdx, fields := loopFields, body := ← `(if $(⟨c⟩) then $thenT else $elseT) }
     jumpTerm ctx lIdx loopNames
@@ -504,8 +598,13 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     let n := mkIdent `__for_n
     let natT : Term := ⟨mkIdent `Nat⟩
     let elem ← `(($(⟨xs⟩))[$i]!)
+    -- A `continue` at this body's own level still owes the increment, so it is rewritten to take it; a
+    -- terminal body (`halt`, `break`, a close) takes no increment after it at all.
+    let incT ← `($i + 1)
+    let body := incContinues i incT body
+    let update ← if (← endsTerminal ctx body) then pure [] else pure [.pureBind i none incT]
     let inner : List Item :=
-      [.pureBind x none elem] ++ body ++ [.pureBind i none (← `($i + 1))]
+      [.pureBind x none elem] ++ body ++ update
     let whileItem := .while_ (← `($i < $n)) inner
     let setup : List Item :=
       [ .pureBind i (some natT) (← `(0)),
@@ -591,7 +690,8 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
   -- (the constant-parameter shape, carried rather than resolved), and a rebound one advances. Splitting
   -- constants out was the silent-trap shape: a parameter the body forgot to rebind stayed constant with no
   -- sign of it.
-  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threaded, paramTys := threadedInfo }
+  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threaded, paramTys := threadedInfo,
+                     env := ← Lean.getEnv, ns := ← Lean.getCurrNamespace }
   let initScope : List (Name × Bind) := threadedInfo.map (fun (x, ty) => (x, .threaded ty))
   -- Run the compiler, seeding state 0 as the entry (its fields are the threaded parameters).
   let s0fields := threadedInfo.map (fun (x, ty) => (x, ty))
@@ -625,5 +725,7 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
   let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $params* : IO Unit :=
     $stepn $(mkIdent c.getId) $s0app)
   Lean.Elab.Command.elabCommand runCmd
+  -- Provenance: the classifier accepts a machine call only for a tagged runner.
+  modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
 
 end LeanIn.Async

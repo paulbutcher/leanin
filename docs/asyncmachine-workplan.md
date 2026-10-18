@@ -64,13 +64,28 @@ rather than multiplying the silent-wrongness surface.
 
 ### M2 — Composition: machines awaiting machines
 
-- A `call`/`awaitMachine` effect: a compiled machine referenced by name, driven to completion, resuming the
-  caller by raw delivery — no interpreted `VM` in the path. The callee's `step` is a plain `partial def`; the
-  caller's continuation is its state, so the shape already exists (`RawCell` proves the park/resume).
-- **Acceptance**: a parent machine awaits a child machine over a real socket; ordering and ownership records
-  (who ran which step, on which thread) match the model; the generated step shows no cell per call.
-- **Evidence**: a new `tests/executor-contract.md` scenario (parent/child composition) with its shell
-  fixture; a microbenchmark reading (`DefuncEcho` mode) comparing machine-call against `VM.runAsync`.
+- The machine call, landed: any `*.run` application in an `await` suspends on the callee — but only after the
+  classifier proves the callee is a compiled machine's `run` (its `.St` exists in the environment), that all
+  ordinary arguments are supplied, and that its last parameter is a function — each violation a named
+  diagnostic. The generator passes the caller's continuation as that last parameter: the callee invokes its
+  `onDone` and `halt`s, resuming the caller by raw delivery with no cell and no interpreted `VM` in the path.
+- **Acceptance**: a parent machine awaits a child machine over a real socket; the composed stream arrives in
+  order, the parent's resend proving the child's `onDone` resumed it; and the resume lands on the child's own
+  completion thread — in the single-carrier driver, accept loop, connection effects and resume all read one
+  thread, with the harness's dedicated-task tid as the live control that the detector distinguishes threads.
+  The no-cell fact is structural (the generator passes the caller's continuation as the callee's last
+  parameter — the expansion names no cell) and costed by the benchmark below; a single-carrier harness cannot
+  distinguish cell from no-cell by thread, and the multi-carrier entry does not serve (the recorded
+  `runCarriers` defect), so that distinction is stated as a limit, not claimed.
+- **Evidence**: SC23 (`tests/executor-contract.md`, with its shell fixture): the composed byte stream in
+  order with the read's own bound recorded (`bounded == no`, SC20-O3's idiom), the tid records above, a staged
+  behavior red (`onDone` dropped ⇒ `bounded=yes`, only the first echo arrives — the scenario's own assertion)
+  and the pre-M2 surface rejection both observed. The direct-continuation shape was chosen over cell-parking
+  before implementation and the reading confirms it costs nothing: same-session C=8, one machine call per
+  request — **197322 rps** against 195801 rps for the same loop with the write inline and 182624 rps for the
+  interpreted `VM` echo (the call is within noise of free; the interpreted hop costs ~7% — 1 −
+  182624/195801 ≈ 6.7%). Landed with `halt` as the return terminal and typed `await` (`let x : T := await e`,
+  whose ascription wins over effect inference — including on the close).
 
 ### M3 — Time as an effect
 

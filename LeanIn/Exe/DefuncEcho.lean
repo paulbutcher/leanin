@@ -10,12 +10,59 @@ open LeanIn
 Small machines that compile the shapes the connection driver relies on — a suspension per iteration, loops and
 their carried fields, `break`/`continue`, a close that ends the path — plus the two hand-written echo baselines
 they are measured against (`cpsEcho` through the `Join`-cell delivery, `vmEcho` through the interpreted `VM`).
-Run with `lake exe defuncEcho [port] [mode]`: `async`, `loop`, `for`, `brk`, `cont`, `vm`, default `cps`.
+Run with `lake exe defuncEcho [port] [mode]`: `async`, `loop`, `for`, `brk`, `cont`, `forCont`, `vm`,
+`parent`, `parentT` (composition with thread-id records, for SC23), `call`, default `cps`.
 -/
 
 asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[req])
+  recurse
+
+-- Composition: a callable child (reads one request, echoes it, and answers its `onDone` with the bytes) and
+-- a parent that awaits it twice per exchange — a machine awaiting a machine, with the parent's continuation
+-- as the child's `onDone`, no cell.
+asyncMachine amChunk (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
+  let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
+  onDone bs
+  halt
+
+asyncMachine amParent (c : LeanIn.Runtime.Conn) := do
+  let first : ByteArray := await (amChunk.run c)
+  let second : ByteArray := await (amChunk.run c)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[first, second])
+  recurse
+
+-- The tid-recording pair for SC23: the child reports the thread its terminal step runs on, the parent reports
+-- the thread each call resumes it on — the resume thread being the child's own completion thread (a raw
+-- resume, no carrier hop), never the accept loop's.
+asyncMachine amChunkT (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
+  let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
+  (do let tid ← IO.getTID; IO.println s!"sc23|childStepTid={tid}"; (← IO.getStdout).flush)
+  onDone bs
+  halt
+
+asyncMachine amParentT (c : LeanIn.Runtime.Conn) := do
+  let first : ByteArray := await (amChunkT.run c)
+  (do let tid ← IO.getTID; IO.println s!"sc23|resumeTid={tid}"; (← IO.getStdout).flush)
+  let second : ByteArray := await (amChunkT.run c)
+  (do let tid ← IO.getTID; IO.println s!"sc23|resumeTid={tid}"; (← IO.getStdout).flush)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[first, second])
+  recurse
+
+-- A child that only writes and returns, and a caller that awaits exactly one call per request — the
+-- machine-call cost isolated against `amEcho` (the same loop with the write inline) and `vmEcho` (the
+-- interpreted `VM`).
+asyncMachine amWrite (c : LeanIn.Runtime.Conn) (bs : ByteArray) (onDone : ByteArray → IO Unit) := do
+  await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
+  onDone bs
+  halt
+
+asyncMachine amCall (c : LeanIn.Runtime.Conn) := do
+  let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
+  let _r : ByteArray := await (amWrite.run c bs)
   recurse
 
 -- A loop as a state machine: send `msg0..msg2` (each an `await`), then close — the loop counter `i` is the
@@ -40,6 +87,14 @@ asyncMachine amBreak (c : LeanIn.Runtime.Conn) := do
     if i == 2 then break
     await (LeanIn.Runtime.Io.sendAllRaw c #[s!"{i}\n".toUTF8])
     let i := i + 1
+  await (LeanIn.Runtime.Io.closeRaw c)
+
+-- `for` with `continue`: send a, c, skipping b by `continue` — the increment is owed on the skipped
+-- iteration too, or c is never reached.
+asyncMachine amForCont (c : LeanIn.Runtime.Conn) := do
+  for x in (#[s!"a\n".toUTF8, s!"b\n".toUTF8, s!"c\n".toUTF8] : Array ByteArray) do
+    if x == s!"b\n".toUTF8 then continue
+    await (LeanIn.Runtime.Io.sendAllRaw c #[x])
   await (LeanIn.Runtime.Io.closeRaw c)
 
 -- `while` with `continue`: send the odd numbers 1,3,5, skipping even by `continue`.
@@ -70,6 +125,15 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
   let c ← Runtime.Listener.accept l hooks
   if mode == "vm" then
     monadLift (Runtime.VM.run (vmEcho c))
+  else if mode == "parent" then
+    monadLift (amParent.run c)
+  else if mode == "parentT" then
+    let tid ← monadLift (IO.getTID : IO UInt64)
+    monadLift (IO.println s!"sc23|acceptTid={tid}")
+    monadLift (IO.getStdout >>= fun s => s.flush : IO Unit)
+    monadLift (amParentT.run c)
+  else if mode == "call" then
+    monadLift (amCall.run c)
   else if mode == "async" then
     monadLift (amEcho.run c)
   else if mode == "loop" then
@@ -80,6 +144,8 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (amBreak.run c)
   else if mode == "cont" then
     monadLift (amContinue.run c)
+  else if mode == "forCont" then
+    monadLift (amForCont.run c)
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode
@@ -90,5 +156,15 @@ def main (args : List String) : IO UInt32 := do
   let hooks ← Runtime.Hooks.new
   let l ← Runtime.Listener.bind (Runtime.loopback port.toUInt16)
   let e ← Sched.Executor.new LeanIn.Task.Item 256 1
-  let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop hooks l mode)
+  if mode == "parentT" then
+    -- The single-carrier entry: one thread is the accept loop, the connection's effects, and the resume —
+    -- and the loop's own pump. The dedicated task's tid is the detector's control that distinct threads
+    -- read distinct tids in this process.
+    IO.println s!"sc23|mainTid={← IO.getTID}"
+    let dt ← IO.asTask IO.getTID Task.Priority.dedicated
+    IO.println s!"sc23|dedicatedTid={(← IO.wait dt).toOption.getD 0}"
+    (← IO.getStdout).flush
+    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop hooks l "parentT")
+  else
+    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop hooks l mode)
   return 0

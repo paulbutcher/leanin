@@ -2016,3 +2016,62 @@ counts bound a wait so that a lost wake is a reading rather than a wedge, and `r
 asserted. (v) The completion arm's `continuationTid` is not compared by O2 on purpose: the route's reading is
 O1's, and this record's clause is about the chain's completion — a reader wanting both readings wants both
 records.
+
+### SC23 — composition: a parent machine awaits a child machine over a real socket
+
+**Actor.** A Lean executable server (`./.lake/build/bin/defuncEcho 8390 parentT`): `amParentT`, an
+`asyncMachine` state machine that awaits `amChunkT` — another compiled machine — twice on one accepted
+connection, each call suspending the parent until the child's terminal `halt` fires the parent's own
+continuation as the child's `onDone`. Both machines report thread ids as they run, and the harness reports its
+own and a dedicated task's. The peer is a shell pipeline writing two chunks with pauses — deliberately not
+ours. The child's continuation parameter is filled by the generator with the parent's continuation: a machine
+awaiting a machine is a raw resume, and no cell is allocated for the call.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC23`, which builds `defuncEcho`, serves it on a
+fixed loopback port, and exchanges two chunks with the served parent over `/dev/tcp`. Nothing here calls a
+private function: the records asserted on are the wire's own byte stream with the read's own bound, and the
+server's `sc23|` tid records on its stdout.
+
+**When.** The client writes `AAAA` and, after a pause, `BBBB`. The served parent awaits the child for the
+first chunk, then for the second, then sends both answers back together. The read runs under the fixture's own
+5 s bound, whose firing is recorded as `bounded`, exactly SC20-O3's shape: the bound is an invocation bound
+and a conjunct of the relation, never the relation itself.
+
+**Then.** Four conjuncts, each its own detector, with the controls below read in the same invocation.
+
+- **SC23-O1, completion.** `bounded == no`: the composed exchange completed — the parent's resend arrived
+  before the bound. A composition whose child's `onDone` never resumes the parent produces a prefix and this
+  bound.
+- **SC23-O2, order.** The stream is exactly `AAAABBBBAAAABBBB`: the child's two echoes in order, then the
+  parent's combined resend — the resend's *presence* being the child's `onDone` having resumed the parent
+  with both answers.
+- **SC23-O3, resumption thread.** Each call's `resumeTid` equals its `childStepTid`: the parent resumed on the
+  child's own completion thread, which is what a raw resume is; a resume delivered through a cell and an item
+  would land wherever the carrier was.
+- **SC23-O4, one driver.** Every recorded tid — both `childStepTid`, both `resumeTid`, and the accept loop's —
+  equals the harness's `mainTid`: in the single-carrier driver, the accept loop, the connection's effects and
+  the resume are one thread, and a hop to another thread is a delivery, not a resume.
+
+**Controls, in the same invocation.** (i) The bound detector reports `bounded=yes` on a real timeout: a
+connection that stays open and silent, read under a 1 s bound, must exit 124, or the `bounded == no` reading
+is an absence a broken detector could always report. (ii) The tid detector reads the harness's dedicated task
+as a different thread from `mainTid`, so the equalities in O3 and O4 are readings rather than a detector that
+cannot differ. (iii) The tid records are shape-checked before they are read: two `childStepTid`, two
+`resumeTid`, and one each of `acceptTid`, `mainTid`, `dedicatedTid`, and a missing or repeated record is a
+setup error, never a pass.
+
+**Red, staged and observed.** (i) The behavior cut: with the child's `onDone` invocation removed, the fixture
+reports `SC23 Then: the composed exchange did not complete (bounded=yes)` with `observed prefix: [AAAA]` —
+the first call never resumes the parent, so even the second chunk is never read, and O1 fails on its own
+conjunct. (ii) The surface cut: on the pre-M2 compiler the composition machines do not elaborate —
+`asyncMachine: a path does not end in recurse or a close` (no `halt` terminal) and `Unknown identifier await`
+(no typed `await`, no machine-call classification) — the boundary the scenario crosses did not exist.
+
+**Limits, stated.** A single-carrier harness cannot distinguish a cell-mediated resume from a raw one by
+thread (a `Join` plus inject would read the same driver thread here), and the multi-carrier entry does not
+serve this shape (the `runCarriers` serving defect recorded beside `LeanIn/Exe/Server.lean`), so O3/O4 read
+resumption and driver-unity, not the absence of a cell: the no-cell fact is structural (the generator passes
+the caller's continuation as the callee's last parameter, and the expansion names no cell) and is costed by
+the M2 benchmark in `docs/asyncmachine-workplan.md`. The port is fixed (`8390`) inside the invocation's own
+loopback; the readiness probe's connection is an ordinary parked read and changes no record. Nothing here
+measures the call's cost; this scenario asserts order, completion, and resumption.
