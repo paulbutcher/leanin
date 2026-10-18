@@ -11,10 +11,10 @@ import LeanIn.Runtime.VM
 machine. The body is lowered **recursively**: pure code is inlined into the current state's step, each `await`
 suspends the current state, and `if`/`match`/`while`/`recurse` become transitions between states. A **liveness
 analysis** decides which variables each state carries as fields (those bound before and used after a
-suspension). The first parameter `(c : Conn)` is the connection — a constant step parameter; a further
-parameter is a **threaded field** only if the body *rebinds* it — state 0 carries it, and `recurse` passes its
-current value back to state 0 — and a constant step parameter otherwise, so a value that must advance across
-iterations (a protocol machine) has to be rebound in every arm that recurses.
+suspension). The first parameter `(c : Conn)` is the connection — a constant step parameter; **every further
+parameter is a threaded field**: state 0 carries it, and `recurse` passes its current value back to state 0, so
+a value the body never rebinds (a config, a handler, a clock) keeps its value across iterations, and one the
+body rebinds (a protocol machine) advances — there is no split to get silently wrong.
 
 Grammar:
 - `let x := await (e)` / `await (e)` — a suspension.
@@ -37,8 +37,9 @@ bind). Field types are inferred without a general elaboration pass: a threaded p
 type, a `recvRaw`-bound variable is `ByteArray`, a `recvTimeoutRaw`-bound one is
 `Option (Except IO.Error (Option ByteArray))`, a `sendRaw`/`sendAllRaw`-bound one is `Except IO.Error Unit`,
 an ascribed binding keeps its type, and any other pure-bound field is read off its use —
-`sendAllRaw`/`sendRaw` argument ⇒ `Array ByteArray`, `if`-condition ⇒ `Bool`, argument of a step parameter's
-arrow ⇒ its domain, else a `Unit` placeholder.
+`sendAllRaw`/`sendRaw` argument ⇒ `Array ByteArray`, `if`-condition ⇒ `Bool`, argument of a parameter's
+arrow ⇒ its domain — and anything else is a **compile error naming the field** and its remedy, never a silent
+`Unit` placeholder.
 -/
 
 namespace LeanIn.Async
@@ -169,21 +170,6 @@ where
   -- A hoisted continuation is a jump term: the fields it passes are used exactly here.
   | .contStmt t => usedNames t
 
-/-- The names **rebound** by `let x := …` in a list of items (recursively). A parameter that is rebound becomes
-a threaded field; one that is only *referenced* (never rebound) stays a constant step parameter — a field
-binding and a bare reference to it can carry different macro scopes and fail to resolve, while a step
-parameter (like the connection) resolves cleanly. -/
-private partial def boundInItems (items : List Item) : List Name :=
-  items.flatMap go
-where
-  go : Item → List Name
-  | .pureBind pat _ _ => patBoundNames pat
-  | .if_ _ t e => boundInItems t ++ boundInItems e
-  | .match_ _ arms => arms.flatMap (fun (_, b) => boundInItems b)
-  | .while_ _ b => boundInItems b
-  | .for_ x _ b => x.getId :: boundInItems b
-  | _ => []
-
 /-- Whether a list of items suspends anywhere (decides inline-vs-new-state for a continuation). -/
 private partial def hasAwait (items : List Item) : Bool :=
   items.any fun
@@ -221,8 +207,8 @@ private structure LoopCtx where
 private structure Ctx where
   name : Name
   conn : Name
-  threaded : List Name          -- the threaded field names (state 0's fields, rebound in the body)
-  stepParams : List (Name × Term)  -- constant step parameters (never rebound), passed to `step` like the connection
+  threaded : List Name          -- the threaded field names (state 0's fields: every parameter)
+  paramTys : List (Name × Term) -- every parameter with its signature type (for use-inference)
   loops : List LoopCtx := []    -- the enclosing `while` loops, innermost first
 
 private abbrev CompileM := StateT (Nat × List GenState) MacroM
@@ -287,7 +273,7 @@ private partial def containsName (f : Name) (s : Syntax) : Bool :=
   | .node _ _ args => args.any (containsName f)
   | _ => false
 
- /-- A field's type when it is used as the argument of a step-parameter function: the function's domain. For
+ /-- A field's type when it is used as the argument of a parameter function: the function's domain. For
 example `handler head` ⇒ `Request.Head`, the handler's argument type — a field whose only use is passing it to
 a typed function, with no `sendAll`/`if` use to read its type off. -/
 private partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Option Term :=
@@ -309,7 +295,7 @@ where
     | .node _ _ args =>
       let direct :=
         if args.size ≥ 2 && args[0]!.isIdent then
-          match ctx.stepParams.find? (fun p => sameName p.1 args[0]!.getId) with
+          match ctx.paramTys.find? (fun p => sameName p.1 args[0]!.getId) with
           | some (_, ty) =>
             match unparen ty.raw with
             | .node _ kk a =>
@@ -335,17 +321,18 @@ private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : 
     else if usedAsCond f rest then `($(mkIdent `Bool))
     else match findFnArg ctx f rest with
       | some ty => pure ty
-      | none => `($(mkIdent `Unit))
+      | none => Macro.throwError s!"asyncMachine: cannot determine the type of state field `{f}` — bound \
+        without an ascription and live across a suspension, and not used in a shape the compiler infers \
+        (a `sendAllRaw`/`sendRaw` argument, an `if`-condition, or the argument of a parameter's arrow). \
+        Ascribe it: `let {f} : T := …`"
 
-/-- A jump `name.step c sp… (name.St.s{idx} args…)`, passing the constant step parameters `sp…` and the state's
-live fields `args`. -/
+/-- A jump `name.step c (name.St.s{idx} args…)`, passing the state's live fields `args`. -/
 private def jumpTerm (ctx : Ctx) (idx : Nat) (args : List Name) : MacroM Term := do
   let step := mkIdent (ctx.name ++ `step)
   let cn := stIdent ctx.name idx
   let c := mkIdent ctx.conn
-  let spArgs := ctx.stepParams.toArray.map (fun (x, _) => (mkIdent x : Term))
   let argTs := args.toArray.map (fun a => (mkIdent a : Term))
-  if argTs.isEmpty then `($step $c $spArgs* $cn) else `($step $c $spArgs* ($cn $argTs*))
+  if argTs.isEmpty then `($step $c $cn) else `($step $c ($cn $argTs*))
 
 /-- The `recurse` jump: back to state 0 with the threaded parameters' current values. -/
 private def recurseTerm (ctx : Ctx) : MacroM Term :=
@@ -496,11 +483,11 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     let rIdx ← freshIdx
     let all : List Item := .while_ c body :: rest
     let used := (usedInItems all).map (·.eraseMacroScopes)
-    let loopScope := scope.filter (fun (n, _) => used.contains n.eraseMacroScopes)
+    let loopScope := scope.filter (fun (n, _) => ctx.threaded.contains n || used.contains n.eraseMacroScopes)
     let loopNames := loopScope.map (·.1)
     let loopFields ← loopScope.mapM (fun (n, b) => do pure (n, ← fieldTypeFor ctx n b all))
     let restUsed := (usedInItems rest).map (·.eraseMacroScopes)
-    let restScope := scope.filter (fun (n, _) => restUsed.contains n.eraseMacroScopes)
+    let restScope := scope.filter (fun (n, _) => ctx.threaded.contains n || restUsed.contains n.eraseMacroScopes)
     let restNames := restScope.map (·.1)
     let restFields ← restScope.mapM (fun (n, b) => do pure (n, ← fieldTypeFor ctx n b rest))
     let restBody ← compileBody ctx rest restScope
@@ -577,9 +564,11 @@ private partial def genState (ctx : Ctx) (rest : List Item) (scope : List (Name 
 /-- The in-scope variables used in `rest` (the live fields). Compared scope-free: the threaded parameter
 declared in the signature and the same name used in the body can carry different macro scopes, which would
 otherwise drop a genuinely live variable from a state's fields. -/
-private partial def liveNames (_ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List Name :=
+private partial def liveNames (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List Name :=
   let used := (usedInItems rest).map (·.eraseMacroScopes)
-  scope.filter (fun (n, _) => used.contains n.eraseMacroScopes) |>.map (·.1)
+  -- Threaded parameters are always live: a `recurse` from any state must be able to pass them all back to
+  -- state 0, so every state carries them whether or not its own body uses them.
+  scope.filter (fun (n, _) => ctx.threaded.contains n || used.contains n.eraseMacroScopes) |>.map (·.1)
 
 /-- The scope restricted to the variables live into `rest`. -/
 private partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List (Name × Bind) :=
@@ -598,17 +587,14 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
     | _ => throwError "asyncMachine: parameters must be `(x : T)`"
   let threaded := threadedInfo.map (·.1)
   let items ← Lean.Elab.liftMacroM (parseItems body)
-  -- Split: parameters rebound in the body are threaded fields; the rest are constant step parameters.
-  let rebound := boundInItems items
-  let stepParams := threadedInfo.filter (fun (x, _) => !rebound.contains x)
-  let threadedFields := threadedInfo.filter (fun (x, _) => rebound.contains x)
-  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threadedFields.map (·.1), stepParams := stepParams }
-  let initScope : List (Name × Bind) := threadedFields.map (fun (x, ty) => (x, .threaded ty))
+  -- Every parameter is a threaded field of state 0: an unrebound parameter keeps its value across `recurse`
+  -- (the constant-parameter shape, carried rather than resolved), and a rebound one advances. Splitting
+  -- constants out was the silent-trap shape: a parameter the body forgot to rebind stayed constant with no
+  -- sign of it.
+  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threaded, paramTys := threadedInfo }
+  let initScope : List (Name × Bind) := threadedInfo.map (fun (x, ty) => (x, .threaded ty))
   -- Run the compiler, seeding state 0 as the entry (its fields are the threaded parameters).
-  let s0fields ← initScope.mapM (fun (x, b) => do
-    match b with
-    | .threaded ty => pure (x, ty)
-    | _ => pure (x, ← `($(mkIdent `Unit))))
+  let s0fields := threadedInfo.map (fun (x, ty) => (x, ty))
   let compileAct : CompileM Unit := do
     let bodyT ← compileBody ctx items initScope
     addState { idx := 0, fields := s0fields, body := bodyT }
@@ -628,18 +614,16 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
     let cn := stLocalName st.idx
     let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
     `(matchAltExpr| | $patTerm => $(st.body)))
-  -- The step takes the connection and the constant step parameters; the threaded fields live in the states.
-  let stepBinders ← stepParams.toArray.mapM (fun (x, ty) => `(bracketedBinder| ($(mkIdent x) : $ty)))
-  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $stepBinders* : $sn → IO Unit :=
+  -- The step takes the connection alone; the threaded fields (every parameter) live in the states.
+  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) : $sn → IO Unit :=
     fun st => match st with
       $matchAlts:matchAlt*)
   Lean.Elab.Command.elabCommand stepCmd
-  -- The run passes the connection and step parameters to `step`, and the threaded fields to state 0.
-  let stepArgs := stepParams.toArray.map (fun (x, _) => (mkIdent x : Term))
-  let tfArgs := threadedFields.toArray.map (fun (x, _) => (mkIdent x : Term))
+  -- The run passes the connection to `step`, and the threaded fields (every parameter) to state 0.
+  let tfArgs := threaded.toArray.map (fun x => (mkIdent x : Term))
   let s0app ← if tfArgs.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $tfArgs*)
   let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $params* : IO Unit :=
-    $stepn $(mkIdent c.getId) $stepArgs* $s0app)
+    $stepn $(mkIdent c.getId) $s0app)
   Lean.Elab.Command.elabCommand runCmd
 
 end LeanIn.Async

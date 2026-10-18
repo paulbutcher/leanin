@@ -71,8 +71,9 @@ deriving Inhabited, BEq, Repr
 `needHandler` -- the head to hand the handler.
 
 A structure rather than an inductive with arguments, because every field the loop reads then carries its type
-from the declaration. The `asyncMachine` compiler infers a state field's type from its uses and falls back to
-`Unit` where uses alone cannot say, which a `match`-bound pattern hits; reading named fields sidesteps that. -/
+from the declaration. The `asyncMachine` compiler infers a state field's type from its uses and errors with
+the field named where uses alone cannot say, which a `match`-bound pattern hits; reading named fields
+sidesteps that. -/
 structure Pump where
   stop    : Stop := .done
   machine : H1.Machine := {}
