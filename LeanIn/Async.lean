@@ -9,23 +9,36 @@ import LeanIn.Runtime.VM
 
 `asyncMachine name (c : Conn) (x : T) … := do …` compiles a connection-loop body into a per-function state
 machine. The body is lowered **recursively**: pure code is inlined into the current state's step, each `await`
-suspends the current state, and `if`/`recurse` become transitions between states. A **liveness analysis**
-decides which variables each state carries as fields (those bound before and used after a suspension). The
-first parameter `(c : Conn)` is the connection — a constant step parameter; any further parameters are
-**threaded fields**: state 0 carries them, and `recurse` passes their current values back to state 0.
+suspends the current state, and `if`/`match`/`while`/`recurse` become transitions between states. A **liveness
+analysis** decides which variables each state carries as fields (those bound before and used after a
+suspension). The first parameter `(c : Conn)` is the connection — a constant step parameter; a further
+parameter is a **threaded field** only if the body *rebinds* it — state 0 carries it, and `recurse` passes its
+current value back to state 0 — and a constant step parameter otherwise, so a value that must advance across
+iterations (a protocol machine) has to be rebound in every arm that recurses.
 
 Grammar:
 - `let x := await (e)` / `await (e)` — a suspension.
-- `let x := e` / `let (a, b) := e` / a bare `e` — pure code, inlined.
-- `if c then A else B` (the `else` is optional) — control flow; each branch is a nested body. A control-flow
-  item in the middle of a sequence hoists the rest into a *shared* continuation state, so converging paths are
-  compiled once. (`match` is the next cut, with `recvTimeout`.)
-- `recurse` — jump back to state 0 (must end a path).
+- `let x := e` / `let x : T := e` — pure code, inlined (an ascription is what pins a state field's type;
+  destructuring `let (a, b) := e` is not supported — bind components separately).
+- a bare `e` — an action, sequenced with `>>=` exactly as `do` would (a term-level `let _ :=` would bind the
+  action as a value and never run it).
+- `if c then A else B` (the `else` is optional), `match s with …` — control flow; each branch is a nested
+  body. A control-flow item in the middle of a sequence hoists the rest into a *shared* continuation state, so
+  converging paths are compiled once.
+- `while c do B` (desugared through the same transitions), `for x in xs do B`, `break`, `continue`.
+- `recurse` — jump back to state 0 (must end a path). A close ends a path too; only pure statements may
+  follow it, and they run after the socket goes (a completion signal is the use).
 
-Effects this cut resumes: `Io.recvRaw` (auto-`Option`: `some` continues, `none` closes), `Io.sendAllRaw`,
-`Io.sendRaw`, `Io.closeRaw`. Field types are inferred without a general elaboration pass: a threaded parameter
-keeps its signature type, a `recvRaw`-bound variable is `ByteArray`, and a pure-bound field is read off its
-use — `sendAllRaw`/`sendRaw` argument ⇒ `Array ByteArray`, `if`-condition ⇒ `Bool`, else a `Unit` placeholder.
+Effects this cut resumes: `Io.recvRaw` (the byte payload continues on `.ok (some …)`; an end of stream or a
+failure closes), `Io.recvTimeoutRaw` (the full race outcome is delivered: `none` stalled, `some (.ok …)` read,
+`some (.error …)` failed), `Io.sendAllRaw`/`Io.sendRaw` (the `Except` is delivered when the result is bound; an
+unbound write failure closes), `Io.closeRaw`, and `VM.runAsync` (a sub-computation's result is delivered to the
+bind). Field types are inferred without a general elaboration pass: a threaded parameter keeps its signature
+type, a `recvRaw`-bound variable is `ByteArray`, a `recvTimeoutRaw`-bound one is
+`Option (Except IO.Error (Option ByteArray))`, a `sendRaw`/`sendAllRaw`-bound one is `Except IO.Error Unit`,
+an ascribed binding keeps its type, and any other pure-bound field is read off its use —
+`sendAllRaw`/`sendRaw` argument ⇒ `Array ByteArray`, `if`-condition ⇒ `Bool`, argument of a step parameter's
+arrow ⇒ its domain, else a `Unit` placeholder.
 -/
 
 namespace LeanIn.Async
@@ -153,7 +166,8 @@ where
   | .continue_ => []
   | .recurse => []
   | .goto _ args => args
-  | .contStmt _ => []
+  -- A hoisted continuation is a jump term: the fields it passes are used exactly here.
+  | .contStmt t => usedNames t
 
 /-- The names **rebound** by `let x := …` in a list of items (recursively). A parameter that is rebound becomes
 a threaded field; one that is only *referenced* (never rebound) stays a constant step parameter — a field
@@ -185,7 +199,8 @@ private inductive Bind where
   | conn                          -- the connection (a step parameter, never a field)
   | threaded (ty : Term)          -- a threaded parameter (its signature type)
   | recvRes                       -- `recvRaw` result ⇒ `ByteArray`
-  | recvTimeoutRes                -- `recvTimeoutRaw` result ⇒ `Option (Option ByteArray)`
+  | recvTimeoutRes                -- `recvTimeoutRaw` result ⇒ `Option (Except IO.Error (Option ByteArray))`
+  | sendRes                       -- `sendRaw`/`sendAllRaw` result ⇒ `Except IO.Error Unit`
   | typed (ty : Term)             -- a pure binding with an ascription ⇒ its type
   | pureB                         -- pure-bound ⇒ inferred from use
 
@@ -311,7 +326,8 @@ private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : 
   match b with
   | .threaded ty => pure ty
   | .recvRes => `($(mkIdent `ByteArray))
-  | .recvTimeoutRes => `(Option (Option ByteArray))
+  | .recvTimeoutRes => `(Option (Except IO.Error (Option ByteArray)))
+  | .sendRes => `(Except IO.Error Unit)
   | .typed ty => pure ty
   | .conn => Macro.throwError s!"asyncMachine: the connection `{f}` cannot be a state field"
   | .pureB =>
@@ -340,6 +356,7 @@ private def resultBind (eff : Eff) : Bind :=
   match eff with
   | .recv => .recvRes
   | .recvTimeout .. => .recvTimeoutRes
+  | .sendAll .. | .send .. => .sendRes
   | _ => .pureB
 
 /-- The suspension for one effect, with continuation `cont`. -/
@@ -348,28 +365,65 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
   match eff with
   | .recv =>
     let bv := bnd.getD `bs
+    -- The auto-close after an end of stream or a failure is cleanup on a connection whose peer is already
+    -- gone; its result is discarded. The shim refuses a close only with the loop down or the submit queue
+    -- full (`MAX_SUBMIT`) — both runtime-wide states, which the loop already fails loudly on its own
+    -- convention (a refused cleanup close in `readDone`/`opDone` kills the loop thread deliberately).
     `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
-        | some $(mkIdent bv) => $cont
-        | none => LeanIn.Runtime.Io.closeRaw $c))
+        | .ok (some $(mkIdent bv)) => $cont
+        | .ok none => discard (LeanIn.Runtime.Io.closeRaw $c)
+        | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
   | .recvTimeout sched d z =>
     let bv := bnd.getD `r
     `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z (fun $(mkIdent bv) => $cont))
   | .runVM m =>
     let bv := bnd.getD `v
     `(LeanIn.Runtime.VM.runAsync $m (fun $(mkIdent bv) => $cont))
-  | .sendAll d => `(LeanIn.Runtime.Io.sendAllRaw $c $d ($cont))
-  | .send d => `(LeanIn.Runtime.Io.sendRaw $c $d ($cont))
+  -- A failed write ends the connection rather than continuing as if the bytes were sent — unless the body
+  -- bound the effect's result (`let r := await …`), in which case the whole `Except` is delivered and the
+  -- body owns the outcome.
+  | .sendAll d =>
+    match bnd with
+    | some bv => `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun $(mkIdent bv) => $cont))
+    | none =>
+      `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun
+          | .ok _ => $cont
+          | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
+  | .send d =>
+    match bnd with
+    | some bv => `(LeanIn.Runtime.Io.sendRaw $c $d (fun $(mkIdent bv) => $cont))
+    | none =>
+      `(LeanIn.Runtime.Io.sendRaw $c $d (fun
+          | .ok _ => $cont
+          | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
 
 /-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, or a close — so appending a
 continuation after it (the code following an `if`/loop body) would be unreachable and must be skipped. -/
-private def endsTerminal (items : List Item) : Bool :=
+private partial def endsTerminal (items : List Item) : Bool :=
   match items.getLast? with
   | some .recurse => true
   | some .break_ => true
   | some .continue_ => true
   | some (.await _ e) => (match classify e with | .close => true | _ => false)
+  -- A close may be followed by a pure tail, so the check looks past pure items for the terminal.
+  | some (.pureStmt _) | some (.pureBind ..) => endsTerminal items.dropLast
   | _ => false
+
+/-- The pure tail a close may be followed by: every statement runs after the socket goes, so nothing that
+suspends is allowed -- a completion signal (the `onClose` of a served connection) is the use. -/
+private def closeTail : List Item → MacroM Term
+  | [] => `(pure ())
+  | .pureStmt s :: rs => do
+    let t ← closeTail rs
+    `($(⟨s⟩) >>= fun _ => $t)
+  | .pureBind pat none s :: rs => do
+    let t ← closeTail rs
+    `(let $(⟨pat⟩) := $(⟨s⟩); $t)
+  | .pureBind pat (some ty) s :: rs => do
+    let t ← closeTail rs
+    `(let $(⟨pat⟩) : $ty := $(⟨s⟩); $t)
+  | _ :: _ => Macro.throwError "asyncMachine: only pure statements may follow `closeRaw`"
 
 mutual
 /-- Compile a list of items into the body Term of a state (or an inline continuation). Generates any
@@ -392,13 +446,21 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     | some t => `(let $(⟨pat⟩) : $t := $(⟨e⟩); $inner)
     | none => `(let $(⟨pat⟩) := $(⟨e⟩); $inner)
   | .pureStmt e :: rest => do
+    -- A bare statement is an action to perform, as `do` would sequence it — a term-level `let _ :=` would
+    -- bind the action as a value and silently never run it.
     let inner ← compileBody ctx rest scope
-    `(let _ := $(⟨e⟩); $inner)
+    `($(⟨e⟩) >>= fun _ => $inner)
   | .await bnd e :: rest => do
     match classify e with
-    | .close =>
-      unless rest.isEmpty do Macro.throwError "asyncMachine: nothing may follow `closeRaw`"
-      `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn))
+    | .close => do
+      let tail ← closeTail rest
+      match bnd with
+      | some bv => `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun $(mkIdent bv) => $tail)
+      -- An unbound close has no outcome channel, so a refusal is loud instead of silently unclosed.
+      | none    =>
+        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun accepted =>
+          if accepted then $tail
+          else throw (IO.userError "asyncMachine: the loop refused the connection's close submission"))
     | .unknown => Macro.throwError "asyncMachine: unsupported effect in await"
     | eff => do
       let scope' := scope ++ bnd.toList.map (·, resultBind eff)

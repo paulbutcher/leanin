@@ -334,8 +334,18 @@ def step (m : Machine) : Machine × StepResult :=
                 keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
        { events := #[.endHeaders head] })
 
-/-- Queue an encoded response head. -/
+/-- Queue an encoded response head. The `Connection` directive on the wire is the machine's own disposition,
+reconciled with the handler's: a handler's `Connection: close` is honoured -- recorded here, so `userClosedBody`
+ends the connection -- and a handler's `Connection: keep-alive` cannot keep a connection the machine must close
+(the peer asked to close, or `maxMessages` was reached). Exactly one directive goes out: `close` when the
+machine will close, nothing otherwise, since keep-alive is the HTTP/1.1 default. A close the machine is about
+to make is the peer's to know about: undisclosed, it reads as a truncated connection, not an ended exchange. -/
 def send (m : Machine) (rh : ResponseHead) : Machine :=
+  let handlerClose := rh.headers.any (fun (n, v) =>
+    n.toLower == "connection" && (v.splitOn ",").any (fun t => t.trimAscii.toString.toLower == "close"))
+  let m := if handlerClose then { m with keepAlive := false } else m
+  let rh := { rh with headers := rh.headers.filter (fun (n, _) => n.toLower != "connection") }
+  let rh := if m.keepAlive then rh else { rh with headers := #[("Connection", "close")] ++ rh.headers }
   { m with out := m.out.push (encodeResponseHead rh) }
 
 /-- Put an error response on the wire (`Connection: close`, empty body) and stop accepting input. The machine
@@ -350,13 +360,19 @@ def closeWithError (m : Machine) (status : Nat) (reason : String := "Internal Se
 def sendData (m : Machine) (chunks : Array ByteArray) : Machine :=
   { m with out := m.out ++ chunks }
 
-/-- The handler has finished the body: keep the connection alive or close it. -/
+/-- The handler has finished the body: keep the connection alive, or close it -- the close halts once the
+queued answer has been flushed, not before, so the answer is not dropped. -/
 def userClosedBody (m : Machine) : Machine :=
-  if m.keepAlive then { m with head? := none, bodyRemaining := 0 } else { m with halted := true }
+  if m.keepAlive then { m with head? := none, bodyRemaining := 0 }
+  else if m.out.size > 0 then { m with closing := true }
+  else { m with halted := true }
 
-/-- The peer has sent all it will: close if nothing is mid-flight. -/
+/-- The peer has sent all it will: close if nothing is mid-flight -- an answer still queued to be written is
+mid-flight, so the close halts once it has been flushed, not before. -/
 def noMoreInput (m : Machine) : Machine :=
-  if m.head?.isNone && m.pos ≥ m.buf.size then { m with halted := true } else m
+  if m.head?.isNone && m.pos ≥ m.buf.size then
+    if m.out.size > 0 then { m with closing := true } else { m with halted := true }
+  else m
 
 end Machine
 

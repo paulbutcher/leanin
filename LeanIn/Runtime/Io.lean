@@ -627,31 +627,40 @@ def recv (c : Conn) (size : UInt64) : Task.EAsync IO.Error (Option ByteArray) :=
 /-- **Receive, raw** (defunctionalization experiment): like `recv`, but `resume` runs *on the loop thread* —
 no `Join` cell, `Item`, inject or carrier hop. The bytes arrive by the same `read`/`readDone` shim path; only the
 delivery is different. This and `sendRaw` measure what the `Join`-cell delivery costs against a direct resume. -/
-def recvRaw (c : Conn) (size : UInt64) (resume : Option ByteArray → IO Unit) : IO Unit := do
+def recvRaw (c : Conn) (size : UInt64) (resume : Except IO.Error (Option ByteArray) → IO Unit) : IO Unit := do
   registerRaw c.idx .read (fun r => resume (match r with
-    | .ok (.read d) => d
-    | _             => none))
+    | .ok (.read d) => .ok d
+    | .ok _         => .error (.userError "Io.recvRaw: the loop delivered a mismatched completion")
+    | .error e      => .error e))
   unless (← npUvRead c.idx size) != 0 do
-    resume none
+    withdrawRaw c.idx .read
+    resume (.error (.userError "Io.recvRaw: the loop refused a read submission"))
 
-/-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. -/
-def sendRaw (c : Conn) (data : ByteArray) (resume : IO Unit) : IO Unit := do
-  registerRaw c.idx .write (fun _ => resume)
+/-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. A refused submission
+resumes an error rather than dropping the continuation: a write that never happened is not a completion. -/
+def sendRaw (c : Conn) (data : ByteArray) (resume : Except IO.Error Unit → IO Unit) : IO Unit := do
+  registerRaw c.idx .write (fun r => resume (match r with
+    | .ok _    => .ok ()
+    | .error e => .error e))
   unless (← npUvWrite c.idx data) != 0 do
-    pure ()
+    withdrawRaw c.idx .write
+    resume (.error (.userError "Io.sendRaw: the loop refused a write submission"))
 
-/-- **Close, raw** (experiment): close the connection's handle on the loop thread. -/
-def closeRaw (c : Conn) : IO Unit := discard (npUvClose c.idx)
+/-- **Close, raw** (experiment): close the connection's handle on the loop thread. The result is `true` when
+the shim accepted the submission, `false` when it refused -- a caller that reports a clean close must read it,
+because a refused close left the handle's end unreported. -/
+def closeRaw (c : Conn) : IO Bool := return (← npUvClose c.idx) == 1
 
 /-- **Receive with a deadline, raw**: race a read against a timer armed via `schedule` (a clock's `schedule`,
 passed in so this file does not import the clock seam). The first to fire wins: a completed read cancels the
-timer and resumes `some result`; the deadline withdraws the parked read and resumes `none` (stalled). The
+timer and resumes `some` of its outcome -- `.ok` with the read, `.error` with its failure, so a reset is not
+mistaken for an orderly end of stream; the deadline withdraws the parked read and resumes `none` (stalled). The
 `won` cell is the first-wins guard — the timer's fire and the read's completion can race on different threads
 (a live loop thread against a harness driver's advance). -/
 def recvTimeoutRaw (c : Conn)
     (schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit)
     (d : Std.Time.Millisecond.Offset) (size : UInt64)
-    (resume : Option (Option ByteArray) → IO Unit) : IO Unit := do
+    (resume : Option (Except IO.Error (Option ByteArray)) → IO Unit) : IO Unit := do
   let won ← Std.Mutex.new false
   let timerCancel ← Task.Cancel.new
   schedule d timerCancel (do
@@ -666,18 +675,15 @@ def recvTimeoutRaw (c : Conn)
       if ← get then pure false else do set true; pure true
     if first then resume (some r))
 
-/-- **Send all chunks, raw** (experiment): a vectored write whose completion runs on the loop thread. -/
-def sendAllRaw (c : Conn) (chunks : Array ByteArray) (resume : IO Unit) : IO Unit := do
-  registerRaw c.idx .write (fun _ => resume)
+/-- **Send all chunks, raw** (experiment): a vectored write whose completion runs on the loop thread. A refused
+submission resumes an error rather than dropping the continuation, exactly as `sendRaw`. -/
+def sendAllRaw (c : Conn) (chunks : Array ByteArray) (resume : Except IO.Error Unit → IO Unit) : IO Unit := do
+  registerRaw c.idx .write (fun r => resume (match r with
+    | .ok _    => .ok ()
+    | .error e => .error e))
   unless (← npUvWritev c.idx chunks) != 0 do
-    pure ()
-
-/-- **A defunctionalized echo** (experiment): read the bytes, write them back, read again — every step a raw
-completion running on the loop thread. `partial` because a connection has no bound. -/
-partial def defuncEcho (c : Conn) : IO Unit :=
-  recvRaw c 65536 fun
-    | some bs => sendRaw c bs (defuncEcho c)
-    | none    => discard (npUvClose c.idx)
+    withdrawRaw c.idx .write
+    resume (.error (.userError "Io.sendAllRaw: the loop refused a write submission"))
 
 /-- **Send one buffer**, awaiting its completion. The bytes are copied into memory the write request owns at the
 submission, so the caller's buffer can go away before the write finishes. -/

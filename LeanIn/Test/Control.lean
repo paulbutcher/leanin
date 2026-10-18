@@ -1046,7 +1046,7 @@ is what makes the thread identities mean anything. The response bytes the client
 printed escaped so the field stays one token (`\`→`\\`, CR→`\r`, LF→`\n`).
 
 The per-connection half is `Runtime.Http.serveConn`, driven by `Runtime.serveNJoin` — the accept loop of ours —
-so the socket bytes are carried through `Std.Http.Protocol.H1`'s own machine and the handler is dispatched
+so the socket bytes are carried through the `LeanIn.Http.H1` machine and the handler is dispatched
 inline on the carrier the connection runs on. `Std.Http.Server`'s loop would have spawned it with `.asTask`
 (`Std/Http/Server/Connection.lean:319`), putting it back on the stock pool — the observation SC19's carrier
 clause reports.
@@ -1090,7 +1090,7 @@ def runtimeHttp : IO UInt32 := do
   let (heldBefore, _) ← e.observe
   let serverProg : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks l 1 (Runtime.Http.serveConn hooks cfg · handler)
+    Runtime.serveNJoin hooks l 1 (Runtime.Http.serveConn cfg · handler)
   let server ← IO.asTask (Runtime.run e serverProg) _root_.Task.Priority.dedicated
   let clientTid ← IO.getTID
   let got ← Std.Async.Async.block do
@@ -1180,8 +1180,9 @@ private def clientRead (c : Std.Async.TCP.Socket.Client) (want : Option Nat)
 /-- **W9's second milestone: the driver as a service — keep-alive, an answered failure, and a bounded peer.**
 
 Three clauses, each with a listener bound by this invocation and a run of its own, in one invocation: one client
-socket carries two request/response exchanges; a handler that returns `error` puts a failure response on the
-wire; and a peer that never sends a byte ends the connection at the mode's stated instant, read from the harness
+socket carries two request/response exchanges; a handler that suspends and only then returns `error` — the
+raise arriving from a resumed continuation — puts a failure response on the wire; and a peer that never sends a
+byte ends the connection at the mode's stated instant, read from the harness
 clock. The client is deliberately `Std.Async`'s, driven by `Async.block` on this thread — a client that is not
 ours is what makes the thread identities mean anything — and the server side is `Runtime.Http.serveConn` under
 `Runtime.serveNJoin`, the accept loop of ours.
@@ -1199,7 +1200,7 @@ which is what ends the peer's read — and this mode then drives its loop in bou
 returns, so the clause reports the peer's behaviour rather than a hang.
 
 The drive path is ours: `Runtime.serveNJoin` is the accept loop and `Runtime.Http.serveConn` the per-connection
-body, driving an `H1` machine built from `H1.Config` alone. The records the mode prints are the ones the frozen
+body, driving a `LeanIn.Http.H1` machine built from its `Limits` alone. The records the mode prints are the ones the frozen
 fixture reads, so a red here is about the connection's behaviour rather than about a missing binding.
 
 Beside the drive path, and the mode's own rather than the driver's, clause three drives its executor once past
@@ -1239,7 +1240,7 @@ def runtimeHttpService : IO UInt32 := do
   let cfg1 : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks1 }
   let server1 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids1.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks1 l1 1 (Runtime.Http.serveConn hooks1 cfg1 · handler1)
+    Runtime.serveNJoin hooks1 l1 1 (Runtime.Http.serveConn cfg1 · handler1)
   let server1T ← IO.asTask (Runtime.run e1 server1) _root_.Task.Priority.dedicated
   -- The client: two exchanges on one socket. The second send is guarded because a peer that has already closed
   -- is an ordinary case for this clause, and what the clause records is the bytes, which the guard cannot change.
@@ -1279,16 +1280,19 @@ def runtimeHttpService : IO UInt32 := do
   let addr2 ← Runtime.Listener.sockName l2
   let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids2 ← IO.mkRef ([] : List UInt64)
+  let cfg2 : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
   let handler2 : Runtime.Http.Handler := fun _ => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids2.modify (· ++ [tid]) : IO Unit)
+    -- The suspension is the point: the raise reaches the driver from a *resumed* continuation, not from the
+    -- extent the handler was first called in, which is the path `VM.attempt` exists to cover.
+    Runtime.VM.sleep cfg2.clock 1
     throw (IO.userError "sc20 clause two: this handler answers every request with a failure")
   for _ in List.range 3 do e2.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore2, _) ← e2.observe
-  let cfg2 : Runtime.Http.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
   let server2 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids2.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks2 l2 1 (Runtime.Http.serveConn hooks2 cfg2 · handler2)
+    Runtime.serveNJoin hooks2 l2 1 (Runtime.Http.serveConn cfg2 · handler2)
   let server2T ← IO.asTask (Runtime.run e2 server2) _root_.Task.Priority.dedicated
   let faClient ←
     try
@@ -1310,11 +1314,11 @@ def runtimeHttpService : IO UInt32 := do
   let distinct2 := distinctOf tids2
   let (inFlightAfter2, _) ← e2.observe
   let pendingAfter2 ← Runtime.pending hooks2
-  match faOutcome with
-  | .error err => IO.println s!"fa|failed={err}"; return 1
-  | .ok (.error err) => IO.println s!"fa|failed={err}"; return 1
-  | .ok (.ok ()) =>
-    IO.println s!"fa|status={parsedStatus got}|got={escBytes got}|carrierThreads={distinct2.length}|heldBefore={heldBefore2}|inFlightAfter={inFlightAfter2}|pendingHooks={pendingAfter2}|runUs={faUs}"
+  -- Whatever the server side did — answered, ended on an error, or died with one — the clause reports what
+  -- the client observed, so the fixture's assertion reads a record rather than the invocation dying without
+  -- one. `parsedStatus` reads 0 on no status line. A server-side failure that costs the client its answer
+  -- fails the clause, loudly, instead of being classified away from the assertion.
+  IO.println s!"fa|status={parsedStatus got}|got={escBytes got}|carrierThreads={distinct2.length}|heldBefore={heldBefore2}|inFlightAfter={inFlightAfter2}|pendingHooks={pendingAfter2}|runUs={faUs}"
 
   -- ================= clause three: a stalled peer — bounded at the mode's stated instant =================
   let stall : Std.Time.Millisecond.Offset := 30
@@ -1334,7 +1338,7 @@ def runtimeHttpService : IO UInt32 := do
     { h1 := {}, clock := Runtime.HarnessClock.clock hc, stallTimeout := stall }
   let server3 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids3.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks3 l3 1 (Runtime.Http.serveConn hooks3 cfg3 · handler3)
+    Runtime.serveNJoin hooks3 l3 1 (Runtime.Http.serveConn cfg3 · handler3)
   let server3T ← IO.asTask (Runtime.runVirtual hc e3 server3) _root_.Task.Priority.dedicated
   -- The client connects and sends nothing, which is what leaves the driver's read to the deadline. If the
   -- invocation's bound fires first, the client closes its write side, which is what ends the peer's read.

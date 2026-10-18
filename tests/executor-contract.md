@@ -1459,7 +1459,9 @@ which SC17's clause three already uses.
    the same socket, read until they equal it again, then shut the socket down. The record is
    `ka|handled=<the requests the handler answered>|first=<escaped response 1>|second=<escaped response 2>|carrierThreads=<n>|clientAmongServer=<b>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
 2. **Clause two — a failing handler (`fa|`).** A second listener and run in the same invocation, whose handler
-   returns `error` for every request. The client sends the same request and reads until end of stream. The record is
+   **suspends first** — one millisecond on the server clock — and only then returns `error` for every request, so
+   the failure is raised in a *resumed* continuation rather than in the extent the handler was first called in.
+   The client sends the same request and reads until end of stream. The record is
    `fa|status=<the code the client parsed out of the status line>|got=<escaped bytes read>|carrierThreads=<n>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
 3. **Clause three — a stalled peer (`idle|`).** A third listener and run, driven by
    `IO.asTask (Runtime.runVirtual hc e prog)` on its own thread, with `cfg.clock := HarnessClock.clock hc` and

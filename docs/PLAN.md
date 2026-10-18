@@ -115,8 +115,9 @@ ______________________________________________________________________
   the `v4.35.0-rc3` tag, for nix) — because `Std.WP` exists only in the 4.35 line. The nix path
   builds from source through nixpkgs rather than installing through elan, which resolves
   `lean-toolchain` over a network that offline runs cannot use.
-- Build: `nix develop -c lake build`; harness: `nix develop -c lake exe spike`. The dev shell wraps
-  `lake`/`lean` in `nice -n 19`; `LEANIN_LEAN_NICE=0` opts out.
+- Build: `nix develop -c lake build`; harness: `nix develop -c lake exe controls` (the scheduler spike that
+  produced `docs/evidence.md`'s baseline was retired once its numbers were recorded — see that file's header).
+  The dev shell wraps `lake`/`lean` in `nice -n 19`; `LEANIN_LEAN_NICE=0` opts out.
 - Reference trees, read-only and outside the build: `Vendor/tokio/` (algorithms) and `Vendor/lean4/`
   (the runtime, at the exact toolchain commit).
 - No Lake dependencies yet — `Std` ships with the toolchain. `iris-lean`, if used, arrives as a pinned
@@ -173,8 +174,10 @@ ______________________________________________________________________
 **Exit criteria — met**
 
 - D8 and D9 recorded with their reasons; **D10 spiked with a passing observation**
-  (`LeanIn/Exe/WakerSpike.lean`, three runs, all checks true).
-- `nix develop -c lake exe spike` reproduces the baseline in [`evidence.md`](evidence.md).
+  (three runs, all checks true; the spike harness was retired once recorded — its verbatim output is in
+  [`evidence.md`](evidence.md)).
+- The baseline in [`evidence.md`](evidence.md) is reproduced and recorded there (the spike harness has since
+  been retired; the record stands as taken on that machine).
 
 ______________________________________________________________________
 

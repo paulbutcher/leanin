@@ -33,10 +33,6 @@ first-time user run, and it must not need anything outside the Lean toolchain. T
 with them, are built on demand: `lake exe controls`, `lake exe server`, and so on, which is how the fixtures
 and `bench/threeway.sh` already reach them. -/
 
-lean_exe spike where root := `LeanIn.Exe.Spike
-
-lean_exe wakerspike where root := `LeanIn.Exe.WakerSpike
-
 lean_exe controls where
   root := `LeanIn.Exe.Controls
   moreLinkArgs := netuvLinkArgs

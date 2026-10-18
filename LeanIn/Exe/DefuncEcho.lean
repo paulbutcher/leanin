@@ -1,51 +1,21 @@
 import LeanIn
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
-import LeanIn.Runtime.VMHttp
-import LeanIn.Runtime.SmEcho
-import LeanIn.Runtime.HttpServer
 import LeanIn.Async
 open LeanIn
+
+/-!
+# `asyncMachine` exercise harness
+
+Small machines that compile the shapes the connection driver relies on — a suspension per iteration, loops and
+their carried fields, `break`/`continue`, a close that ends the path — plus the two hand-written echo baselines
+they are measured against (`cpsEcho` through the `Join`-cell delivery, `vmEcho` through the interpreted `VM`).
+Run with `lake exe defuncEcho [port] [mode]`: `async`, `loop`, `for`, `brk`, `cont`, `vm`, default `cps`.
+-/
 
 asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[req])
-  recurse
-
-/-- Stateless H1 respond: feed the request bytes to a fresh machine, then step + run the handler until the
-machine stops making progress, returning the accumulated output (the response). Correct when each read
-delivers a complete request — the benchmark's sequential keep-alive requests; a partial read would need the
-machine threaded across iterations (the control-flow/liveness follow-up), since a fresh machine loses it. -/
-partial def process (handler : Runtime.VMHttp.PureHandler) (bs : ByteArray) : Array ByteArray :=
-  go (({ config := {} } : Std.Http.Protocol.H1.Machine .receiving).feed bs) #[]
-where
-  go (m : Std.Http.Protocol.H1.Machine .receiving) (acc : Array ByteArray) : Array ByteArray :=
-    if m.halted then acc
-    else
-      let (m', step) := m.step
-      let acc := acc ++ step.output.data
-      let m'' := Runtime.VMHttp.processEvents m' step.events handler
-      if m''.halted then acc
-      else if Runtime.VMHttp.madeProgress step.output.size step.events then go m'' acc
-      else acc
-
-/-- The echo handler, shared across modes. -/
-def reply (head : Std.Http.Request.Head) : Std.Http.Response.Head × ByteArray :=
-  let body := s!"hello from leanin\nmethod={head.method} path={head.uri} version={head.version}\n".toUTF8
-  let headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
-      (Std.Http.Header.Value.ofString! (toString body.size))
-  ({ status := .ok, version := .v11, headers }, body)
-
-/-- An async variant used to exercise the handler suspension path: wait 10 ms on the server clock, then reply. -/
-def delayedReply (clock : Runtime.Clock) (head : Std.Http.Request.Head) :
-    Runtime.VM (Std.Http.Response.Head × ByteArray) := do
-  Runtime.VM.sleep clock 10
-  pure (reply head)
-
-asyncMachine amHttp (c : LeanIn.Runtime.Conn) := do
-  let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
-  let out := process reply bs
-  await (LeanIn.Runtime.Io.sendAllRaw c out)
   recurse
 
 -- A loop as a state machine: send `msg0..msg2` (each an `await`), then close — the loop counter `i` is the
@@ -98,22 +68,10 @@ partial def vmEcho (c : Runtime.Conn) : Runtime.VM Unit := do
 partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : String) :
     Task.EAsync IO.Error Unit := do
   let c ← Runtime.Listener.accept l hooks
-  if mode == "raw" then
-    monadLift (Runtime.Io.defuncEcho c)
-  else if mode == "vm" then
+  if mode == "vm" then
     monadLift (Runtime.VM.run (vmEcho c))
-  else if mode == "vmhttp" then
-    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 1500 {} reply))
-  else if mode == "vmhttpS" then
-    monadLift (Runtime.VM.run (Runtime.VMHttp.vmServeConn c (Runtime.Clock.live hooks) 400 {} reply))
-  else if mode == "smecho" then
-    monadLift (Runtime.SmEcho.spawnEchoStep (.reading c))
-  else if mode == "smdirect" then
-    monadLift (Runtime.SmEcho.directEchoStep (.reading c))
   else if mode == "async" then
     monadLift (amEcho.run c)
-  else if mode == "amhttp" then
-    monadLift (amHttp.run c)
   else if mode == "loop" then
     monadLift (amLoop.run c)
   else if mode == "for" then
@@ -122,13 +80,6 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (amBreak.run c)
   else if mode == "cont" then
     monadLift (amContinue.run c)
-  else if mode == "serveconn" then
-    -- `maxMessages` bumped far past the default 100 so a keep-alive connection is not closed mid-benchmark
-    -- (Node applies no per-connection request cap); the H1 machine threads the count across requests.
-    monadLift (Runtime.HttpServer.serveConn.run c (Runtime.Clock.live hooks) 12000 (Runtime.HttpServer.Handler.ofPure reply) ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
-  else if mode == "asynchandler" then
-    let clock := Runtime.Clock.live hooks
-    monadLift (Runtime.HttpServer.serveConn.run c clock 12000 (delayedReply clock) ({ config := { maxMessages := 1000000000 } } : Std.Http.Protocol.H1.Machine .receiving))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
   acceptLoop hooks l mode

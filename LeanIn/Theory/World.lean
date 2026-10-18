@@ -35,8 +35,9 @@ namespace LeanIn
 
 /-- The actor of a step: a **native** thread.
 
-In v1 that means the scheduler's carrier or a waker thread — `WakerSpike` shows an external completion
-handled on a pool worker, which takes the same mutex the carrier does. It never means a green task: two
+In v1 that means the scheduler's carrier or a waker thread — the D3 waker spike (recorded in
+`docs/evidence.md`) showed an external completion handled on a pool worker, which takes the same mutex the
+carrier does. It never means a green task: two
 tasks running on one carrier are one native actor, and no green task owns a mutex or parks. When green
 tasks enter this model they need their own identity, distinct from this one. -/
 abbrev Tid := Nat
