@@ -775,7 +775,7 @@ difference between 8.2 and 6.7 — the parse, pump, framing and handler that the
 of which `h1bench` attributes 0.41 µs to parsing. The follow-up work named by that decomposition is the pump,
 not the I/O path. The instrument's ±30 % spread (§4.7) applies; these are single-run rows per point.
 
-**The swept read deadline (this commit).** The per-read stall bound used to arm a timer per read: a mutex, a
+**The swept read deadline.** The per-read stall bound used to arm a timer per read: a mutex, a
 cancel token, closures, a `timerPending` push and a wheel insert, plus a later inert fire. It is now a slot the
 read writes and the driver expires on its own poll timeout — no scheduling on the request path. Same-session
 A/B, server core 1 / client core 2, three runs each: **8.39–8.59 → 7.28–7.66 µs CPU/request**, 112.4–115.4 k →
@@ -783,7 +783,7 @@ A/B, server core 1 / client core 2, three runs each: **8.39–8.59 → 7.28–7.
 **100 431** at C=8 (1.16×) and 106 673 against 103 433 at C=32 (1.03×). The harness-clock path is unchanged
 (`Clock.swept`), so SC20-O3/SC24 keep their exact instants.
 
-**Keep-armed reads (this change).** The shim used to arm and disarm a read per submission (`uv_read_start` /
+**Keep-armed reads.** The shim used to arm and disarm a read per submission (`uv_read_start` /
 `uv_read_stop`, an `epoll_ctl` pair per request). It now arms once, buffers arrivals up to 256 KiB, delivers one
 event per pending read and re-arms after a take. Interleaved sign test, five pairs per shape: depth-1 medians
 126.3 k → **133.8 k (+5.9 %)**, depth 16 471.1 k → 482.8 k (+2.5 %), 5/5 wins in both; repeated on the ported
@@ -797,7 +797,7 @@ round and only then medianed — cancels that drift where averaging rows cannot.
 across levels carries heap and connection state into the next: over one long invocation Node's C=32 rows fell
 about 30 % while ours held, which reading rows alone would have reported as a win for us. `bench/paired.sh`
 does both, restarting both servers fresh at each level. Nine rounds per level, five seconds per arm, host load
-3.0–4.5:
+2.3–4.5:
 
 | level | leanin / Node, median of round ratios | IQR | medians, node / leanin |
 |---|---|---|---|
@@ -829,8 +829,9 @@ pre-change driver had none). Blocking on an event instead of a 1 ms timeout (`| 
 1000`) measured **+6.2 % at C=1 (9/9, IQR 1.059–1.072)** and is neutral at C=8 (0.996) and C=32 (1.000). With it
 the paired C=1 ratio against Node reads **0.936–0.937** across two runs (Node 77.6–78.1 k, ours 72.9–73.1 k),
 against 0.945 before the change and ~1.04 for the pre-change build; one traced iteration per request remains
-(2.99 polls/request against the pre-change 2.1) and is not yet removed. At C=8 and C=32 the same changes are
-what the wins above measure: ~15.6 % and ~10 % ahead of the pre-change build paired (1/0.865 and 1/0.909, 9/9).
+(2.99 polls/request against the pre-change 2.1) and is not yet removed — removing that iteration is the next
+step toward C=1 parity. At C=8 and C=32 the same changes are what the wins above measure: ~15.6 % and ~10 %
+ahead of the pre-change build paired (1/0.865 and 1/0.909, 9/9).
 
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
