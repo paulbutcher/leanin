@@ -31,11 +31,22 @@ if [ "$#" -gt 0 ]; then levels=("$@"); else levels=(1 8 32); fi
 # (on intel_pstate that is `energy_performance_preference`, not `scaling_governor`).
 SERVER_CPU="${THREEWAY_SERVER_CPU:-1}"
 CLIENT_CPU="${THREEWAY_CLIENT_CPU:-2}"
+# A host with fewer than three cores cannot give each side its own: run unpinned there and say so, rather than
+# failing the arm on a `taskset` refusal.
+if [ "$(nproc 2>/dev/null || echo 0)" -lt 3 ]; then
+  echo "threeway: fewer than three cores; running unpinned (rows are not comparable)" >&2
+  SERVER_CPU=""
+  CLIENT_CPU=""
+fi
+pin() { # <cpu-or-empty> <cmd...>
+  local cpu="$1"; shift
+  if [ -n "$cpu" ]; then taskset -c "$cpu" "$@"; else "$@"; fi
+}
 
 run_arm() { # <label> <port> <cmd...>
   local label="$1" port="$2"
   shift 2
-  taskset -c "$SERVER_CPU" "$@" >"/tmp/threeway_${port}.log" 2>&1 &
+  pin "$SERVER_CPU" "$@" >"/tmp/threeway_${port}.log" 2>&1 &
   local pid=$!
   sleep 2
   local resp
@@ -50,7 +61,7 @@ run_arm() { # <label> <port> <cmd...>
   local c
   for c in "${levels[@]}"; do
     printf '%-11s C=%-3s %s\n' "$label" "$c" \
-      "$(taskset -c "$CLIENT_CPU" node bench/load.mjs "$port" "$c" 5 /bench)"
+      "$(pin "$CLIENT_CPU" node bench/load.mjs "$port" "$c" 5 /bench)"
   done
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
