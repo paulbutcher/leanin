@@ -882,8 +882,10 @@ work, so that figure was placement and host noise and is withdrawn.
 That investigation did surface a real violation: `pumpQuitRef` and `driverActiveRef` were plain `IO.Ref Bool`s
 written by the driver's thread and read by the pump thread and carriers — the cross-thread-state rule this
 repository states elsewhere (`runWith`: "a plain `IO.Ref` would be a violation"). They are now `Std.Mutex Bool`
-flags with locked get/set, so a quit request cannot be lost. Measured neutral (the flags are not on the request
-path); SC19/20/23/24/27 and BT1–3 pass.
+flags with locked get/set, so a quit request cannot be lost. Paired against the commit before it, nine rounds per level, it measures
+**0.991 at C=1** (IQR 0.984–1.027), **0.997 at C=8** (0.979–1.010) and **1.006 at C=32** (1.001–1.013) — neutral,
+as expected for flags read by `startListener`/`takeover`/`liveSchedule` rather than per request. SC19/20/23/24/27
+and BT1–3 pass.
 
 **Sustained load, the realistic shape.** One server at a time, pinned, driven back to back for 150 s at C=32 and
 120 s at C=1 (5 s samples, no gaps), to test whether leaving the server up favours ours:
