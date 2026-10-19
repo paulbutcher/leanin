@@ -89,7 +89,24 @@ So the growth is **not protocol work**: it is GC marking (×2.2, the live set gr
 the write-completion path (×1.6, whose cause is not yet isolated). GC and refcounting together are ~44 % of
 instructions at C=32; `pump` is ~34 % and flat across levels.
 
-**Two attempts at the allocation figures failed, and are recorded so they are not repeated:**
+**Serious profiling (method and result).** `perf` is blocked (`perf_event_paranoid = 4`), so the workable
+instrument is callgrind on a **finite** workload: `server <port> quiet count=N` serves exactly N connections and
+exits, so callgrind writes one complete profile; a `count=1` run gives the startup constant, and
+`(Ir − startup) / requests` is the per-request instruction count. On the committed driver: 1,577 M Ir for 27,992
+requests minus 206 M startup = **~49,000 Ir/request** (25,300 self). Findings:
+
+- **~51 allocator calls per request** (`mi_malloc` 50.8/req) — the allocation target, now quantified.
+- **H1's own loops dominate self-cost**: `repeatM` 1,591 + a `Legacy.Range.forIn` 963 +
+  `String.mapAux at H1.Writer.shouldKeepAlive` 486 ≈ 3,000 Ir/request, while `H1.Machine.step` is 161 and
+  `parseHeaders` 146. `shouldKeepAlive` case-folds header strings per request; that is a concrete, local fix.
+- HashMap internals are ~2 calls per operation (~8/request across read+write registration).
+- Inclusive: `dispatch` 77 %, `rawResume` 71 %, `readDone` 57 %, `pump` 37 %, refcount 20 %, `opDone` 19 %.
+
+Callgrind's own `callgrind_control` dumps fragmented the profile (empty totals) and mid-run dumps mismatched the
+request count; the finite-workload method is the one to reuse. Self-cost totals parse to ~58 % of the program
+total (the format drops some position encodings), so treat self-cost *rankings* as the signal, not the absolute.
+
+**Earlier attempts at allocation counts, recorded so they are not repeated:**
 
 - *Allocation-site counts*: callgrind's `calls=` counts taken from a mid-run dump cover only a slice while the
   client's completed count covers the whole run, and an attempt to gate counting with `--instr-atstart=no` plus

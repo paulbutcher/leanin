@@ -82,8 +82,14 @@ def main (args : List String) : IO UInt32 := do
       monadLift (IO.println s!"  {head.method} {head.targetString} -> 200, on carrier {tid}")
     return reply head
   IO.println s!"leanin server listening on {addr}"
+  -- `count=N` serves exactly N connections and then exits: the finite workload a profiler needs, so the process
+  -- writes one complete profile instead of being killed mid-run.
+  let count? := args.findSome? (fun a =>
+    (a.dropPrefix? "count=").bind (fun n => n.toNat?))
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    Runtime.serveForever hooks l (Runtime.Http.serveConn cfg · handler)
+    match count? with
+    | some n => Runtime.serveNJoin hooks l n (Runtime.Http.serveConn cfg · handler)
+    | none   => Runtime.serveForever hooks l (Runtime.Http.serveConn cfg · handler)
   -- Driven by `Runtime.run`: the caller's thread runs the executor while it waits, which is what pumps the
   -- live clock's timer. The multi-carrier entry `Runtime.runCarriers` does **not** serve here — a connection is
   -- accepted by the kernel and never answered, because its caller waits on a cell without pumping and the accept
