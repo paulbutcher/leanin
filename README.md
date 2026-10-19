@@ -11,20 +11,25 @@ techniques found in tokio and node to get a runtime for concurrency that is on p
 languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
 defunctionalisation rather than vanilla `do`.
 
-The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which gives
-you a flavour of our current performance: a keep-alive with a per-request handler (`bench/threeway.sh`):
+The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which
+gives you a flavour of our current performance: keep-alive requests, one request outstanding per connection
+(`bench/threeway.sh`), every arm in one invocation with 5 s per point, both sides pinned to distinct P-cores and
+the CPU energy-performance preference at `performance`. **C is the number of concurrent keep-alive connections.**
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
-| Node 22 | 38 663 | 128 721 | 130 621 |
-| **leanin** | **53 688** | **71 644** | **67 793** |
-| shipped `Std.Http.Server` | 2 157 | 3 324 | 2 602 |
+| Node 22 | 70 018 | 146 999 | 150 085 |
+| **leanin** | **77 891** | **114 058** | **104 369** |
+| compiled example, no parsing (`lake exe hello … keep`) | 77 150 | 197 070 | 168 592 |
+| shipped `Std.Http.Server` | 5 163 | 5 773 | 7 577 |
 
-**~25× the Lean HTTP server that ships with the toolchain, and 1.39× Node at one connection** (16 µs against
-20 µs p50). At eight and thirty-two connections we read 0.56× and 0.52× Node: the serving path runs on one
-carrier, so a second connection only queues. The driver is itself a compiled `asyncMachine`, and a no-parse
-control (`lake exe hello … keep`) reads 106 450 at C=8 against 71 644 — so about 30 % of that level is
-parse/frame/handler and the rest is the single carrier. More details here: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+**leanin leads Node at one connection (1.11×) and reads 0.78× and 0.70× of it at eight and thirty-two, while
+being 14–20× the Lean HTTP server that ships with the toolchain.** p50 is 12 µs for both servers at C=1, and
+44 µs (Node) against 63 µs (leanin) at C=8. The driver is itself a compiled `asyncMachine`; the no-parse row is
+the same compiler answering a fixed response, and it beats Node at every level — which places the gap in the
+protocol work: the driver spends 8.2 µs of CPU per request against Node's 6.7 µs and the no-parse control's
+4.8 µs, so ~3.4 µs per request is parse, pump and handler. How the numbers are taken, and the shapes where we
+are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
@@ -145,7 +150,10 @@ nix develop -c bash bench/threeway.sh          # levels 1 8 32
 nix develop -c bash bench/threeway.sh 1 4 16   # chosen levels
 ```
 
-The table at the top of this file is that four-arm run's output. Read the ratios, not the absolute figures:
+Both sides are pinned to distinct cores (server 1, client 2 — `THREEWAY_SERVER_CPU` and `THREEWAY_CLIENT_CPU`
+override), and the energy-performance preference must be `performance` for rows to be comparable; an unpinned
+run lets the two sides compete for the same cores and moves the rows by up to 50 %. The table at the top of this
+file is that four-arm run's output. Read the ratios, not the absolute figures:
 this instrument's run-to-run spread is ±30 % ([`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.7), and a run
 taken on a loaded box reads depressed — an earlier four-way of this shape was recorded at load average 4.8–6.0
 and §4 carries the settled re-run beside it.

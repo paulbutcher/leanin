@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # threeway.sh [C ...] — keep-alive echo-handler comparison: Node vs leanin vs the shipped Std.Http.Server.
 #
+# C is concurrent keep-alive connections, each with one request outstanding at a time.
 #   nix develop -c bash bench/threeway.sh           # default levels: 1 8 32
 #   nix develop -c bash bench/threeway.sh 1 4 16    # chosen levels
 #
@@ -23,10 +24,18 @@ lake build server stdServer hello >/dev/null || exit 1
 
 if [ "$#" -gt 0 ]; then levels=("$@"); else levels=(1 8 32); fi
 
+# Both sides are pinned to distinct cores, because an unpinned client and server compete for the same eight
+# cores and move each other's rows by tens of percent. This host (Intel Ultra 7 268V) has P-cores 0-3 and
+# E-cores 4-7, so the defaults use P-cores; on another host, override with THREEWAY_SERVER_CPU and
+# THREEWAY_CLIENT_CPU. Rows are only comparable when the CPU energy-performance preference is `performance`
+# (on intel_pstate that is `energy_performance_preference`, not `scaling_governor`).
+SERVER_CPU="${THREEWAY_SERVER_CPU:-1}"
+CLIENT_CPU="${THREEWAY_CLIENT_CPU:-2}"
+
 run_arm() { # <label> <port> <cmd...>
   local label="$1" port="$2"
   shift 2
-  "$@" >"/tmp/threeway_${port}.log" 2>&1 &
+  taskset -c "$SERVER_CPU" "$@" >"/tmp/threeway_${port}.log" 2>&1 &
   local pid=$!
   sleep 2
   local resp
@@ -40,7 +49,8 @@ run_arm() { # <label> <port> <cmd...>
   printf '%-11s %s\n' "$label" "$resp"
   local c
   for c in "${levels[@]}"; do
-    printf '%-11s C=%-3s %s\n' "$label" "$c" "$(node bench/load.mjs "$port" "$c" 5 /bench)"
+    printf '%-11s C=%-3s %s\n' "$label" "$c" \
+      "$(taskset -c "$CLIENT_CPU" node bench/load.mjs "$port" "$c" 5 /bench)"
   done
   kill "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
