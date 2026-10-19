@@ -22,9 +22,11 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 | **leanin** | **71 654** | **106 046** | **105 373** |
 | shipped `Std.Http.Server` | 5 332 | 5 965 | 8 281 |
 
-**leanin is level with Node at one connection and reads 1.07× and 1.06× of it at eight and thirty-two, while
-being 13–18× the Lean HTTP server that ships with the toolchain.** p50 is 12 µs for both at C=1, 69 µs against
-74 µs at C=8, and 288 µs against 300 µs at C=32. How the numbers are taken, what they decompose
+**leanin is level with Node at one connection, at ~0.94× at eight and ~0.81× at thirty-two in repeated runs,
+and 13–22× the Lean HTTP server that ships with the toolchain.** Five interleaved repeats at C=8 read
+131 374 rps (median) against Node's 138 886, and 113 091 against 140 181 at C=32. Single runs of this instrument
+move by up to 50 % with the host's state — a loaded box depresses both servers and can invert the C=8 order —
+so read the repeated medians, not one row; the ratios within one session are reproducible to a few percent. How the numbers are taken, what they decompose
 into, and the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
