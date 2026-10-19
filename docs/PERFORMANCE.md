@@ -850,6 +850,17 @@ the sign of a libuv status decoded explicitly from two's complement (`signed`) r
 encoding. Paired, nine rounds per level: **1.028 at C=1 (IQR 1.010–1.032), 1.005 at C=8, 1.009 at C=32**.
 SC19/20/23/24/27 and BT1–3 pass, covering EOF and negative-status paths.
 
+**Candidate 2 was then tested both ways, and both were rejected.** *Owner-gated direct writes*: the write path
+was re-gated on an explicit loop-owner claim (taken in `takeover`, released when the driver finishes) instead of
+the polling flag, with `c->writes` counting queued writes too so ordering holds. Counters confirm the branch now
+runs — `calls=200, attempts=200, ok=200` — and it measures **0.972 at C=1, 1.011 at C=8, 0.985 at C=32**: making
+the fast path live makes C=1 and C=32 worse. *Completion-first progress*: returning from the poll when a
+submission has already recorded events measures **0.981 / 0.976 / 0.950** and is additionally not
+semantics-preserving as written, because it returns before arming the wheel timer the swept deadline relies on.
+Neither variant is in the tree. The counters and the owner contract remain the useful artefacts: they settle that
+the old branch was inert (`gate_loop=200, attempts=0`) and that activating it is not a win on this driver.
+
+
 **What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
 **12.07 µs** per request against Node's **8.92 µs**, but the same runtime and shim with **no protocol at all**
 (`hello keep`) cost **9.47 µs** — already more than Node's whole request. The HTTP layer is therefore only
