@@ -859,6 +859,13 @@ collapsed to ~9 k rps — one request per millisecond per connection — which p
 test around the slots rather than the storage shape, so it is a retry with the write-wait path now understood,
 not a repeat of a dead end.
 
+**Fixed-slot raw registry, retried and rejected.** With the liveness count and the slots in one structure under
+one lock (so they cannot drift), and the 16 k-entry collapse explained as array copying, the registry was sized
+to 256 entries — enough for 64 connections, larger than the benchmark uses, and small enough that copying is
+free. It measured **0.968 at C=1 and 0.871 at C=32** against the HashMap build: fixed Lean slots under
+`Std.Mutex` are slower than the hash insert they replace even when the array is small, so the shape is rejected
+on its own merits rather than on a bug. The registry is not where the floor is.
+
 **Sustained load, the realistic shape.** One server at a time, pinned, driven back to back for 150 s at C=32 and
 120 s at C=1 (5 s samples, no gaps), to test whether leaving the server up favours ours:
 
