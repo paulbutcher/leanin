@@ -77,6 +77,7 @@
 #define EV_NO_SLOT 6
 
 #define SUB_READ 1
+#define MAX_BUF (256 * 1024)
 #define SUB_WRITE 2
 #define SUB_SHUTDOWN 3
 #define SUB_CLOSE 4
@@ -90,7 +91,13 @@ typedef struct {
   size_t want;
   int idx;
   int used;
-  int shutting;      /* SUB_SHUTDOWN was applied: the write side is going away, so a close must drain first */
+  int shutting;
+  /* A read that stays armed: bytes arriving with no Lean read pending are buffered here (up to MAX_BUF), and one
+     event per delivery; `np_uv_take` drains the buffer and re-arms if backpressure stopped it. */
+  int reading;
+  int pending;
+  int eof;
+  int rerr;      /* SUB_SHUTDOWN was applied: the write side is going away, so a close must drain first */
 } conn_t;
 
 typedef struct {
@@ -237,6 +244,7 @@ static void on_close(uv_handle_t *h) {
   conn_t *c = (conn_t *)h->data;
   free(c->buf);
   c->buf = NULL; c->len = 0; c->cap = 0; c->want = 0; c->used = 0;
+  c->reading = 0; c->pending = 0; c->eof = 0; c->rerr = 0;
 }
 
 static void on_reject_close(uv_handle_t *h) {
@@ -323,6 +331,28 @@ static void alloc_cb(uv_handle_t *h, size_t suggested, uv_buf_t *out) {
   out->len = (c->cap - c->len < want) ? (c->cap - c->len) : want;
 }
 
+/* Hand the pending read whatever is ready: buffered bytes first, then the end-of-stream or failure marker on a
+   later submission (the take that follows the data event drains the buffer). Keeping the handle armed is what
+   makes a request-at-a-time peer cost no epoll_ctl per read. */
+static void deliver_read(conn_t *c) {
+  if (!c->pending) return;
+  if (c->len > 0) {
+    c->pending = 0; c->want = 0;
+    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)c->len);
+    return;
+  }
+  if (c->eof) {
+    c->pending = 0; c->want = 0;
+    push_ev(EV_READ, (uint64_t)c->idx, 0);
+    return;
+  }
+  if (c->rerr) {
+    int e = c->rerr; c->rerr = 0; c->pending = 0; c->want = 0;
+    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)(int64_t)e);
+    return;
+  }
+}
+
 static void on_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b) {
   (void)b;
   conn_t *c = (conn_t *)s->data;
@@ -332,17 +362,19 @@ static void on_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b) {
    * `UV_EOF`) arrive. */
   if (nread == 0)
     return;
-  /* One read per submission: stop here, and the next `np_uv_read` starts the next one. */
-  uv_read_stop(s);
-  c->want = 0;
   if (nread > 0) {
     c->len += (size_t)nread;
-    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)nread);
   } else if (nread == UV_EOF) {
-    push_ev(EV_READ, (uint64_t)c->idx, 0);
+    c->eof = 1;
   } else {
-    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)(int64_t)nread);  /* a failure, the negated libuv code */
+    c->rerr = (int)nread;  /* a failure, the negated libuv code */
   }
+  if (c->len >= MAX_BUF) {
+    /* Backpressure: stop reading until a take drains the buffer. */
+    uv_read_stop(s);
+    c->reading = 0;
+  }
+  deliver_read(c);
 }
 
 static void on_write(uv_write_t *req, int status) {
@@ -407,9 +439,16 @@ static void apply_submit(submit_t *s) {
       g_cnt[CNT_READ]++;
       if (dead) { push_ev(EV_READ, s->conn, (uint64_t)(int64_t)UV_ECANCELED); break; }
       c->want = s->want ? s->want : READ_CHUNK;
-      if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) != 0) {
-        c->want = 0;
-        push_ev(EV_READ, s->conn, (uint64_t)(int64_t)UV_EIO);
+      c->pending = 1;
+      if (c->len > 0 || c->eof || c->rerr) {
+        deliver_read(c);
+      } else if (!c->reading) {
+        if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) != 0) {
+          c->want = 0; c->pending = 0;
+          push_ev(EV_READ, s->conn, (uint64_t)(int64_t)UV_EIO);
+        } else {
+          c->reading = 1;
+        }
       }
       break;
     case SUB_WRITEV: {
@@ -630,7 +669,13 @@ LEAN_EXPORT lean_object *np_uv_take(uint32_t idx) {
   size_t n = (c != NULL && c->used) ? c->len : 0;
   lean_object *arr = lean_alloc_sarray(1, n, n);
   if (n > 0) memcpy(lean_sarray_cptr(arr), c->buf, n);
-  if (c != NULL) c->len = 0;
+  if (c != NULL) {
+    c->len = 0;
+    c->want = 0;
+    if (c->used && !c->reading && !c->eof && !c->rerr) {
+      if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) == 0) c->reading = 1;
+    }
+  }
   return lean_io_result_mk_ok(arr);
 }
 

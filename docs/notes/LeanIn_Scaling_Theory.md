@@ -155,12 +155,13 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
 wins when replaced locally; every micro-change measured parity or worse.
 
-**Keep-armed reads: no measured win.** The shim was changed (scratch copy) to arm a connection's read once and
-buffer arrivals, delivering one event per pending read and re-arming after a take, with a 256 KiB backpressure
-cap. It is correct — SC19/20/23/24/27 and the diagnostics pass — but depth-1 throughput is indistinguishable from
-the one-read-per-submission shim (111.7–117.4 k baseline against 106.2–122.5 k, 7.9–8.2 µs either way) and depth
-16 differs only inside the spread. So the `epoll_ctl` pair was **not** the dominant part of the 5.1 µs per-event
-tax; the park/wake between completions and the write submission are what remain. Not landed.
+**Keep-armed reads: landed, +5–6 % at depth 1.** The shim arms a connection's read once, buffers arrivals,
+delivers one event per pending read, drains on `np_uv_take` and re-arms, with a 256 KiB backpressure cap. The
+first A/B (host load 4.5) read as noise; the sign test settles it: **5/5 wins in two separate five-pair runs on
+a quiet host** — depth-1 medians 126.3 → 133.8 k (+5.9 %) and depth 16 471.1 → 482.8 k (+2.5 %), and on the
+ported build at load 4.5, 125.0 → 130.9 k (5/5). The lesson is the measurement discipline: same-session
+interleaved pairs and a sign count, not medians of a noisy batch. It also shows the `epoll_ctl` pair was a real
+part of the per-event tax; what remains is the park/wake between completions and the write submission.
 
 **Wake checks (does I/O wake the loop correctly?).** A missed wake shows up as latency quantised at the poll
 timeout, so each shape was measured with the *same client* against Node as the control: busy (20 k requests),

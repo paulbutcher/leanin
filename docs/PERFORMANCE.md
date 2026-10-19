@@ -783,6 +783,13 @@ A/B, server core 1 / client core 2, three runs each: **8.39–8.59 → 7.28–7.
 **100 431** at C=8 (1.16×) and 106 673 against 103 433 at C=32 (1.03×). The harness-clock path is unchanged
 (`Clock.swept`), so SC20-O3/SC24 keep their exact instants.
 
+**Keep-armed reads (this change).** The shim used to arm and disarm a read per submission (`uv_read_start` /
+`uv_read_stop`, an `epoll_ctl` pair per request). It now arms once, buffers arrivals up to 256 KiB, delivers one
+event per pending read and re-arms after a take. Interleaved sign test, five pairs per shape: depth-1 medians
+126.3 k → **133.8 k (+5.9 %)**, depth 16 471.1 k → 482.8 k (+2.5 %), 5/5 wins in both; repeated on the ported
+build at higher host load, 125.0 k → 130.9 k, 5/5. The same server at depth 16 reads ~483 k against Node's
+~106 k in the pipelined shape.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
