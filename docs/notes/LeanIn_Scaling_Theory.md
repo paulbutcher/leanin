@@ -26,8 +26,39 @@ Two facts carry the theory:
    pipelined throughput. So the compiled step is not intrinsically expensive; the sequential shape's extra
    ~4.6 µs is per-event overhead (read re-arm, write submission, park/wake), which batching amortises.
 
-The gap to Node (8.2 vs 6.7) is therefore almost entirely the **3.4 µs of parse + pump + framing + handler**
-that the no-parse control does not pay. That is the first target.
+The gap to Node (8.2 vs 6.7) was first attributed to the 3.4 µs of parse + pump + framing + handler that the
+no-parse control does not pay. **The experiment log below corrected that**: most of the 3.4 µs is the per-read
+deadline machinery, not the pump.
+
+## Experiment log (2026-10-19): the deadline, not the pump
+
+Measured by A/B variants of `server` under the pinned method above, then discarded (each variant is a
+measurement artefact, not a candidate to keep):
+
+| variant | rps | µs CPU/request |
+|---|---|---|
+| stock | 107–117 k | 8.18–8.86 |
+| **timer never armed** (mutex, cancel token and closures still allocated) | 126–131 k | **7.30–7.56** |
+| **deadline removed entirely** | 132–145 k | **6.48–7.16** |
+| Node, same method | 142–145 k | 6.63–6.74 |
+
+Neither the wheel's size (a 50 ms stall is no faster) nor its inert fires (a one-hour stall is no faster) moves
+the number, so the cost is the **registration path**: `timerPending` push, the driver's drain into the
+`TreeMap`, the wheel insert, plus the per-read mutex, cancel token and closures. Roughly **1.2 µs is timer
+registration and ~0.5 µs the rest of the deadline's bookkeeping**.
+
+**A sweep prototype reached the target and exposed a defect.** A per-connection slot plus one self-rearming
+20 ms sweep read **135.1–135.7 k rps at 7.05–7.13 µs/request, p50 53 µs** (stock 117 k / 8.2 µs / 62 µs) —
+Node's throughput within ~5 %, on the same core. But SC20's second clause — a handler that suspends 1 ms and
+then raises — hangs under the sweep: the request's read is armed and never completes, while the same scenario
+passes with the sweep disabled. Gating the arm on an active driver did not fix it; the interaction is with the
+loop's stop/restart between scenario clauses or the sweep's timer chain, and the root cause is open. The
+prototype was reverted from the tree.
+
+**So the next step is not the pump.** It is to land a deadline whose request path costs a slot write and nothing
+else — either by fixing the sweep above, or by reusing per-connection timer/mutex/cancel objects and replacing
+one wheel entry in place — with SC20 and the pinned threeway as the gate. The pump's own share (parse 0.41 µs
+from `h1bench`; encode, appends and handler not yet separated) is the step after that.
 
 ## The theory
 
