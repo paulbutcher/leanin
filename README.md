@@ -18,15 +18,16 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
-| Node 22 | 75 215 | 98 695 | 99 268 |
-| **leanin** | **71 654** | **106 046** | **105 373** |
-| shipped `Std.Http.Server` | 5 332 | 5 965 | 8 281 |
+| Node 22 | 74 427 | 89 950 | 92 055 |
+| **leanin** | **69 096** | **122 546** | **109 623** |
+| shipped `Std.Http.Server` | 4 306 | 4 456 | 6 709 |
 
-**leanin is level with Node at one connection, at ~0.94× at eight and ~0.81× at thirty-two in repeated runs,
-and 13–22× the Lean HTTP server that ships with the toolchain.** Five interleaved repeats at C=8 read
-131 374 rps (median) against Node's 138 886, and 113 091 against 140 181 at C=32. Single runs of this instrument
-move by up to 50 % with the host's state — a loaded box depresses both servers and can invert the C=8 order —
-so read the repeated medians, not one row; the ratios within one session are reproducible to a few percent. How the numbers are taken, what they decompose
+**leanin is at ~0.93× Node at one connection and ahead at eight and thirty-two in these repetitions, and
+16–27× the Lean HTTP server that ships with the toolchain.** The row is the median of three invocations of the
+instrument above, spanning host load 3.3–6.8; Node's own C=8/C=32 rows collapse on the loaded invocations, and
+the cleanest one (load 3.3) reads 0.86× / 0.84× / 0.84×, which is the conservative comparison to trust. Single
+runs move by up to 50 % with the host's state, so read the repeated medians or the clean row, not an arbitrary
+run; ratios within one session are reproducible to a few percent. How the numbers are taken, what they decompose
 into, and the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status

@@ -790,6 +790,30 @@ event per pending read and re-arms after a take. Interleaved sign test, five pai
 build at higher host load, 125.0 k → 130.9 k, 5/5. The same server at depth 16 reads ~483 k against Node's
 ~106 k in the pipelined shape.
 
+**Re-read with both wins in place** — `nix develop -c bash bench/threeway.sh 1 8 32`, four arms, both sides
+pinned to distinct P-cores as above, three invocations while the host's load average rose 3.31 → 4.30 → 6.76.
+Median of the three:
+
+| server | C=1 | C=8 | C=32 |
+|---|---|---|---|
+| Node 22 | 74 427 | 89 950 | 92 055 |
+| compiled driver (`server`) | 69 096 | **122 546** | **109 623** |
+| compiled, no protocol work (`hello keep`) | 79 692 | 181 354 | 176 237 |
+| shipped `Std.Http.Server` | 4 306 | 4 456 | 6 709 |
+
+The cleanest invocation (load 3.31) reads 74 061 / 146 479 / 130 695 for Node, 63 978 / 122 546 / 109 623 for
+the driver, 79 692 / 190 525 / 176 739 for `hello keep` and 5 175 / 5 015 / 6 814 for the shipped server: against
+Node that is 0.86× / 0.84× / 0.84×, and 12.4× / 24.4× / 16.1× against the shipped server. Node's C=8/C=32 rows
+fall by ~40 % on the two loaded invocations, so the medians above flatter our row; the clean run is the
+conservative comparison. Per-request CPU still grows with connections (7.0 → 8.3 µs from C=8 to C=32), which is
+the remaining gap and the subject of the scaling note.
+
+**What did not move.** Three Lean-side replacements of the raw-registration `HashMap` with fixed slots all read
+~9 k rps at ~104 µs CPU/request — one request per millisecond per connection, i.e. served off the driver's idle
+poll rather than the epoll wake — and a shim path that attempted `uv_try_write` on the loop thread read 3/5 at
+C=32 and 4/5 at C=8 with 0–2 % differences. Neither is in the tree; the measurements and the diagnosis are in
+[`notes/LeanIn_Scaling_Theory.md`](notes/LeanIn_Scaling_Theory.md).
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
