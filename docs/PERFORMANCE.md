@@ -845,6 +845,21 @@ Per request that is ~59 k instructions, and the profile's named contributors are
 (`lean_dec_ref_cold`, `lean_alloc_small_object_core`), GC marking (`lean_mark_mt`), malloc/free, and string
 building for the response (`lean_string_utf8_set`, `lean_string_append`, `Std.Http`'s `shouldKeepAlive`).
 
+**Sustained load, the realistic shape.** One server at a time, pinned, driven back to back for 150 s at C=32 and
+120 s at C=1 (5 s samples, no gaps), to test whether leaving the server up favours ours:
+
+| level | arm | first window | last window | min–max |
+|---|---|---|---|---|
+| C=32 | Node | 147 587 | 127 491 | 115 659–149 940 |
+| C=32 | leanin | 119 660 | 117 047 | 102 331–130 541 |
+| C=1 | Node | 70 480 | 66 744 | 48 782–75 269 |
+| C=1 | leanin | 60 471 | 60 538 | 58 682–65 107 |
+
+Node degrades under sustained load (148→127 k, −14 %) and has hiccups (one window at 48.8 k), but ours degrades
+too (130→117 k, −11 %), so the ordering is unchanged: Node ahead at C=1 and C=32, level at C=8. The 84 k C=32
+reading behind the withdrawn 1.24× row was an outlier in our own environment, not Node's steady state; the
+sustained series above is what the "left running" case actually looks like.
+
 **The C=32 "win" was Node's slow tail, and the distribution settles it.** Six alternating runs per level with
 both servers pinned and each kept up for the level: at C=8 Node read 103 735–146 120 (median 126 877) and ours
 101 003–135 711 (median 128 456); at C=32 Node read 113 494–141 220 (median 125 474) and ours 103 508–121 607
