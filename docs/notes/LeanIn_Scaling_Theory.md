@@ -47,13 +47,24 @@ the number, so the cost is the **registration path**: `timerPending` push, the d
 `TreeMap`, the wheel insert, plus the per-read mutex, cancel token and closures. Roughly **1.2 µs is timer
 registration and ~0.5 µs the rest of the deadline's bookkeeping**.
 
-**A sweep prototype reached the target and exposed a defect.** A per-connection slot plus one self-rearming
-20 ms sweep read **135.1–135.7 k rps at 7.05–7.13 µs/request, p50 53 µs** (stock 117 k / 8.2 µs / 62 µs) —
-Node's throughput within ~5 %, on the same core. But SC20's second clause — a handler that suspends 1 ms and
-then raises — hangs under the sweep: the request's read is armed and never completes, while the same scenario
-passes with the sweep disabled. Gating the arm on an active driver did not fix it; the interaction is with the
-loop's stop/restart between scenario clauses or the sweep's timer chain, and the root cause is open. The
-prototype was reverted from the tree.
+**A sweep prototype reached the target and exposed an integration race.** A per-connection slot plus one
+self-rearming 20 ms sweep read **135.1–135.7 k rps at 7.05–7.13 µs/request, p50 53 µs** (stock 117 k / 8.2 µs /
+62 µs) — Node's throughput within ~5 %, on the same core. Two integration defects then appeared, and their
+behaviour was not stable between runs:
+
+1. SC20's second clause (a handler that suspends 1 ms then raises) hung: the read was armed and never completed.
+   Isolated by A/B: it hangs when the read's arm **schedules a timer** (with or without `ensurePump`), and passes
+   when the arm does nothing. Moving the arming off the request path into the driver's own iteration
+   (`driveOnce` arms one sweep entry while slots exist) **fixed clause two**.
+2. That arrangement then failed clause three (the harness-clock stall) with `at=0` instead of `at=30` — the
+   harness clock path takes no swept reads at all, so a state or timing interaction crossed clauses. A
+   follow-up variant with the arming disabled produced no output at all, so the failure is not stable.
+
+The prototype was reverted; `main`'s behaviour (`swept := false`) is the known-good baseline and SC20 passes.
+**The blocker is a race between the sweep's timer and the loop/driver lifecycle, not the slot bookkeeping.** The
+next attempt should land the driver-armed design in a branch with a deterministic reproduction of the
+clause-two/clause-three transition (run the two clauses against one process, repeatedly), treat any run-to-run
+variation as a failure of the change, and only then measure.
 
 **So the next step is not the pump.** It is to land a deadline whose request path costs a slot write and nothing
 else — either by fixing the sweep above, or by reusing per-connection timer/mutex/cancel objects and replacing
