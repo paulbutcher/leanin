@@ -16,12 +16,15 @@ you a flavour of our current performance: a keep-alive with a per-request handle
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
-| Node 22 | 45 380 | 139 857 | 101 042 |
-| **leanin** | **29 932** | **42 241** | **37 705** |
-| shipped `Std.Http.Server` | 2 166 | 3 363 | 2 687 |
+| Node 22 | 38 663 | 128 721 | 130 621 |
+| **leanin** | **53 688** | **71 644** | **67 793** |
+| shipped `Std.Http.Server` | 2 157 | 3 324 | 2 602 |
 
-**~14× the Lean HTTP server that ships with the toolchain**, and within 1.5× of Node at one connection. We
-still have some work to hit Node 22 performance, but is within spitting distance. More details here: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+**~25× the Lean HTTP server that ships with the toolchain, and 1.39× Node at one connection** (16 µs against
+20 µs p50). At eight and thirty-two connections we read 0.56× and 0.52× Node: the serving path runs on one
+carrier, so a second connection only queues. The driver is itself a compiled `asyncMachine`, and a no-parse
+control (`lake exe hello … keep`) reads 106 450 at C=8 against 71 644 — so about 30 % of that level is
+parse/frame/handler and the rest is the single carrier. More details here: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
