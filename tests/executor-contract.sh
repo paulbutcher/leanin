@@ -4696,6 +4696,161 @@ check_sc23() {
     "${child_tids[0]}" "$dedicated_tid"
 }
 
+# --- SC25 — spawn: a machine scheduled as an executor item, joined through its completion cell ————————
+# One client for the assertion and the control: connect, optionally send, read to EOF under the given bound.
+# It is the detector the bound assertion reads, so a control that uses it exercises the same code.
+ec_client() { # <port> <payload-or-empty> <bound-seconds> <body-file> ; exits 124 on its own bound
+  python3 - "$1" "$2" "$3" >"$4" 2>"$4.err" <<'PY'
+import socket, sys
+port, payload, bound = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+s = socket.create_connection(('127.0.0.1', port), timeout=bound)
+s.settimeout(bound)
+if payload:
+    s.sendall(payload.encode())
+buf = b''
+try:
+    while True:
+        d = s.recv(4096)
+        if not d:
+            break
+        buf += d
+except socket.timeout:
+    s.close()
+    sys.exit(124)
+s.close()
+sys.stdout.buffer.write(buf)
+PY
+}
+
+check_sc25() {
+  local status_a status_b bounded_a bounded_b pid ctl i ready readyc body_a body_b control
+  lake build defuncEcho >/dev/null 2>&1 ||
+    setup_error "SC25: defuncEcho did not build" "invocation: lake build defuncEcho"
+  for prt in 8391 8395; do
+    if (exec 3<>/dev/tcp/127.0.0.1/$prt) 2>/dev/null; then
+      exec 3>&- 3<&-
+      setup_error "SC25: port $prt is already owned before the server starts" \
+        "a leftover or unrelated listener; the check does not kill what it did not start"
+    fi
+  done
+  pid=""; ctl=""
+  ./.lake/build/bin/defuncEcho 8391 spawn >/tmp/sc25_server.log 2>&1 &
+  pid=$!
+  ./.lake/build/bin/defuncEcho 8395 cps >/tmp/sc25_ctl.log 2>&1 &
+  ctl=$!
+  trap '[ -n "${pid:-}" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; }; [ -n "${ctl:-}" ] && { kill "$ctl" 2>/dev/null; wait "$ctl" 2>/dev/null || true; }' EXIT
+  ready=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8391) 2>/dev/null; then exec 3>&- 3<&-; ready=1; break; fi
+    sleep 0.25
+  done
+  [ "$ready" = 1 ] || {
+    kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+    setup_error "SC25: the server did not listen on 8391 in time" "log: $(tail -2 /tmp/sc25_server.log)"
+  }
+  readyc=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8395) 2>/dev/null; then exec 3>&- 3<&-; readyc=1; break; fi
+    sleep 0.25
+  done
+  [ "$readyc" = 1 ] || {
+    kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+    setup_error "SC25: the control server did not listen on 8395 in time" "log: $(tail -2 /tmp/sc25_ctl.log)"
+  }
+  ec_client 8391 0 5 /tmp/sc25_body0; status_a=$?
+  ec_client 8391 1 5 /tmp/sc25_body1; status_b=$?
+  # The same client under a 1 s bound against the default echo, which never answers an empty request: the
+  # detector must report its own bound, so `bounded=no` above is a reading and not an absence it cannot see.
+  ec_client 8395 "" 1 /tmp/sc25_ctl_body; control=$?
+  body_a="$(cat /tmp/sc25_body0)"; body_b="$(cat /tmp/sc25_body1)"
+  if [ "$status_a" = 124 ]; then bounded_a=yes; else bounded_a=no; fi
+  if [ "$status_b" = 124 ]; then bounded_b=yes; else bounded_b=no; fi
+  kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+  trap - EXIT
+  [ "$control" = 124 ] ||
+    setup_error "SC25: the client's own bound did not fire on an unanswered connection" \
+      "control exit=$control, body=[$(cat /tmp/sc25_ctl_body)]" \
+      "the detector the assertion reads must report a timeout somewhere in this invocation"
+  [ "$bounded_a" = no ] && [ "$bounded_b" = no ] ||
+    fail "SC25 Then (O1): a spawned join never completed (bounded 0=$bounded_a 1=$bounded_b)" \
+      "the boot items were pushed but the parked parent was not resumed: a push never reached the executor, or a join never saw its cell" \
+      "observed: [0]=[$body_a] [1]=[$body_b]"
+  # Identical spawns (BBB spawned first, AAA second) with the join order swapped: a collector that returned
+  # completions in completion order would give one order in both clauses, so both assertions cannot hold.
+  [ "$body_a" = "BBBAAA" ] ||
+    fail "SC25 Then (O2): joining the first-spawned handle first did not yield the spawn order" \
+      "expected BBBAAA — the first spawned child's payload (BBB) then the second's (AAA)" \
+      "observed: [$body_a]"
+  [ "$body_b" = "AAABBB" ] ||
+    fail "SC25 Then (O2): joining the second-spawned handle first did not reverse the payloads" \
+      "expected AAABBB — the same spawns, the join order swapped; a completion-order collector cannot produce both orders" \
+      "observed: [$body_b]"
+  printf "SC25 ok: join order governs (0->BBBAAA, 1->AAABBB), both unbounded; the same client's bound fired on the control (%s)\n" "$control"
+}
+
+# --- SC26 — select: first-wins over two cells, with registration order as the tie rule ————————————————
+check_sc26() {
+  local status_a status_b bounded_a bounded_b pid ctl i ready readyc a b control
+  lake build defuncEcho >/dev/null 2>&1 ||
+    setup_error "SC26: defuncEcho did not build" "invocation: lake build defuncEcho"
+  for prt in 8392 8396; do
+    if (exec 3<>/dev/tcp/127.0.0.1/$prt) 2>/dev/null; then
+      exec 3>&- 3<&-
+      setup_error "SC26: port $prt is already owned before the server starts" \
+        "a leftover or unrelated listener; the check does not kill what it did not start"
+    fi
+  done
+  pid=""; ctl=""
+  ./.lake/build/bin/defuncEcho 8392 select >/tmp/sc26_server.log 2>&1 &
+  pid=$!
+  ./.lake/build/bin/defuncEcho 8396 cps >/tmp/sc26_ctl.log 2>&1 &
+  ctl=$!
+  trap '[ -n "${pid:-}" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; }; [ -n "${ctl:-}" ] && { kill "$ctl" 2>/dev/null; wait "$ctl" 2>/dev/null || true; }' EXIT
+  ready=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8392) 2>/dev/null; then exec 3>&- 3<&-; ready=1; break; fi
+    sleep 0.25
+  done
+  [ "$ready" = 1 ] || {
+    kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+    setup_error "SC26: the server did not listen on 8392 in time" "log: $(tail -2 /tmp/sc26_server.log)"
+  }
+  readyc=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8396) 2>/dev/null; then exec 3>&- 3<&-; readyc=1; break; fi
+    sleep 0.25
+  done
+  [ "$readyc" = 1 ] || {
+    kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+    setup_error "SC26: the control server did not listen on 8396 in time" "log: $(tail -2 /tmp/sc26_ctl.log)"
+  }
+  ec_client 8392 A 5 /tmp/sc26_a; status_a=$?
+  ec_client 8392 B 5 /tmp/sc26_b; status_b=$?
+  ec_client 8396 "" 1 /tmp/sc26_ctl_body; control=$?
+  a="$(cat /tmp/sc26_a)"; b="$(cat /tmp/sc26_b)"
+  if [ "$status_a" = 124 ]; then bounded_a=yes; else bounded_a=no; fi
+  if [ "$status_b" = 124 ]; then bounded_b=yes; else bounded_b=no; fi
+  kill "$pid" "$ctl" 2>/dev/null; wait "$pid" 2>/dev/null || true; wait "$ctl" 2>/dev/null || true
+  trap - EXIT
+  [ "$control" = 124 ] ||
+    setup_error "SC26: the client's own bound did not fire on an unanswered connection" \
+      "control exit=$control" "the detector the assertion reads must report a timeout somewhere in this invocation"
+  [ "$bounded_a" = no ] && [ "$bounded_b" = no ] ||
+    fail "SC26 Then (O3): a select clause never completed (bounded A=$bounded_a B=$bounded_b)" \
+      "A=[$a] B=[$b]"
+  # The answer pairs the winner index with the winning cell's own value: A1one is index 1 with `one` (the
+  # cell resolved before the select), B0zero is index 0 with `zero` (the tie's registration order).
+  [ "$a" = "A1one" ] ||
+    fail "SC26 Then (O1): the cell resolved before the select did not win with its value" \
+      "expected A1one — index 1 and that cell's payload; the second cell resolved before the select even though it registered second" \
+      "observed: [$a]"
+  [ "$b" = "B0zero" ] ||
+    fail "SC26 Then (O2): registration order is not the tie rule, or the value is not the winner's" \
+      "expected B0zero — both cells resolved before the select, so the first registered wins, with that cell's payload" \
+      "observed: [$b]"
+  printf 'SC26 ok: first-resolved wins with its value (A1one), registration order ties (B0zero), both unbounded; control bound=%s\n' "$control"
+}
+
 # --- SC24 — time as an effect: sleeps and deadline races at the harness clock's stated instants ————————
 # The server is the public `controls` executable in its `--runtime-machine-time` mode: two clauses, each a
 # compiled machine served under `Runtime.runVirtual` with its completion awaited through a Join cell so the run
@@ -4798,9 +4953,11 @@ SC20) check_sc20 ;;
 SC21) check_sc21 ;;
 SC22) check_sc22 ;;
 SC23) check_sc23 ;;
+SC25) check_sc25 ;;
+SC26) check_sc26 ;;
 SC24) check_sc24 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23|SC24\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23|SC24|SC25|SC26\n' >&2
   exit 2
   ;;
 esac

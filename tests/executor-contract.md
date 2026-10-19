@@ -2108,3 +2108,70 @@ client's live-time bound is an invocation bound, recorded (`bounded`) and assert
 clock wrapper is the harness's own composition — arming a timer from the loop's thread also nudges the parked
 driver through the executor's inject, the load-bearing wake `Io.liveSchedule` documents for the live clock;
 without it the arm strands.
+
+### SC25 — spawn: a machine scheduled as an executor item, joined through its completion cell
+
+**Actor.** A Lean executable server (`lake exe defuncEcho <port> spawn`): each accepted connection is served
+by `amSpawn`, which reads one request byte (the join-order selector), spawns two `amChunkOf` children through
+`Runtime.sharedPush` — the first carrying `BBB`, the second `AAA`, always in that order — joins the two cells
+in the order the selector names (`0`: first spawned then second; `1`: the reverse), echoes the joined bytes,
+and closes. Each child is a single `onDone` step whose boot runs as an executor item, and its completion
+resolves the cell the parent awaits.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC25`, on loopback. One client — `ec_client`,
+which connects, optionally sends, and reads to EOF under a bound — serves both the assertion and the control.
+
+**When.** Two connections on the same server: one sends `0`, one sends `1`.
+
+**Then.** The answers are `BBBAAA` and `AAABBB`, both completed unbounded.
+
+- **SC25-O1, completion and through-reach.** Neither read hit the client's bound: the boot items reached the
+  executor through the app's inject and their resolutions resumed the parked parent. The detector is the
+  client's own bound, and its affirmative control in the same invocation is that same client against a `cps`
+  echo with an empty request and a 1 s bound, which must exit 124. This asserts **reach**, not the wake:
+  the parent enqueues both boots while it is running, and the driver drains queued work before parking, so a
+  push that enqueued without waking would still be taken here. The wake a parked driver needs is
+  `Runtime.sharedPush`'s — the inject SC2 exercises (an injected completion waking a waiting `blockOn`), with
+  SC18's wake from a non-carrier thread as its companion. The spawn adds no wake path: it calls the same
+  inject every other push does.
+- **SC25-O2, join order governs.** The two clauses spawn identical children (BBB first) and differ only in
+  the join order, and they answer `BBBAAA` and `AAABBB`. A collector that returned completions in completion
+  order would give one order in both clauses; a value-sorting collector cannot satisfy both. So the bytes
+  bind the join order to the handle that owns each payload.
+- **SC25-O3, typed handles.** The handles are `RawCell ByteArray` field values carried across the parent's
+  suspension to the joins; the generated spawner's payload type comes from the child's own `onDone` domain.
+
+**Limits, stated.** The scenario observes order, completion and through-reach; it does not observe which
+carrier ran a boot, and neither clause controls the completion order itself — that is why two swapped joins
+are used rather than a staged completion. The children carry a connection they do not use (the spawn surface
+takes one so the handle type stays the child's own). The port is fixed inside the invocation's loopback.
+
+### SC26 — select: first-wins over two cells, with registration order as the tie rule
+
+**Actor.** A Lean executable server (`lake exe defuncEcho <port> select`): each accepted connection is served
+by `amSelect`, which reads one request byte and selects over two cells it creates itself, answering with the
+winning index paired with that cell's own payload. On `A` the second cell (payload `one`) resolves before the
+select and the first (`zero`) after it; on `B` both resolve before the select.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC26`, on loopback; the same `ec_client`
+detector as SC25, with the same `cps`/1 s-bound control in the same invocation.
+
+**When.** Two connections on the select server carrying `A` and `B`, each read to its end under a bound.
+
+**Then.** The answers are `A1one` and `B0zero`, both completed unbounded.
+
+- **SC26-O1, first-resolved wins, with its value.** `A1one`: the cell resolved before the select resumed it
+  with index 1 and with that cell's payload, even though the other cell registered first; the loser's later
+  resolution produced no second resume (the answer carries one pair and the connection ends).
+- **SC26-O2, registration order is the tie rule.** `B0zero`: with both cells already resolved, the first
+  registered cell wins, with its own payload, as `Task.select` documents.
+- **SC26-O3, completion.** Both reads completed unbounded: neither select nor the loser's parked waiter held
+  the connection open.
+
+**Controls, in the same invocation.** (i) The two clauses report different winners and payloads (`1one`
+then `0zero`), so the winner field is a reading rather than a constant. (ii) The bound detector is the same
+client under a 1 s bound against a silent `cps` connection, which must exit 124.
+
+**Limits, stated.** The loser's parked waiter remains registered until its cell resolves and then no-ops; the
+scenario observes that no second resume reaches the machine, not the waiter's storage. The select's value type
+is the cells' own, and the tie rule is the registration order of the two awaits in `selectRaw`.

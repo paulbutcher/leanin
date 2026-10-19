@@ -71,6 +71,18 @@ def await (cell : RawCell α) (resume : α → IO Unit) : IO Unit := do
 
 end RawCell
 
+/-- **Select, raw**: first-wins over two completion cells of one type. The first cell to resolve resumes the
+waiter with its index and value; the other's resolution is ignored (its waiter stays registered and no-ops
+when it fires). Registration order is the tie rule — the first cell registers first, so an already-resolved
+first handle wins — as `Task.select` documents. -/
+def selectRaw (h0 : RawCell α) (h1 : RawCell α) (resume : Nat × α → IO Unit) : IO Unit := do
+  let won ← IO.mkRef false
+  let once (i : Nat) : α → IO Unit := fun v => do
+    let first ← won.modifyGet fun b => if b then (false, b) else (true, true)
+    if first then resume (i, v)
+  RawCell.await h0 (once 0)
+  RawCell.await h1 (once 1)
+
 /-- A defunctionalized computation. -/
 inductive VM (α : Type) where
   | pure (v : α)

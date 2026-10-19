@@ -112,15 +112,49 @@ rather than multiplying the silent-wrongness surface.
 
 ### M4 — spawn and select
 
-- `spawn`: a machine scheduled onto the executor, awaited through a cell — the substrate is the existing
-  `Task.Async.spawn` machinery; the compiled surface is a classifier effect with a cell per spawn, never per
-  step.
+- `spawn`: a machine scheduled onto the executor, awaited through a cell — *superseded design*: the substrate
+  was planned as `Task.Async.spawn`; the landed spawner uses the executor's own inject (`sharedPush`) because
+  a compiled step carries no `Ctx` route (see the landed note below). The compiled surface is a classifier
+  effect with a cell per spawn, never per step.
 - `select`/`race`: first-wins over two suspensions (`RawCell.resolve` is already first-wins); the tie rule is
   registration order, as `Task.select` documents.
 - **Acceptance**: spawn/join ordering records in the SC1 idiom; a select scenario in the SC16 idiom (winner,
   ready order, loser's fate).
 - **Evidence**: one scenario each with fixture; wake rules reconciled with the executor's `poked`/broadcast
   machinery and stated in the decision record.
+- **Landed**: a spawner is generated beside every tagged `run` whose last parameter is `(α → IO Unit)`:
+  `Foo.spawn push c …` allocates a `RawCell α`, pushes an executor item that runs the child with
+  `RawCell.resolve cell` as its `onDone`, and hands the cell back as the handle. The classifier's `.spawn`
+  emits the handle bind; `.join` (`RawCell.await h`) is the suspension; `.newCell`/`.resolve` expose the
+  cell primitives directly, so a machine can stage deterministic completions. `select` compiles to
+  `LeanIn.Runtime.selectRaw h0 h1`, first-wins over two cells with registration order as the tie rule (the
+  `won` flag makes the loser's later resolution a no-op). The spawn's substrate is the executor's own inject
+  (`Runtime.sharedPush`) rather than `Task.Async.spawn`, which needs a `Ctx` route a compiled step does not
+  carry; the wake is the same push a parked driver is woken by, so no new wake rule was introduced.
+- **Red observations** (isolated throwaway copy, `/tmp`, fresh build): (i) cutting the generated spawn's push
+  — the child's boot never reaches an executor item — makes SC25's client bound fire (`exit 124`, empty
+  body): the scenario's own O1 assertion (`bounded == no`) fails; (ii) reversing `selectRaw`'s registration
+  order makes SC26's tie clause answer `B1`/`B1one` instead of `B0`/`B0zero`; (iii) swapping `amSpawn`'s `0`
+  clause join order makes it answer `AAABBB`, failing SC25's O2 assertion on the `BBBAAA` bytes. All are the
+  scenarios' own assertions, not scaffolding failures. The through-reach cut is an enqueue cut, not a
+  wake-only cut: SC25's bound detects a push that never reaches the executor, and the parked-wake rule is
+  `sharedPush`'s, exercised by SC2 (an injected completion waking a waiting `blockOn`), with SC18's
+  non-carrier wake beside it, rather than re-proved here.
+- **Scenario evidence**: SC25 (`defuncEcho … spawn`) serves identical children with two join orders and
+  answers `BBBAAA` for `0` and `AAABBB` for `1` — a completion-order collector would give one order in both,
+  and a value-sorting one cannot satisfy both — under a client bound that never fires; the same client
+  against a silent `cps` connection under a 1 s bound exits 124 as the detector's control. SC26
+  (`defuncEcho … select`) answers `A1one` (the cell resolved before the select wins with its own payload
+  even though it registered second, and the loser's later resolution produces no second resume) and
+  `B0zero` (both cells resolved before the select: registration order wins, with its payload).
+- **Performance reading** (a separate client loop, not fixture output: client-side wall clock over loopback,
+  this host, one session's readings; instrument and limits stated): one connection's service for `spawn` is 39 µs and for `select` 49 µs over 300 sequential
+  connections, against 14 µs per echoed request inside one connection for the plain loop echo. The
+  connection figures include accept/churn, so they are not a spawn-cost isolation: the attributable spawn
+  work per connection is one cell allocation, two executor pushes, two resolutions and one park/resume; the
+  select work is two cell allocations, two resolutions, a select registration and a winner resume. Both are
+  connection-dominated on loopback and say nothing about per-request spawn cost, which needs a machine that
+  spawns within a served exchange.
 
 ### M5 — The server surface, and the showcase
 

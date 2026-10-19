@@ -2,6 +2,7 @@ import LeanIn
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.VM
 import LeanIn.Async
+import LeanIn.Test.Machines
 open LeanIn
 
 /-!
@@ -11,7 +12,8 @@ Small machines that compile the shapes the connection driver relies on — a sus
 their carried fields, `break`/`continue`, a close that ends the path — plus the two hand-written echo baselines
 they are measured against (`cpsEcho` through the `Join`-cell delivery, `vmEcho` through the interpreted `VM`).
 Run with `lake exe defuncEcho [port] [mode]`: `async`, `loop`, `for`, `brk`, `cont`, `forCont`, `vm`,
-`parent`, `parentT` (composition with thread-id records, for SC23), `call`, default `cps`.
+`parent`, `parentT` (composition with thread-id records, for SC23), `call`, `spawn` (SC25), `select`
+(SC26), default `cps`.
 -/
 
 asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
@@ -120,7 +122,8 @@ partial def vmEcho (c : Runtime.Conn) : Runtime.VM Unit := do
   | some bs => Runtime.VM.send c bs; vmEcho c
   | none    => Runtime.VM.close c
 
-partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : String) :
+partial def acceptLoop (e : LeanIn.Sched.Executor LeanIn.Task.Item 256)
+    (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : String) :
     Task.EAsync IO.Error Unit := do
   let c ← Runtime.Listener.accept l hooks
   if mode == "vm" then
@@ -146,9 +149,13 @@ partial def acceptLoop (hooks : Runtime.Hooks) (l : Runtime.Listener) (mode : St
     monadLift (amContinue.run c)
   else if mode == "forCont" then
     monadLift (amForCont.run c)
+  else if mode == "spawn" then
+    monadLift (amSpawn.run c (Runtime.sharedPush e) "AAA".toUTF8 "BBB".toUTF8 (fun _ => pure ()))
+  else if mode == "select" then
+    monadLift (amSelect.run c (fun _ => pure ()))
   else
     let _ ← Task.MonadAsync.spawn (cpsEcho hooks c)
-  acceptLoop hooks l mode
+  acceptLoop e hooks l mode
 
 def main (args : List String) : IO UInt32 := do
   let port := (args.head?.bind (·.toNat?)).getD 8080
@@ -164,7 +171,7 @@ def main (args : List String) : IO UInt32 := do
     let dt ← IO.asTask IO.getTID Task.Priority.dedicated
     IO.println s!"sc23|dedicatedTid={(← IO.wait dt).toOption.getD 0}"
     (← IO.getStdout).flush
-    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop hooks l "parentT")
+    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop e hooks l "parentT")
   else
-    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop hooks l mode)
+    let _ : Except IO.Error Unit ← Runtime.run e (acceptLoop e hooks l mode)
   return 0
