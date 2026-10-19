@@ -412,6 +412,48 @@ private partial def popDue (wheel : Std.TreeMap Nat (Array WheelTimer)) (now : N
 flush's condition. -/
 def hasListener : IO Bool := return (← loopRef.get).isSome
 
+/-- **A stalled read's slot**: the connection's outstanding read and the instant it must be answered by. The
+request path writes one entry and the completion erases it; nothing is scheduled, so there is no timer
+registration on the hot path at all. The driver sweeps expired slots on its own poll timeout (see
+`driveOnce`), which is where the stall bound is enforced. -/
+private structure StallSlot where
+  deadline : Nat
+  fire     : IO Unit
+
+private initialize stallRef : Std.Mutex (Std.TreeMap UInt32 StallSlot) ←
+  Std.Mutex.new Std.TreeMap.empty
+
+/-- The earliest slot deadline, if any: the driver folds it into its poll timeout. -/
+private def stallNext? : IO (Option Nat) :=
+  stallRef.atomically do
+    let m ← get
+    pure (m.toList.foldl (fun acc (_, s) => match acc with
+      | none => some s.deadline
+      | some d => some (if s.deadline < d then s.deadline else d)) none)
+
+/-- Whether any raw operation is outstanding (temporary diagnostic). -/
+private def stallLive : IO Bool :=
+  stallRef.atomically do pure ((← get).size != 0)
+
+/-- Whether any *raw* operation is outstanding. The driver must keep driving the loop while one is, even when its
+own executor has nothing to run: a raw completion is the loop's to deliver, and parking on the executor's
+condition variable there strands it (the submission's wake reaches the loop, not the executor). -/
+private def rawLive : IO Bool :=
+  rawRef.atomically do pure ((← get).size != 0)
+
+/-- Close the expired slots: take them out under the lock, then withdraw their reads and resume them outside it,
+so a late completion is dropped rather than resuming a machine that has moved on. -/
+private def sweepDue : IO Bool := do
+  let now ← IO.monoNanosNow
+  let due ← stallRef.atomically do
+    let m ← get
+    let due := m.toList.filter (fun (_, s) => s.deadline ≤ now)
+    set (due.foldl (fun m (c, _) => m.erase c) m)
+    pure due
+  for (_, s) in due do
+    s.fire
+  pure (!due.isEmpty)
+
 /-- **One pump of the I/O loop**, the loop's only driver. Drain the timers carriers scheduled into the wheel,
 fire every one that has come due, run one shim iteration parked on the earliest remaining deadline, and dispatch
 what it records to the bound listener's table if there is one. The single-carrier driver (`blockOnIo`) calls
@@ -424,6 +466,9 @@ bound listener. Returns `false` when the loop was stopped (the shim's `2`) or wh
 a driver with its own park can fall back to it; `true` after a real pump. -/
 def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   let now ← IO.monoNanosNow
+  -- A slot whose deadline has passed is closed here, on the driver: its resume enqueues work (or ends the
+  -- connection), so the driver returns rather than parking with that work pending.
+  if ← sweepDue then return true
   let fresh ← timerPending.atomically do
     let ps ← get
     set (#[] : Array WheelTimer)
@@ -450,7 +495,12 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
     | some table => dispatch table (← npUvEvents)
     | none => pure ()
     return active != 2
-  let nextDue ← wheelRef.atomically do return (← get).minKey?
+  let wheelDue ← wheelRef.atomically do return (← get).minKey?
+  let stallDue ← stallNext?
+  let nextDue := match wheelDue, stallDue with
+    | none, x => x
+    | x, none => x
+    | some a, some b => some (if a ≤ b then a else b)
   -- What counts as "nothing to drive" depends on the driver. The **pump** exists to serve a *bound* listener for
   -- a driver that never takes the loop over (`blockOnWith`, the virtual-clock entries): it must keep pumping
   -- while a listener is bound, because the accept that gives it work is registered by a task the pump itself
@@ -459,17 +509,20 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   -- a drained executor left behind — is not work for it: it must condvar-park on its own executor's empty
   -- queues (a bare `Join` wait, like the handlebench's), not loop-park on another executor's listener, or a
   -- reader of the parked count spins on it.
-  let nothing ← if ownedWorkOnly then
+  let nothingOne ← if ownedWorkOnly then
       match ← loopRef.get with
       | none => pure true
       | some table => table.atomically do pure (← get).parked.isEmpty
     else
       pure !(← hasListener)
+  -- A raw operation is loop work even though it is not in the Join-based parked table.
+  let nothing := nothingOne && !(← rawLive)
   if nothing && nextDue.isNone then
     return false
   let timeoutMs : UInt32 := match nextDue with
     | some d => if d > now then (max 1 ((d - now) / 1000000)).toUInt32 else 1
-    | none => 0
+    -- With no deadline but raw work outstanding, poll briefly rather than spinning at zero.
+    | none => if nothing then 0 else 1
   let active ← npUvRunOnceTimeout timeoutMs
   match ← loopRef.get with
   | some table => dispatch table (← npUvEvents)
@@ -659,6 +712,18 @@ delivery is different. This and `sendRaw` measure what the `Join`-cell delivery 
     withdrawRaw c.idx .read
     closeOnRefusal c "a refused read submission"
     resume (.error (.userError "Io.recvRaw: the loop refused a read submission"))
+
+/-- **Read with a swept stall bound**: register the read, record the slot, and let the driver expire it. The
+resume type matches `recvTimeoutRaw`'s, so a caller's match is unchanged. -/
+def recvStallRaw (c : Conn) (d : Std.Time.Millisecond.Offset) (size : UInt64)
+    (resume : Option (Except IO.Error (Option ByteArray)) → IO Unit) : IO Unit := do
+  let now ← IO.monoNanosNow
+  stallRef.atomically do
+    modify (·.insert c.idx { deadline := now + d.toInt.toNat * 1000000,
+                             fire := do withdrawRaw c.idx .read; resume none })
+  recvRaw c size (fun r => do
+    stallRef.atomically do modify (·.erase c.idx)
+    resume (some r))
 
 /-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. A refused submission
 resumes an error rather than dropping the continuation: a write that never happened is not a completion. -/

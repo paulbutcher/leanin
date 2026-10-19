@@ -47,29 +47,32 @@ the number, so the cost is the **registration path**: `timerPending` push, the d
 `TreeMap`, the wheel insert, plus the per-read mutex, cancel token and closures. Roughly **1.2 µs is timer
 registration and ~0.5 µs the rest of the deadline's bookkeeping**.
 
-**A sweep prototype reached the target and exposed an integration race.** A per-connection slot plus one
-self-rearming 20 ms sweep read **135.1–135.7 k rps at 7.05–7.13 µs/request, p50 53 µs** (stock 117 k / 8.2 µs /
-62 µs) — Node's throughput within ~5 %, on the same core. Two integration defects then appeared, and their
-behaviour was not stable between runs:
+**The sweep landed, with the driver owning the deadline.** The design that works needs no timer at all: a read
+writes one slot (connection → deadline), its completion erases it, and `driveOnce` folds the earliest slot
+deadline into its own poll timeout and sweeps expired slots at the top of each iteration. The clock carries a
+`swept` capability: the live clock is swept, a harness clock keeps the armed instant it must retire exactly.
 
-1. SC20's second clause (a handler that suspends 1 ms then raises) hung: the read was armed and never completed.
-   Isolated by A/B: it hangs when the read's arm **schedules a timer** (with or without `ensurePump`), and passes
-   when the arm does nothing. Moving the arming off the request path into the driver's own iteration
-   (`driveOnce` arms one sweep entry while slots exist) **fixed clause two**.
-2. That arrangement then failed clause three (the harness-clock stall) with `at=0` instead of `at=30` — the
-   harness clock path takes no swept reads at all, so a state or timing interaction crossed clauses. A
-   follow-up variant with the arming disabled produced no output at all, so the failure is not stable.
+Three integration defects were found and fixed on the way:
 
-The prototype was reverted; `main`'s behaviour (`swept := false`) is the known-good baseline and SC20 passes.
-**The blocker is a race between the sweep's timer and the loop/driver lifecycle, not the slot bookkeeping.** The
-next attempt should land the driver-armed design in a branch with a deterministic reproduction of the
-clause-two/clause-three transition (run the two clauses against one process, repeatedly), treat any run-to-run
-variation as a failure of the change, and only then measure.
+1. Scheduling a timer from the read path hung SC20's suspending-handler clause — removed by the design, which
+   schedules nothing on the request path.
+2. The driver's idle test counted only the Join-based parked table, so a **raw operation outstanding with no
+   deadline** (the response write) made it condvar-park while the loop still owed the completion; the wake for
+   a later submission reaches the loop, not the executor. The test now also requires no raw operation, with a
+   1 ms poll while one is outstanding.
+3. The machine syntax rejects a typed bind of an `if` of two awaits; the driver branches explicitly.
 
-**So the next step is not the pump.** It is to land a deadline whose request path costs a slot write and nothing
-else — either by fixing the sweep above, or by reusing per-connection timer/mutex/cancel objects and replacing
-one wheel entry in place — with SC20 and the pinned threeway as the gate. The pump's own share (parse 0.41 µs
-from `h1bench`; encode, appends and handler not yet separated) is the step after that.
+**Measured, same session, server core 1 / client core 2, three runs each:**
+
+| arm | rps | µs CPU/request | p50 |
+|---|---|---|---|
+| before | 112.4 / 111.3 / 115.4 k | 8.39 / 8.59 / 8.37 | 63 / 65 / 63 µs |
+| **swept deadline** | **120.4 / 128.0 / 132.7 k** | **7.66 / 7.44 / 7.28** | **58 / 56 / 55 µs** |
+
+That is ~1.0 µs less CPU per request (+12 % throughput, p50 −12 %), and the pinned threeway reads 116 191
+against Node's 100 431 at C=8 (1.16×) and 106 673 against 103 433 at C=32 (1.03×). The remaining distance to the
+prototype's 7.05 µs is per-iteration bookkeeping (`sweepDue`, `stallNext?`, `rawLive`); that is the next small
+step, after which the pump is the only remaining per-request item.
 
 ## The theory
 

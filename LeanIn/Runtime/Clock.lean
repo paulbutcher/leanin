@@ -40,6 +40,9 @@ structure Clock where
   action rather than parking a waiter, so a timeout that resolves a cell directly leaves no parked task for a
   winner to abandon — `withTimeout` arms its deadline this way and sets the token when its computation wins. -/
   schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit
+  /-- Whether a read's stall bound should be **swept** (the live clock: a slot the driver expires on its own
+  timeout) or **armed** (a harness clock: an instant the driver advances to, retired exactly). -/
+  swept : Bool
 
 /-- **The production clock**: the live reading, and a `sleep` that parks the waiter and schedules its fire on
 the runtime's own timing wheel (`Io.liveSchedule`). The wheel is driven by the loop thread that also services
@@ -58,7 +61,8 @@ def Clock.live (_hooks : Hooks) : Clock :=
       Io.liveSchedule (now0 + d.toInt.toNat * 1000000) ctx.cancel fire⟩
   , schedule := fun d cancel fire => do
       let now0 ← IO.monoNanosNow
-      Io.liveSchedule (now0 + d.toInt.toNat * 1000000) cancel fire }
+      Io.liveSchedule (now0 + d.toInt.toNat * 1000000) cancel fire
+  , swept := true }
 
 /-- The virtual clock's state: the current instant and its pending timers, sorted by instant and FIFO on
 ties. -/
@@ -138,7 +142,8 @@ def HarnessClock.clock (hc : HarnessClock) : Clock :=
       return ()⟩
   , schedule := fun d cancel fire => do
       let now0 ← hc.now
-      hc.schedule (now0 + d.val.toNat) (do unless ← Task.Cancel.isSet cancel do fire) }
+      hc.schedule (now0 + d.val.toNat) (do unless ← Task.Cancel.isSet cancel do fire)
+  , swept := false }
 
 /-- **The harness clock, composed with the executor wake a virtual driver needs.**
 

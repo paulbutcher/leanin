@@ -775,6 +775,14 @@ difference between 8.2 and 6.7 — the parse, pump, framing and handler that the
 of which `h1bench` attributes 0.41 µs to parsing. The follow-up work named by that decomposition is the pump,
 not the I/O path. The instrument's ±30 % spread (§4.7) applies; these are single-run rows per point.
 
+**The swept read deadline (this commit).** The per-read stall bound used to arm a timer per read: a mutex, a
+cancel token, closures, a `timerPending` push and a wheel insert, plus a later inert fire. It is now a slot the
+read writes and the driver expires on its own poll timeout — no scheduling on the request path. Same-session
+A/B, server core 1 / client core 2, three runs each: **8.39–8.59 → 7.28–7.66 µs CPU/request**, 112.4–115.4 k →
+**120.4–132.7 k rps**, p50 63–65 → **55–58 µs**. The pinned threeway then read **116 191** against Node's
+**100 431** at C=8 (1.16×) and 106 673 against 103 433 at C=32 (1.03×). The harness-clock path is unchanged
+(`Clock.swept`), so SC20-O3/SC24 keep their exact instants.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always

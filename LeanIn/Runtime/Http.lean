@@ -141,20 +141,38 @@ asyncMachine drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) 
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
         onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
       | .ok _ => pure ()
-    let rt := await (LeanIn.Runtime.Io.recvTimeoutRaw c cfg.clock.schedule cfg.stallTimeout 65536)
-    match rt with
-    | none =>
-      let closed := await (LeanIn.Runtime.Io.closeRaw c)
-      onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
-    | some (.error e) =>
-      let closed := await (LeanIn.Runtime.Io.closeRaw c)
-      onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
-    | some (.ok none) =>
-      let m := H1.Machine.noMoreInput machine
-      recurse
-    | some (.ok (some bs)) =>
-      let m := H1.Machine.feed machine bs
-      recurse
+    -- A live clock's deadline is a slot the driver sweeps on its own poll timeout; a harness clock's is an
+    -- armed instant the virtual driver advances to, and it must be retired exactly.
+    if cfg.clock.swept then
+      let rt := await (LeanIn.Runtime.Io.recvStallRaw c cfg.stallTimeout 65536)
+      match rt with
+      | none =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+      | some (.error e) =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | some (.ok none) =>
+        let m := H1.Machine.noMoreInput machine
+        recurse
+      | some (.ok (some bs)) =>
+        let m := H1.Machine.feed machine bs
+        recurse
+    else
+      let rt := await (LeanIn.Runtime.Io.recvTimeoutRaw c cfg.clock.schedule cfg.stallTimeout 65536)
+      match rt with
+      | none =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+      | some (.error e) =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | some (.ok none) =>
+        let m := H1.Machine.noMoreInput machine
+        recurse
+      | some (.ok (some bs)) =>
+        let m := H1.Machine.feed machine bs
+        recurse
   | .done =>
     if out.size > 0 then
       let sw := await (LeanIn.Runtime.Io.sendAllRaw c out)

@@ -223,6 +223,7 @@ private partial def piShape (e : Lean.Expr) : Nat × Bool :=
 /-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
 private inductive Eff where
   | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
+  | stallRead (deadline : Term) (size : Term)  -- `Io.recvStallRaw c d sz` → the same race, swept
   | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
   | sleep (sched : Term) (deadline : Term)  -- `Io.sleepRaw sched d` → `Unit`
   | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
@@ -244,6 +245,7 @@ private partial def unparen (s : Syntax) : Syntax :=
 
 private def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   match unparen e with
+  | `(LeanIn.Runtime.Io.recvStallRaw $_ $d $z) => pure (.stallRead ⟨d⟩ ⟨z⟩)
   | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => pure (.recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩)
   | `(LeanIn.Runtime.Io.sleepRaw $s $d) => pure (.sleep ⟨s⟩ ⟨d⟩)
   | `(LeanIn.Runtime.VM.runAsync $m) => pure (.runVM ⟨m⟩)
@@ -457,6 +459,7 @@ private def resultBind (eff : Eff) : Bind :=
   match eff with
   | .recv => .recvRes
   | .recvTimeout .. => .recvTimeoutRes
+  | .stallRead .. => .recvTimeoutRes
   | .sendAll .. | .send .. => .sendRes
   | .runMachine .. => .pureB
   | _ => .pureB
@@ -491,6 +494,10 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
         | .ok (some $(mkIdent bv)) => $body
         | .ok none => LeanIn.Runtime.Io.closeAfterFailure $c
         | .error _ => pure ()))
+  | .stallRead d z =>
+    let bv := bnd.getD `r
+    let k ← annot bv
+    `(LeanIn.Runtime.Io.recvStallRaw $c $d $z $k)
   | .recvTimeout sched d z =>
     let bv := bnd.getD `r
     let k ← annot bv
