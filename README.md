@@ -18,12 +18,13 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 
 | server | C=1 req/s | C=8 | C=32 |
 |---|---|---|---|
-| Node 22 | 70 335 | 100 431 | 103 433 |
-| **leanin** | **77 727** | **116 191** | **106 673** |
-| shipped `Std.Http.Server` | 5 186 | 5 802 | 8 528 |
+| Node 22 | 75 215 | 98 695 | 99 268 |
+| **leanin** | **71 654** | **106 046** | **105 373** |
+| shipped `Std.Http.Server` | 5 332 | 5 965 | 8 281 |
 
-**leanin reads 1.10×, 1.16× and 1.03× Node at one, eight and thirty-two connections, and 12–20× the Lean HTTP
-server that ships with the toolchain.** How the numbers are taken, what they decompose
+**leanin is level with Node at one connection and reads 1.07× and 1.06× of it at eight and thirty-two, while
+being 13–18× the Lean HTTP server that ships with the toolchain.** p50 is 12 µs for both at C=1, 69 µs against
+74 µs at C=8, and 288 µs against 300 µs at C=32. How the numbers are taken, what they decompose
 into, and the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
