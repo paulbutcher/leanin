@@ -89,7 +89,27 @@ So the growth is **not protocol work**: it is GC marking (×2.2, the live set gr
 the write-completion path (×1.6, whose cause is not yet isolated). GC and refcounting together are ~44 % of
 instructions at C=32; `pump` is ~34 % and flat across levels.
 
-**Serious profiling (method and result).** `perf` is blocked (`perf_event_paranoid = 4`), so the workable
+**Serious profiling with `perf` (after the host's `perf_event_paranoid` was lowered and the generic 6.17 tools
+package installed).** Sampled profiles at C=8 and C=32, server pinned, under load:
+
+| symbol | C=8 | C=32 |
+|---|---|---|
+| `lean_dec_ref_cold` | 24.7 % | 27.0 % |
+| `lean_mark_mt` (GC) | 5.6 % | 10.1 % |
+| `lean_copy_expand_array` | 3.2 % | 10.4 % |
+| `mi_free` | 4.3 % | 3.5 % |
+| `lean_alloc_small_object_core` | 3.3 % | 2.7 % |
+| H1 `findLF` loop | 1.9 % | 1.3 % |
+| mutex lock/unlock | 3.6 % | 2.7 % |
+
+The C-growth is **`copy_expand_array` (×3.2) and GC marking (×1.8)**. The call graph attributes the array copy
+entirely to `Std.DHashMap` insert/erase in `registerRaw`/`rawResume` — the aliasing shape: the map is read out of
+its cell for mutation. **Taking the map out of the cell before mutating it (the same discipline that fixed the
+slot array) made no measurable difference** (C=8 7.08–7.16 vs 7.04–7.09 µs; C=32 8.26–8.29 vs 8.14–8.27), so the
+copy is inherent to the map's structure or does not translate to wall time. Allocation and refcount remain the
+dominant, growth-bearing term (~37 % at C=8, ~44 % at C=32), which is the frame/state-representation direction.
+
+**Earlier profiling method (callgrind, retained for reference).** `perf` is blocked (`perf_event_paranoid = 4`), so the workable
 instrument is callgrind on a **finite** workload: `server <port> quiet count=N` serves exactly N connections and
 exits, so callgrind writes one complete profile; a `count=1` run gives the startup constant, and
 `(Ir − startup) / requests` is the per-request instruction count. On the committed driver: 1,577 M Ir for 27,992
