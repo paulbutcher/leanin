@@ -141,6 +141,21 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
   either. The discipline itself is the reusable lesson — in-place updates are available, but every reference
   held during the update must be removed first.
 
+**Two more local designs measured worse and were reverted, which closes the "shave the protocol path" family:**
+
+- *Byte-built response encoding* (status digits written manually, headers appended into one buffer instead of
+  `s!`/`String.join`/`toUTF8`): **~7 % slower at C=8 and C=32** — `ByteArray.append` copies the accumulated buffer
+  per piece, so the encoder became quadratic per response. A correct version would need a single preallocated
+  buffer or a chunk list joined once, and would still face the measurement bar.
+- *Allocation-free literal comparisons plus one-pass header classification* (packed-`Nat` matching for
+  `close`/`keep-alive`/`connection`/`content-length`, `Content-Length` and keep-alive decided during parsing):
+  **~7 % slower at C=8 and ~8 % at C=32**. The packed comparison costs more per header than the original
+  short-circuiting `findSome?` scans, and the single pass visits every header instead of stopping early.
+
+So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
+wins when replaced locally; every micro-change measured parity or worse. The remaining levers are structural:
+the per-transition state allocation (frame) and carriers.
+
 **That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
 representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
 cost is what grows with connections. The note's fixed-frame proposal should be re-read against this profile
