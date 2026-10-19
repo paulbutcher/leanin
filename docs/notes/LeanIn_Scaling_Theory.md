@@ -89,6 +89,17 @@ So the growth is **not protocol work**: it is GC marking (×2.2, the live set gr
 the write-completion path (×1.6, whose cause is not yet isolated). GC and refcounting together are ~44 % of
 instructions at C=32; `pump` is ~34 % and flat across levels.
 
+**Two attempts at the allocation figures failed, and are recorded so they are not repeated:**
+
+- *Allocation-site counts*: callgrind's `calls=` counts taken from a mid-run dump cover only a slice while the
+  client's completed count covers the whole run, and an attempt to gate counting with `--instr-atstart=no` plus
+  `callgrind_control -i on/-d` produced implausible totals (≈300 Ir/request). No reliable per-site allocation
+  counts were obtained with the available unprivileged tools; the Ir *shares* above remain indicative.
+- *Slot arrays for raw registrations*: replacing the `HashMap (conn, op) → resume` with a fixed 16 k-entry array
+  was **catastrophically slower** (9.2 k rps, 10.4 µs/request against 128–135 k, 7.1 µs) — the `set!` copies the
+  array per operation. Reverted. A retry needs a genuinely mutable store (or the shim's own slot table), not
+  `Array.set!` under a mutex.
+
 **That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
 representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
 cost is what grows with connections. The note's fixed-frame proposal should be re-read against this profile
