@@ -22,13 +22,9 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 | **leanin** | **77 891** | **114 058** | **104 369** |
 | shipped `Std.Http.Server` | 5 163 | 5 773 | 7 577 |
 
-**leanin is level with Node at one connection** (1.11× in the row above, inside the instrument's spread at that
-level) **and reads 0.78× and 0.70× of it at eight and thirty-two, while being 14–20× the Lean HTTP server that
-ships with the toolchain.** p50 is 12 µs for both servers at C=1, and
-44 µs (Node) against 63 µs (leanin) at C=8. The driver is itself a compiled `asyncMachine`, and it spends
-8.2 µs of CPU per request against Node's 6.7 µs; a no-parse control of the same compiler, measured in
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md), spends 4.8 µs — so ~3.4 µs per request is parse, pump and
-handler. How the numbers are taken, and the shapes where we are worse, are there too.
+**leanin is level with Node at one connection, reads 0.78× and 0.70× of it at eight and thirty-two, and is
+14–20× the Lean HTTP server that ships with the toolchain.** How the numbers are taken, what they decompose
+into, and the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
