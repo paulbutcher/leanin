@@ -790,23 +790,31 @@ event per pending read and re-arms after a take. Interleaved sign test, five pai
 build at higher host load, 125.0 k → 130.9 k, 5/5. The same server at depth 16 reads ~483 k against Node's
 ~106 k in the pipelined shape.
 
-**Re-read with both wins in place** — `nix develop -c bash bench/threeway.sh 1 8 32`, four arms, both sides
-pinned to distinct P-cores as above, three invocations while the host's load average rose 3.31 → 4.30 → 6.76.
-Median of the three:
+**The ratio needs pairing, not a larger sample.** Two defects made the single-shot rows unusable as a claim.
+First, absolute rows drift with the host's state by up to 50 %, and both arms drift together; pairing the arms
+inside one round — both servers up, one arm after the other, order alternating, the ratio computed *within* the
+round and only then medianed — cancels that drift where averaging rows cannot. Second, a server left running
+across levels carries heap and connection state into the next: over one long invocation Node's C=32 rows fell
+about 30 % while ours held, which reading rows alone would have reported as a win for us. `bench/paired.sh`
+does both, restarting both servers fresh at each level. Nine rounds per level, five seconds per arm, host load
+3.0–4.5:
 
-| server | C=1 | C=8 | C=32 |
+| level | leanin / Node, median of round ratios | IQR | medians, node / leanin |
 |---|---|---|---|
-| Node 22 | 74 427 | 89 950 | 92 055 |
-| compiled driver (`server`) | 69 096 | **122 546** | **109 623** |
-| compiled, no protocol work (`hello keep`) | 79 692 | 181 354 | 176 237 |
-| shipped `Std.Http.Server` | 4 306 | 4 456 | 6 709 |
+| C=1 | **0.912** | 0.901–0.931 | 68 717 / 62 883 |
+| C=8 | **1.002** | 0.958–1.006 | 124 501 / 123 819 |
+| C=32 | **1.237** | 1.179–1.274 | 84 565 / 106 753 |
 
-The cleanest invocation (load 3.31) reads 74 061 / 146 479 / 130 695 for Node, 63 978 / 122 546 / 109 623 for
-the driver, 79 692 / 190 525 / 176 739 for `hello keep` and 5 175 / 5 015 / 6 814 for the shipped server: against
-Node that is 0.86× / 0.84× / 0.84×, and 12.4× / 24.4× / 16.1× against the shipped server. Node's C=8/C=32 rows
-fall by ~40 % on the two loaded invocations, so the medians above flatter our row; the clean run is the
-conservative comparison. Per-request CPU still grows with connections (7.0 → 8.3 µs from C=8 to C=32), which is
-the remaining gap and the subject of the scaling note.
+**So the C=1 deficit is real**, consistently ~9 %, and it is the protocol layer rather than the I/O path: in the
+same session the compiled driver with no protocol work (`hello keep`) read 79 692 against Node's 74 427 at C=1,
+so the runtime, shim and raw delivery are already faster than Node, and the ~3 µs gap is parse, pump, framing
+and response encoding. **The C=8 "0.84×" in earlier single-run rows was drift, not a deficit** — paired, the two
+are level (1.002, IQR straddling 1.0). At C=32 we are ahead by ~24 %; Node's absolute there settles near 85 k in
+this harness after warm-up, which is why the ratio, not the row, is the claim. The four-arm three-way remains the
+instrument for the shipped-server multiplier (medians of three invocations, load 3.31→6.76: Node 74 427 / 89 950
+/ 92 055, driver 69 096 / 122 546 / 109 623, `hello keep` 79 692 / 181 354 / 176 237, shipped server 4 306 /
+4 456 / 6 709 — 12–24× our favour). Per-request CPU still grows with connections (7.0 → 8.3 µs from C=8 to
+C=32), which is the remaining gap and the subject of the scaling note.
 
 **What did not move.** Three Lean-side replacements of the raw-registration `HashMap` with fixed slots all read
 ~9 k rps at ~104 µs CPU/request — one request per millisecond per connection, i.e. served off the driver's idle

@@ -12,23 +12,25 @@ languages but which lives in a proof assistant. The basic trick is to use **data
 defunctionalisation rather than vanilla `do`.
 
 The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which
-gives you a flavour of our current performance: keep-alive requests, one request outstanding per connection
-(`bench/threeway.sh`), every arm in one invocation with 5 s per point, both sides pinned to distinct P-cores and
-the CPU energy-performance preference at `performance`. **C is the number of concurrent keep-alive connections.**
+gives you a flavour of our current performance: keep-alive requests, one request outstanding per connection,
+both sides pinned to distinct P-cores, the CPU energy-performance preference at `performance`, and the arms
+paired and interleaved in one invocation (`bench/paired.sh`). **C is the number of concurrent keep-alive
+connections.**
 
-| server | C=1 req/s | C=8 | C=32 |
+| connections | C=1 | C=8 | C=32 |
 |---|---|---|---|
-| Node 22 | 74 427 | 89 950 | 92 055 |
-| **leanin** | **69 096** | **122 546** | **109 623** |
-| shipped `Std.Http.Server` | 4 306 | 4 456 | 6 709 |
+| leanin / Node 22 (paired median) | **0.91×** | **1.00×** | **1.24×** |
+| interval (IQR of the per-round ratios) | 0.90–0.93 | 0.96–1.01 | 1.18–1.27 |
 
-**leanin is at ~0.93× Node at one connection and ahead at eight and thirty-two in these repetitions, and
-16–27× the Lean HTTP server that ships with the toolchain.** The row is the median of three invocations of the
-instrument above, spanning host load 3.3–6.8; Node's own C=8/C=32 rows collapse on the loaded invocations, and
-the cleanest one (load 3.3) reads 0.86× / 0.84× / 0.84×, which is the conservative comparison to trust. Single
-runs move by up to 50 % with the host's state, so read the repeated medians or the clean row, not an arbitrary
-run; ratios within one session are reproducible to a few percent. How the numbers are taken, what they decompose
-into, and the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+**`bench/paired.sh` pairs the arms inside each round — both servers up, order alternated, the ratio taken per
+round before any averaging — and restarts both servers at each level, because a server that has served a level
+carries state into the next. Nine rounds per level: we are ~9 % slower than Node at one connection, level at
+eight, and ~24 % ahead at thirty-two, and the intervals are narrow enough to say so.** The C=1 deficit is the
+protocol driver, not the I/O path: the same runtime with no protocol work (`hello keep`) is faster than Node at
+C=1, so the ~3 µs difference is parse, pump and response encoding. Against the Lean HTTP server that ships with
+the toolchain we remain 12–24× ahead (`bench/threeway.sh`, medians of three invocations). Absolute single rows
+move with the host's state — read the paired ratios. How the numbers are taken, what they decompose into, and
+the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
