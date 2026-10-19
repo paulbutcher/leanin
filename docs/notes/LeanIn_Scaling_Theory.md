@@ -72,17 +72,18 @@ Three integration defects were found and fixed on the way:
 That is ~1.0 µs less CPU per request (+12 % throughput, p50 −12 %). The pinned threeway in the fast host state
 reads ~0.94× Node at C=8 and ~0.81× at C=32; repeated medians, not single runs, are the number to quote.
 
-**Next lever, measured: the sweep's per-iteration scans.** Per-request CPU rises with connections — 7.04 µs at
-C=8, 7.46 at C=16, 8.32 at C=32 — and a variant that skips `sweepDue`/`stallNext?` entirely reads 25–35 %
-faster in the same session. So the scans are the C-growth. Two replacement designs were tried and **both
-regressed**:
+**C-growth: real, but not yet attributed.** Per-request CPU rises with connections (7.04 µs at C=8, 7.46 at C=16,
+8.32 at C=32, measured on a clean host). Two designs for the slot bookkeeping were built and measured against the
+committed driver in the same session:
 
-- two indexes (by connection, by deadline): the request path grew two map writes plus bucket filtering, −25 %;
-- a FIFO of deadlines (array + head index): collapsed to 17 µs/request — the array grows without compaction.
+- two indexes (by connection, by deadline): the request path gained two map writes and bucket filtering, −25 %;
+- a list-headed FIFO with lazy stale skipping: **neutral at C=8, −5 % at C=32** — no better than the scans.
 
-The next design should keep the request path at one insert and one erase: a **`List`-headed FIFO with stale
-skipping and periodic compaction**, or a cached minimum recomputed only when the minimum leaves. Validate with
-the same attribution harness before any threeway claim.
+An earlier "no-scan is 25–35 % faster" reading was taken while three stray benchmark servers were still running;
+it is **withdrawn**. So the scans are not shown to be the C-growth, and neither replacement pays. The next step is
+a clean attribution run (no-scan vs scan, no strays, low host load) before any further change to the slot
+bookkeeping; if it again shows nothing, the C-growth is elsewhere — socket/epoll bookkeeping per connection or
+executor queue effects — and should be profiled from there.
 
 **Then the pump**: driver minus no-parse is now ~2.3 µs/request, of which `h1bench` attributes 0.41 to parsing.
 That is the last per-request item before carriers.
