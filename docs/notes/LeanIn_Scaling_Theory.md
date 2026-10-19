@@ -72,18 +72,29 @@ Three integration defects were found and fixed on the way:
 That is ~1.0 µs less CPU per request (+12 % throughput, p50 −12 %). The pinned threeway in the fast host state
 reads ~0.94× Node at C=8 and ~0.81× at C=32; repeated medians, not single runs, are the number to quote.
 
-**C-growth: real, but not yet attributed.** Per-request CPU rises with connections (7.04 µs at C=8, 7.46 at C=16,
-8.32 at C=32, measured on a clean host). Two designs for the slot bookkeeping were built and measured against the
-committed driver in the same session:
+**C-growth attributed (callgrind, unprivileged: per-function instruction counts).** The driver was profiled
+under `valgrind --tool=callgrind` with a real client at C=8 and C=32; instructions per request are 10,599 and
+12,025 (+13.5 %, matching the +18 % CPU time). Per request:
 
-- two indexes (by connection, by deadline): the request path gained two map writes and bucket filtering, −25 %;
-- a list-headed FIFO with lazy stale skipping: **neutral at C=8, −5 % at C=32** — no better than the scans.
+| component | C=8 | C=32 | change |
+|---|---|---|---|
+| `dispatch` | 8,934 | 11,306 | +2,372 |
+| `opDone` (write completion) | 2,178 | 3,432 | +1,254 (×1.6) |
+| `lean_mark_mt` (GC marking) | 1,015 | 2,209 | +1,194 (×2.2) |
+| `dec_ref_cold` (refcount) | 2,232 | 2,624 | +392 |
+| `pump` | 4,246 | 4,132 | flat |
+| parse/step/send | ~2,500 | ~2,510 | flat |
 
-An earlier "no-scan is 25–35 % faster" reading was taken while three stray benchmark servers were still running;
-it is **withdrawn**. So the scans are not shown to be the C-growth, and neither replacement pays. The next step is
-a clean attribution run (no-scan vs scan, no strays, low host load) before any further change to the slot
-bookkeeping; if it again shows nothing, the C-growth is elsewhere — socket/epoll bookkeeping per connection or
-executor queue effects — and should be profiled from there.
+So the growth is **not protocol work**: it is GC marking (×2.2, the live set grows with the connection count) and
+the write-completion path (×1.6, whose cause is not yet isolated). GC and refcounting together are ~44 % of
+instructions at C=32; `pump` is ~34 % and flat across levels.
+
+**That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
+representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
+cost is what grows with connections. The note's fixed-frame proposal should be re-read against this profile
+(`docs/notes/LeanIn_Frame_Reuse_Handoff.md`), starting with the measured allocation sites rather than the parser.
+The `opDone` growth needs its own attribution next (its lookup is a linear scan of the Join-based parked table;
+whether that table holds anything at higher C is unverified).
 
 **Then the pump**: driver minus no-parse is now ~2.3 µs/request, of which `h1bench` attributes 0.41 to parsing.
 That is the last per-request item before carriers.
