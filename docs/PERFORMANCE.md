@@ -833,17 +833,22 @@ against 0.945 before the change and ~1.04 for the pre-change build; one traced i
 step toward C=1 parity. At C=8 and C=32 the same changes are what the wins above measure: ~15.6 % and ~10 %
 ahead of the pre-change build paired (1/0.865 and 1/0.909, 9/9).
 
-**Direct writes from the loop thread (the next 2.6 %, and where C=1 now stands).** The shim now attempts
-`uv_try_write` for a submission the loop thread makes when nothing is queued and no write is in flight, pushing
-the completion in the same iteration; partial writes and `EAGAIN` queue the remainder, preserving order. Paired
-against the same build: **+2.6 % at C=1 (9/9, IQR 1.012–1.028)**, 1.000 at C=8 and 0.991 at C=32. The paired
-C=1 ratio against Node still reads **0.933** (node 72.8 k, ours 68.4 k), so the A/B gain is real but sits inside
-the run-to-run spread of the node comparison; it is not enough to overtake Node at one connection. The reason is
-visible in per-request cost: at C=1 the server spends **11.6 µs of CPU per request against Node's 8.3 µs**
-(`/proc` deltas over a pinned window; round trip 14.3 against 13.4 µs, so the CPU is what the gap is made of).
-Per request that is ~59 k instructions, and the profile's named contributors are refcount traffic
-(`lean_dec_ref_cold`, `lean_alloc_small_object_core`), GC marking (`lean_mark_mt`), malloc/free, and string
-building for the response (`lean_string_utf8_set`, `lean_string_append`, `Std.Http`'s `shouldKeepAlive`).
+**The direct-write fast path is inert on the serving path (measured, and its earlier claim withdrawn).** The
+shim's `uv_try_write` branch is gated on `g_loop_running`, and counters added to the shim show, over 200 write
+submissions from the server, **`gate_loop=200`, `attempts=0`, `ok=0`** — the flag is false throughout dispatch,
+so the branch never runs and its recorded "+2.6 % at C=1" was noise between builds. The branch remains in the
+shim because it is upstream code and its reachability in the pump-driven entry (where `g_loop_running` is set
+around non-blocking iterations) is unverified; the served path does not exercise it. Activating it needs the
+ownership contract and completion-first progress the review note describes, not a widened flag: a submission
+must be attributable to the loop's owner across dispatch, and a recorded completion must be delivered before any
+blocking poll.
+
+**The event bridge carries `UInt32` fields (candidate 1 of the review note).** `np_uv_events` built an
+`Array UInt64`; on 64-bit `lean_box_uint64` allocates a constructor per field, so one request's read and write
+completions cost six box objects. Both sides now carry `Array UInt32` — `lean_box_uint32` is an immediate — with
+the sign of a libuv status decoded explicitly from two's complement (`signed`) rather than from a 64-bit
+encoding. Paired, nine rounds per level: **1.028 at C=1 (IQR 1.010–1.032), 1.005 at C=8, 1.009 at C=32**.
+SC19/20/23/24/27 and BT1–3 pass, covering EOF and negative-status paths.
 
 **What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
 **12.07 µs** per request against Node's **8.92 µs**, but the same runtime and shim with **no protocol at all**

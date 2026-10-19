@@ -99,7 +99,7 @@ fired timer's continuation is in the executor's inject) and must harvest socket 
 @[extern "np_uv_run_nowait"] opaque npUvRunNowait : IO UInt32
 
 /-- Drain the shim's event queue: `(kind, conn, arg)` triples, flat in one array. -/
-@[extern "np_uv_events"] opaque npUvEvents : IO (Array UInt64)
+@[extern "np_uv_events"] opaque npUvEvents : IO (Array UInt32)
 
 /-- The bytes accumulated on connection `idx`, clearing them. The loop thread's alone: it is called where a
 completion's bytes are still that connection's, before the next read on it can start. -/
@@ -225,11 +225,12 @@ private def flagSet (r : Std.Mutex Bool) (b : Bool) : IO Unit := r.atomically do
 
 namespace Io
 
-/-- The signed reading of an event argument. libuv reports a failure as the negated error code, and the shim
-carries that through a `UInt64`, so this is where the sign comes back. -/
-private def signed (arg : UInt64) : Int :=
+/-- The signed reading of an event argument. libuv reports a failure as the negated error code; the shim carries
+the argument as a `UInt32` (an immediate scalar, where a boxed `UInt64` allocated one object per field), so the
+sign comes back here from two's complement. -/
+private def signed (arg : UInt32) : Int :=
   let n := arg.toNat
-  if n ≥ 2 ^ 63 then (n : Int) - 2 ^ 64 else (n : Int)
+  if n ≥ 2 ^ 31 then (n : Int) - 2 ^ 32 else (n : Int)
 
 /-- The failure a libuv status names, spelled the way libuv spells it. -/
 private def libuvError (what : String) (status : Int) : IO IO.Error := do
@@ -389,7 +390,7 @@ def signalWatch (signum : Nat) (repeating : Bool) (cell : Task.Join Int) (push :
 /-- **Deliver one batch of shim events**, in the order the shim recorded them. An unrecognised kind, or an
 overflowed queue, is a defect in this file's contract with `c/netuv.c` rather than a connection's behaviour, so
 it throws and the loop thread dies loudly instead of continuing with a queue it cannot read. -/
-private def dispatch (loop : Std.Mutex Table) (evs : Array UInt64) : IO Unit := do
+private def dispatch (loop : Std.Mutex Table) (evs : Array UInt32) : IO Unit := do
   let mut i := 0
   while i + 2 < evs.size do
     let kind := evs[i]!
@@ -397,10 +398,10 @@ private def dispatch (loop : Std.Mutex Table) (evs : Array UInt64) : IO Unit := 
     let arg  := evs[i + 2]!
     i := i + 3
     match kind.toNat with
-    | 1 => arrive loop conn.toUInt32                                    -- accepted
-    | 2 => readDone loop conn.toUInt32 (signed arg)                     -- read completed
-    | 3 => opDone loop conn.toUInt32 (signed arg) .write                -- write completed
-    | 4 => opDone loop conn.toUInt32 (signed arg) .shutdown             -- shutdown completed
+    | 1 => arrive loop conn                                             -- accepted
+    | 2 => readDone loop conn (signed arg)                              -- read completed
+    | 3 => opDone loop conn (signed arg) .write                         -- write completed
+    | 4 => opDone loop conn (signed arg) .shutdown                      -- shutdown completed
     | 5 => throw (IO.userError "Io: the shim's event queue overflowed; the loop was not being drained")
     | 6 => noSlot loop                                                  -- no free connection slot
     | 7 => signalFired (signed conn)                                    -- a watched signal fired (signum in conn)

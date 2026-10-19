@@ -657,9 +657,9 @@ LEAN_EXPORT lean_object *np_uv_events(void) {
   if (g_ev_dropped && g_ev_n == 0) { push_ev(EV_OVERFLOW, 0, 0); g_ev_dropped = 0; }
   lean_object *arr = lean_mk_empty_array_with_capacity(lean_box((size_t)(3 * g_ev_n)));
   for (int i = 0; i < g_ev_n; i++) {
-    arr = lean_array_push(arr, lean_box_uint64(g_ev[i][0]));
-    arr = lean_array_push(arr, lean_box_uint64(g_ev[i][1]));
-    arr = lean_array_push(arr, lean_box_uint64(g_ev[i][2]));
+    arr = lean_array_push(arr, lean_box_uint32((uint32_t)g_ev[i][0]));
+    arr = lean_array_push(arr, lean_box_uint32((uint32_t)g_ev[i][1]));
+    arr = lean_array_push(arr, lean_box_uint32((uint32_t)g_ev[i][2]));
   }
   g_cnt[CNT_EVENTS] += (uint64_t)g_ev_n;
   g_ev_n = 0;
