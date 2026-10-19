@@ -845,6 +845,20 @@ Per request that is ~59 k instructions, and the profile's named contributors are
 (`lean_dec_ref_cold`, `lean_alloc_small_object_core`), GC marking (`lean_mark_mt`), malloc/free, and string
 building for the response (`lean_string_utf8_set`, `lean_string_append`, `Std.Http`'s `shouldKeepAlive`).
 
+**What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
+**12.07 µs** per request against Node's **8.92 µs**, but the same runtime and shim with **no protocol at all**
+(`hello keep`) cost **9.47 µs** — already more than Node's whole request. The HTTP layer is therefore only
+**2.6 µs** of the 12.07, and no amount of protocol work can close the C=1 gap on its own; the per-operation
+runtime path is the floor to attack. Two bounds on the protocol side: `encodeResponseHead` measures **235 ns**
+per call in isolation (2 % of a request, so rebuilding it cannot pay), and the profile's remaining protocol spend
+is refcount/alloc/free (~6.7 k Ir) — worth a few percent, not the 10 % needed. The runtime path's cost is the raw
+completion: per read and per write, a closure plus a `Std.Mutex (HashMap (conn, op) closure)` insert/erase and the
+executor/loop handoff. Replacing that with fixed per-connection slots holding a data state (the "data, not
+closures" design) is the change that can reach the ~1.2 µs a 10 % cut requires; an earlier Lean-side slot attempt
+collapsed to ~9 k rps — one request per millisecond per connection — which points at the driver's idle/liveness
+test around the slots rather than the storage shape, so it is a retry with the write-wait path now understood,
+not a repeat of a dead end.
+
 **Sustained load, the realistic shape.** One server at a time, pinned, driven back to back for 150 s at C=32 and
 120 s at C=1 (5 s samples, no gaps), to test whether leaving the server up favours ours:
 
