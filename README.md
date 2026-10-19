@@ -28,11 +28,13 @@ parse/frame/handler and the rest is the single carrier. More details here: [`doc
 
 ## Development Status
 
-**M2 closed, M3 under way** ([`PLAN.md`](docs/PLAN.md) §0, [`docs/decisions.md`](docs/decisions.md)). The
-pure model is implemented and machine-checked (`LeanIn/Model/`, `LeanIn/Theory/World.lean`) with an executable
-probe for its vacuity; `LeanIn/Theory/Bridge.lean` states the nine primitive contracts about the native
-operations, each with a control and three with native trace scenarios under `tests/`; and the runtime serves
-real connections on carriers of our own, which is what the table above measures.
+**The `asyncMachine` workplan is closed (M1–M5)** ([`docs/asyncmachine-workplan.md`](docs/asyncmachine-workplan.md)):
+sound authoring, composition, time as an effect, spawn and select, and accept — with the compiled server
+example and the authoring guide. The roadmap's own status is in [`PLAN.md`](docs/PLAN.md) §0. The pure model
+is implemented and machine-checked (`LeanIn/Model/`, `LeanIn/Theory/World.lean`) with an executable probe for
+its vacuity; `LeanIn/Theory/Bridge.lean` states the nine primitive contracts about the native operations, each
+with a control and three with native trace scenarios under `tests/`; and the runtime serves real connections
+on a carrier of our own, which is what the table above measures.
 
 ## Design
 
@@ -54,12 +56,15 @@ our version is **compiled** and not threaded through closures with `bind`.
 `asyncMachine` (`LeanIn/Async.lean`) lowers a `do` block to a **flat state machine**: with one constructor per
 suspension point, carrying the variables which live across invocations as *data* (after a liveness analysis); a `step`
 function the driver matches on; pure code inlined into the current state; and `if`, `while`, `for`, `break` and
-`continue` lowered to transitions between states. Suspensions are marked `await`. Parameters are either constant
-**step parameters** (the connection, the clock, the handler) or **threaded fields** (the H1 machine — state 0
-carries it and `recurse` passes its current value back, which is how keep-alive state survives across requests).
+`continue` lowered to transitions between states. Suspensions are marked `await`. Parameters are **threaded
+fields of state 0**: a parameter the body does not rebind keeps its value across `recurse` (the clock, the
+handler), and one it rebinds advances (the H1 machine — which is how keep-alive state survives across
+requests). The connection is the `step` function's own argument.
 
 A suspension allocates no `Join` cell, `Item`, inject or carrier fire. A completion **resumes its continuation
-on the loop thread** — raw delivery — so resuming is a direct call rather than a wakeup round trip.
+on the loop thread** — raw delivery — so resuming is a direct call rather than a wakeup round trip. That is
+also the scaling trade: every connection's steps and their resumes run on that one loop thread, which is the
+ceiling the measurements below read.
 
 Details are in [`docs/async-vm.md`](docs/async-vm.md).
 
@@ -96,7 +101,10 @@ or more. Until the store has it, the same commands can run through the toolchain
 `elan` provides at the same version; say which of the two ran.
 
 `lake build` also prints the `#print axioms` audit from `LeanIn/Theory/Bridge.lean`, reporting what the model's
-theorems rest on — currently only Lean's built-in `propext` and `Quot.sound`.
+theorems rest on: the pure-model theorems rest on Lean's `propext`, `Quot.sound` and `Classical.choice`, and
+the bridge theorems additionally name the primitive specifications they consume as axioms (`clock_spec`,
+`lock_spec`, `unlock_spec`, `wait_spec`, `notifyOne_spec`, `notifyAll_spec`) — the trusted base
+[`docs/proof-strategy.md`](docs/proof-strategy.md) describes.
 
 ## Run
 
@@ -107,8 +115,9 @@ nix develop -c lake exe server          # the HTTP server on our runtime, port 8
 nix develop -c lake exe stdServer       # the same response via the shipped Std.Http.Server, port 8090
 nix develop -c lake exe h1bench         # the head-parse microbenchmark
 nix develop -c lake exe defuncEcho      # the same echo: CPS closures against the compiled state machine
+nix develop -c lake exe hello           # the compiled `asyncMachine` server example, port 8085
 
-nix develop -c bash tests/executor-contract.sh SC1    # one scenario (SC1..SC22)
+nix develop -c bash tests/executor-contract.sh SC1    # one scenario (SC1..SC27)
 nix develop -c bash tests/bridge-contract.sh BT1      # one native trace scenario (BT1..BT3)
 
 nix fmt                                 # treefmt over nix, shell, markdown and TOML
@@ -127,15 +136,16 @@ executor scenarios independently.
 
 ## Benchmark
 
-`bench/threeway.sh` runs every arm on this box inside one invocation, in the same mode — a per-request handler,
-`bench/load.mjs` in keep-alive, `5 s` per point:
+`bench/threeway.sh` runs every arm on this box inside one invocation, in the same mode — a keep-alive
+per-request handler, `bench/load.mjs`, `5 s` per point — across four arms: Node, the compiled driver, the
+shipped `Std` server, and the compiled example (`hello keep`):
 
 ```sh
 nix develop -c bash bench/threeway.sh          # levels 1 8 32
 nix develop -c bash bench/threeway.sh 1 4 16   # chosen levels
 ```
 
-The table at the top of this file is that driver's settled output. Read the ratios, not the absolute figures:
+The table at the top of this file is that four-arm run's output. Read the ratios, not the absolute figures:
 this instrument's run-to-run spread is ±30 % ([`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.7), and a run
 taken on a loaded box reads depressed — an earlier four-way of this shape was recorded at load average 4.8–6.0
 and §4 carries the settled re-run beside it.
@@ -150,7 +160,7 @@ and §4 carries the settled re-run beside it.
 | [`PLAN.md`](docs/PLAN.md) | The plan, the roadmap, and the status |
 | [`docs/decisions.md`](docs/decisions.md) | D0–D22, all closed, each with its evidence — and the limits each entry leaves open |
 | [`docs/interface.md`](docs/interface.md) | The fixed interface: one spec, two implementations |
-| [`docs/tokio-workplan.md`](docs/tokio-workplan.md) | The nine deliverables of the current milestone, with the evidence each requires |
+| [`docs/tokio-workplan.md`](docs/tokio-workplan.md) | The eighteen deliverables of the current milestone, with the evidence each requires |
 | [`docs/proof-strategy.md`](docs/proof-strategy.md) | Property ladder, three-layer architecture, trusted base, the hard parts |
 | [`docs/primitive-theory.md`](docs/primitive-theory.md) | What the externs guarantee: axioms, discharge, control tests |
 | [`docs/tokio-map.md`](docs/tokio-map.md) | What we are taking from Tokio, component by component, with line anchors |
