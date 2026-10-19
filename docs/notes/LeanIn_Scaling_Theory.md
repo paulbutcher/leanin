@@ -155,12 +155,15 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
 wins when replaced locally; every micro-change measured parity or worse.
 
-**Growing the maps out of Lean (approach 1, failed).** Replacing the raw-registration `HashMap` with a fixed
-Lean `Array` and take-out discipline was measured at **~9 k rps at both C=8 and C=32 (0/5 wins)** against a
-120–140 k baseline: the 16 k-entry array is still copied per operation, so `Array.set!` under this mutation
-pattern is not in-place. The copy the profile attributes at C=32 (10 %) therefore cannot be removed from Lean
-source; the storage has to live on the C side (`conn_t` slots with `lean_inc`/`lean_dec`), which also subsumes
-the stall map and the merged per-connection slot.
+**Slot arrays for raw registration (approach 1, failed in three shapes).** Fixed-slot storage replacing the
+`HashMap`, in a mutex with take-out, in a bare `IO.Ref` with `modifyGet`, and with explicit `get`/`set` — each
+measured **~9 k rps at C=8 and C=32 (0/5 wins)** against a 120–140 k baseline, at ~104 µs CPU/request. Micro
+benchmarks show all three mutation shapes are cheap in isolation (400–970 ns on a 16 k array), and the 9 k figure
+with eight connections is one request per millisecond per connection — the driver's idle poll — so the variants
+are not copying: they are being served off the 1 ms tick instead of the epoll wake. The registration substitution
+breaks the prompt-completion path in a way not resolved here, and it is not a copying problem. Abandoned; the
+HashMap stays, and the C=32 growth has no validated fix yet. The reusable response buffer (approach 4) is the
+next Lean-side item.
 
 **Keep-armed reads: landed, +5–6 % at depth 1.** The shim arms a connection's read once, buffers arrivals,
 delivers one event per pending read, drains on `np_uv_take` and re-arms, with a 256 KiB backpressure cap. The
