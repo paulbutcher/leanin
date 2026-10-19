@@ -232,6 +232,7 @@ private inductive Eff where
   | newCell                     -- `RawCell.new` → a fresh completion cell
   | resolve (cell : Term) (v : Term)  -- `RawCell.resolve cell v` → first-wins resolution
   | select (h0 : Term) (h1 : Term)  -- `VM.selectRaw h0 h1` → the winning index and value
+  | accept (l : Term) (push : Term)  -- `Io.acceptRaw l push` → the accepted connection (or an error)
   | sendAll (data : Term)
   | send (data : Term)
   | close
@@ -247,6 +248,7 @@ private def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   | `(LeanIn.Runtime.Io.sleepRaw $s $d) => pure (.sleep ⟨s⟩ ⟨d⟩)
   | `(LeanIn.Runtime.VM.runAsync $m) => pure (.runVM ⟨m⟩)
   | `(LeanIn.Runtime.selectRaw $a $b) => pure (.select ⟨a⟩ ⟨b⟩)
+  | `(LeanIn.Runtime.Io.acceptRaw $l $push) => pure (.accept ⟨l⟩ ⟨push⟩)
   | `(LeanIn.Runtime.RawCell.await $h) => pure (.join ⟨h⟩)
   | `(LeanIn.Runtime.RawCell.new) => pure .newCell
   | `(LeanIn.Runtime.RawCell.resolve $cell $v) => pure (.resolve ⟨cell⟩ ⟨v⟩)
@@ -473,10 +475,12 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
   match eff with
   | .recv =>
     let bv := bnd.getD `bs
-    -- The auto-close after an end of stream or a failure is cleanup on a connection whose peer is already
-    -- gone; its result is discarded. The shim refuses a close only with the loop down or the submit queue
-    -- full (`MAX_SUBMIT`) — both runtime-wide states, which the loop already fails loudly on its own
-    -- convention (a refused cleanup close in `readDone`/`opDone` kills the loop thread deliberately).
+    -- Cleanup ownership is single on every failure path. A *completion* failure is closed by the loop
+    -- (`readDone` and `opDone` close after the raw callback and raise if the shim refuses), and a *submission
+    -- refusal* is closed by the primitive itself before it resumes — so the generated error arms do nothing;
+    -- closing here too would submit a second close for one failure. The end-of-stream arm is the machine's
+    -- own: nobody else closes a connection whose peer simply left, so it closes, and a refusal is raised
+    -- (`closeAfterFailure`) because a refused cleanup leaves the connection open with a step that has ended.
     -- A pattern cannot carry the ascription, so it is checked in the branch body.
     let checked : MacroM Term :=
       match ty? with
@@ -485,8 +489,8 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
     let body ← checked
     `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
         | .ok (some $(mkIdent bv)) => $body
-        | .ok none => discard (LeanIn.Runtime.Io.closeRaw $c)
-        | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
+        | .ok none => LeanIn.Runtime.Io.closeAfterFailure $c
+        | .error _ => pure ()))
   | .recvTimeout sched d z =>
     let bv := bnd.getD `r
     let k ← annot bv
@@ -541,6 +545,10 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
     let bv := bnd.getD `v
     let k ← annot bv
     `(LeanIn.Runtime.selectRaw $h0 $h1 $k)
+  | .accept l push =>
+    let bv := bnd.getD `c
+    let k ← annot bv
+    `(LeanIn.Runtime.Io.acceptRaw $l $push $k)
   -- A failed write ends the connection rather than continuing as if the bytes were sent — unless the body
   -- bound the effect's result (`let r := await …`), in which case the whole `Except` is delivered and the
   -- body owns the outcome.
@@ -552,7 +560,7 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
     | none =>
       `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun
           | .ok _ => $cont
-          | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
+          | .error _ => pure ()))
   | .send d =>
     match bnd with
     | some bv =>
@@ -561,7 +569,7 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
     | none =>
       `(LeanIn.Runtime.Io.sendRaw $c $d (fun
           | .ok _ => $cont
-          | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
+          | .error _ => pure ()))
   | _ => Macro.throwError "asyncMachine: unsupported effect"
 
 /-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, `halt`, or a close — so
@@ -782,7 +790,7 @@ private partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List (Name
 end
 
 /-- `asyncMachine name (c : Conn) (x : T) … := do …` — lower the body to a state machine. -/
-elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedBinder* " := " body:doSeq : command => do
+elab "asyncMachine " n:ident " (" c:ident " : " cty:term " )" params:bracketedBinder* " := " body:doSeq : command => do
   -- The threaded parameters (each `(x : T)`), with their signature types. The names are scope-erased: a
   -- `bracketedBinder` parameter and the body's references to it can carry different macro scopes (an
   -- inline-parsed parameter like the connection does not), which would leave a state field unresolvable.
@@ -821,14 +829,16 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
     let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
     `(matchAltExpr| | $patTerm => $(st.body)))
   -- The step takes the connection alone; the threaded fields (every parameter) live in the states.
-  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) : $sn → IO Unit :=
+  -- The first parameter's own type: a connection for a connection loop, a listener for an accept loop — the
+  -- step carries whatever the body's first value is, and the body names it by the declared identifier.
+  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : $cty) : $sn → IO Unit :=
     fun st => match st with
       $matchAlts:matchAlt*)
   Lean.Elab.Command.elabCommand stepCmd
   -- The run passes the connection to `step`, and the threaded fields (every parameter) to state 0.
   let tfArgs := threaded.toArray.map (fun x => (mkIdent x : Term))
   let s0app ← if tfArgs.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $tfArgs*)
-  let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $params* : IO Unit :=
+  let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : $cty) $params* : IO Unit :=
     $stepn $(mkIdent c.getId) $s0app)
   Lean.Elab.Command.elabCommand runCmd
   -- A spawner, when the machine is callable: its last parameter is the continuation `(α → IO Unit)`, so
@@ -851,7 +861,7 @@ elab "asyncMachine " n:ident " (" c:ident " : " _cty:term " )" params:bracketedB
         pure cell)
       let spawnCmd ← `(def $spawnn:ident
         ($(mkIdent `push) : LeanIn.Task.Item → BaseIO Unit)
-        ($(mkIdent c.getId) : LeanIn.Runtime.Conn) $binders* :
+        ($(mkIdent c.getId) : $cty) $binders* :
           IO (LeanIn.Runtime.RawCell $_arg) := $body)
       Lean.Elab.Command.elabCommand spawnCmd
       modifyEnv fun env => LeanIn.Async.spawnAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `spawn))

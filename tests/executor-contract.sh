@@ -4785,7 +4785,7 @@ check_sc25() {
     fail "SC25 Then (O2): joining the second-spawned handle first did not reverse the payloads" \
       "expected AAABBB — the same spawns, the join order swapped; a completion-order collector cannot produce both orders" \
       "observed: [$body_b]"
-  printf "SC25 ok: join order governs (0->BBBAAA, 1->AAABBB), both unbounded; the same client's bound fired on the control (%s)\n" "$control"
+  printf "SC25 ok: join order governs (0->BBBAAA, 1->AAABBB), both within the 5 s bound; the same client's bound fired on the control (%s)\n" "$control"
 }
 
 # --- SC26 — select: first-wins over two cells, with registration order as the tie rule ————————————————
@@ -4848,7 +4848,79 @@ check_sc26() {
     fail "SC26 Then (O2): registration order is not the tie rule, or the value is not the winner's" \
       "expected B0zero — both cells resolved before the select, so the first registered wins, with that cell's payload" \
       "observed: [$b]"
-  printf 'SC26 ok: first-resolved wins with its value (A1one), registration order ties (B0zero), both unbounded; control bound=%s\n' "$control"
+  printf 'SC26 ok: first-resolved wins with its value (A1one), registration order ties (B0zero), both within the 5 s bound; control bound=%s\n' "$control"
+}
+
+
+# --- SC27 — the compiled server: bind, serve, a handler ————————————————————————————————————————————————
+# Request and expected bytes live in files so neither passes through command substitution (which strips
+# trailing newlines): the comparison is a byte-for-byte `cmp`.
+ec_client_file() { # <port> <payload-file|-> <watchdog-seconds> <body-file>
+  # The socket read itself carries no bound: the watchdog bounds the invocation, not the assertion.
+  timeout "$3" python3 - "$1" "$2" >"$4" 2>"$4.err" <<'PY'
+import socket, sys
+port, plfile = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(('127.0.0.1', port), timeout=None)
+if plfile != "-":
+    s.sendall(open(plfile, 'rb').read())
+buf = b''
+while True:
+    d = s.recv(4096)
+    if not d:
+        break
+    buf += d
+s.close()
+sys.stdout.buffer.write(buf)
+PY
+}
+
+check_sc27() {
+  local status_a status_b pid i ready control
+  lake build hello >/dev/null 2>&1 ||
+    setup_error "SC27: hello did not build" "invocation: lake build hello"
+  if (exec 3<>/dev/tcp/127.0.0.1/8397) 2>/dev/null; then
+    exec 3>&- 3<&-
+    setup_error "SC27: port 8397 is already owned before the server starts" \
+      "a leftover or unrelated listener; the check does not kill what it did not start"
+  fi
+  pid=""
+  ./.lake/build/bin/hello 8397 >/tmp/sc27_server.log 2>&1 &
+  pid=$!
+  trap '[ -n "${pid:-}" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; }' EXIT
+  ready=0
+  for i in $(seq 1 40); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8397) 2>/dev/null; then exec 3>&- 3<&-; ready=1; break; fi
+    sleep 0.25
+  done
+  [ "$ready" = 1 ] || {
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    setup_error "SC27: hello did not listen on 8397 in time" "log: $(tail -2 /tmp/sc27_server.log)"
+  }
+  printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' > /tmp/sc27_req
+  printf 'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello' > /tmp/sc27_expected
+  ec_client_file 8397 /tmp/sc27_req 20 /tmp/sc27_a; status_a=$?
+  ec_client_file 8397 /tmp/sc27_req 20 /tmp/sc27_b; status_b=$?
+  ec_client 8397 "" 1 /tmp/sc27_ctl; control=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+  trap - EXIT
+  [ "$control" = 124 ] ||
+    setup_error "SC27: the client's own bound did not fire on a connection that sends nothing" \
+      "control exit=$control" "the handler waits for a request, so a silent connection must time out"
+  # O3: the read carries no socket bound; a watchdog hit is the completion proposition's failure.
+  [ "$status_a" = 0 ] ||
+    fail "SC27 Then (O3): the first exchange did not reach end of stream within the invocation watchdog" \
+      "client status=$status_a (124 is the watchdog; the read itself is unbounded)" \
+      "body: $(od -An -c /tmp/sc27_a | head -2)"
+  [ "$status_b" = 0 ] ||
+    fail "SC27 Then (O3): the second exchange did not reach end of stream within the invocation watchdog" \
+      "client status=$status_b" "body: $(od -An -c /tmp/sc27_b | head -2)"
+  cmp -s /tmp/sc27_a /tmp/sc27_expected ||
+    fail "SC27 Then (O1): the first response is not the pinned bytes" \
+      "expected: $(od -An -c /tmp/sc27_expected)" "observed: $(od -An -c /tmp/sc27_a)"
+  cmp -s /tmp/sc27_b /tmp/sc27_expected ||
+    fail "SC27 Then (O2): the accept loop did not answer the second connection byte-exactly" \
+      "expected: $(od -An -c /tmp/sc27_expected)" "observed: $(od -An -c /tmp/sc27_b)"
+  printf 'SC27 ok: compiled server answered twice byte-exactly, both reached EOF (watchdog not hit); control bound=%s\n' "$control"
 }
 
 # --- SC24 — time as an effect: sleeps and deadline races at the harness clock's stated instants ————————
@@ -4955,9 +5027,10 @@ SC22) check_sc22 ;;
 SC23) check_sc23 ;;
 SC25) check_sc25 ;;
 SC26) check_sc26 ;;
+SC27) check_sc27 ;;
 SC24) check_sc24 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23|SC24|SC25|SC26\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23|SC24|SC25|SC26|SC27\n' >&2
   exit 2
   ;;
 esac

@@ -53,4 +53,6 @@ lean_exe stdServer where
   root := `LeanIn.Exe.StdServer
   moreLinkArgs := #["-luv"]
 
+lean_exe hello where root := `LeanIn.Exe.Hello
+
 lean_exe h1bench where root := `LeanIn.Exe.H1Bench

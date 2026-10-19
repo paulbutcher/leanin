@@ -2123,9 +2123,10 @@ which connects, optionally sends, and reads to EOF under a bound — serves both
 
 **When.** Two connections on the same server: one sends `0`, one sends `1`.
 
-**Then.** The answers are `BBBAAA` and `AAABBB`, both completed unbounded.
+**Then.** The answers are `BBBAAA` and `AAABBB`, both completed within the client's 5 s bound (which did not
+fire).
 
-- **SC25-O1, completion and through-reach.** Neither read hit the client's bound: the boot items reached the
+- **SC25-O1, completion and through-reach.** Neither read hit the client's 5 s bound: the boot items reached the
   executor through the app's inject and their resolutions resumed the parked parent. The detector is the
   client's own bound, and its affirmative control in the same invocation is that same client against a `cps`
   echo with an empty request and a 1 s bound, which must exit 124. This asserts **reach**, not the wake:
@@ -2158,15 +2159,16 @@ detector as SC25, with the same `cps`/1 s-bound control in the same invocation.
 
 **When.** Two connections on the select server carrying `A` and `B`, each read to its end under a bound.
 
-**Then.** The answers are `A1one` and `B0zero`, both completed unbounded.
+**Then.** The answers are `A1one` and `B0zero`, both completed within the client's 5 s bound (which did not
+fire).
 
 - **SC26-O1, first-resolved wins, with its value.** `A1one`: the cell resolved before the select resumed it
   with index 1 and with that cell's payload, even though the other cell registered first; the loser's later
   resolution produced no second resume (the answer carries one pair and the connection ends).
 - **SC26-O2, registration order is the tie rule.** `B0zero`: with both cells already resolved, the first
   registered cell wins, with its own payload, as `Task.select` documents.
-- **SC26-O3, completion.** Both reads completed unbounded: neither select nor the loser's parked waiter held
-  the connection open.
+- **SC26-O3, completion.** Both reads completed within the 5 s client bound: neither select nor the loser's
+  parked waiter held the connection open.
 
 **Controls, in the same invocation.** (i) The two clauses report different winners and payloads (`1one`
 then `0zero`), so the winner field is a reading rather than a constant. (ii) The bound detector is the same
@@ -2175,3 +2177,35 @@ client under a 1 s bound against a silent `cps` connection, which must exit 124.
 **Limits, stated.** The loser's parked waiter remains registered until its cell resolves and then no-ops; the
 scenario observes that no second resume reaches the machine, not the waiter's storage. The select's value type
 is the cells' own, and the tie rule is the registration order of the two awaits in `selectRaw`.
+
+### SC27 — the compiled server: bind, serve, a handler
+
+**Actor.** `lake exe hello <port>` (`LeanIn/Exe/Hello.lean`): a compiled accept loop (`helloServe`) parks on
+`Io.acceptRaw`, spawns `helloConn` per accepted connection through the app's inject, and recurses; the
+connection machine reads the request, writes one fixed response, closes, and reports the close to the spawn
+handle. No `Std.Http.Server` and no stock `Task` is in the serving path.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC27`, on loopback. The exchanges use a client
+whose socket read carries **no bound**, so the request and the expected response travel as files and the
+comparison is `cmp` (byte-for-byte; no command substitution can strip or rewrite bytes). The invocation is
+watchdogged at 20 s, and a watchdog hit fails O3 — the completion proposition is asserted without a socket
+bound, under a watchdog whose firing is itself the observation that the stream never ended. The control uses
+the bounded `ec_client` against a silent connection.
+
+**When.** Two sequential connections, each sending the four-line request
+`GET / HTTP/1.1` / `Host: 127.0.0.1` / `Connection: close` / an empty line, from a file.
+
+**Then.** Each connection reads, byte-for-byte, `HTTP/1.1 200 OK`, `Connection: close`,
+`Content-Length: 5`, an empty line, then `hello`; both reads reached end of stream.
+
+- **SC27-O1, the response.** Both exchanges are byte-exact against the pinned response, so the handler's
+  write and the close are both observed by the client.
+- **SC27-O2, the loop recurs.** The second connection is accepted and answered after the first: the accept
+  loop resumed and recursed, and its per-connection spawn ran as an executor item.
+- **SC27-O3, completion.** Both reads reached end of stream and the invocation watchdog did not fire; the
+  control is the bounded client under a 1 s bound against a connection that sends nothing, which must exit 124 — the handler waits for a request, so an
+  unanswered connection is the detector's affirmative case.
+
+**Limits, stated.** The scenario reads the compiled path's own output on a real socket; it does not compare
+throughput (that is `bench/threeway.sh`'s separate instrument, run in CI). The response is fixed, so nothing
+here exercises the HTTP protocol machine — SC19/SC20 do.

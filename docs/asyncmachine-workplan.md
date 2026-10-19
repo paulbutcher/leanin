@@ -78,9 +78,8 @@ rather than multiplying the silent-wrongness surface.
   distinguish cell from no-cell by thread, and the multi-carrier entry does not serve (the recorded
   `runCarriers` defect), so that distinction is stated as a limit, not claimed.
 - **Evidence**: SC23 (`tests/executor-contract.md`, with its shell fixture): the composed byte stream in
-  order with the read's own bound recorded (`bounded == no`, SC20-O3's idiom), the tid records above, a staged
-  behavior red (`onDone` dropped ⇒ `bounded=yes`, only the first echo arrives — the scenario's own assertion)
-  and the pre-M2 surface rejection both observed. The direct-continuation shape was chosen over cell-parking
+  order with the read's own bound recorded (`bounded == no`, SC20-O3's idiom) and the tid records above. The
+  direct-continuation shape was chosen over cell-parking
   before implementation and the reading confirms it costs nothing: same-session C=8, one machine call per
   request — **197322 rps** against 195801 rps for the same loop with the write inline and 182624 rps for the
   interpreted `VM` echo (the call is within noise of free; the interpreted hop costs ~7% — 1 −
@@ -95,8 +94,7 @@ rather than multiplying the silent-wrongness surface.
 - **Acceptance met**: SC24 — a machine that sleeps between writes (`dl|`) and one whose operation loses a
   timeout race (`st|`), both driven by `HarnessClock`, each asserted at the harness clock's stated instant
   (`at == delay`, `at == stall`) with the same client-read detector reporting bytes in one clause and none in
-  the other. Red: the sleep cut (`at=0` vs `delay=30`, the fixture's own assertion) and the pre-M3 surface
-  rejection (`unsupported effect in await`) both observed.
+  the other.
 - **Two runtime facts the milestone surfaced**: a harness instant lives in the clock's own list, not libuv's
   wheel, so the thread that must reach it is the *driver* parked on the executor's condvar — `HarnessClock.clockWithWake`
   composes the schedule with the inject nudge such a park needs (a bare `npUvWheelWake` would end the loop
@@ -131,14 +129,10 @@ rather than multiplying the silent-wrongness surface.
   `won` flag makes the loser's later resolution a no-op). The spawn's substrate is the executor's own inject
   (`Runtime.sharedPush`) rather than `Task.Async.spawn`, which needs a `Ctx` route a compiled step does not
   carry; the wake is the same push a parked driver is woken by, so no new wake rule was introduced.
-- **Red observations** (isolated throwaway copy, `/tmp`, fresh build): (i) cutting the generated spawn's push
-  — the child's boot never reaches an executor item — makes SC25's client bound fire (`exit 124`, empty
-  body): the scenario's own O1 assertion (`bounded == no`) fails; (ii) reversing `selectRaw`'s registration
-  order makes SC26's tie clause answer `B1`/`B1one` instead of `B0`/`B0zero`; (iii) swapping `amSpawn`'s `0`
-  clause join order makes it answer `AAABBB`, failing SC25's O2 assertion on the `BBBAAA` bytes. All are the
-  scenarios' own assertions, not scaffolding failures. The through-reach cut is an enqueue cut, not a
-  wake-only cut: SC25's bound detects a push that never reaches the executor, and the parked-wake rule is
-  `sharedPush`'s, exercised by SC2 (an injected completion waking a waiting `blockOn`), with SC18's
+- **Wake rule**: spawn adds no wake path — it calls the same inject every other push uses. SC25's completion
+  assertion reaches a push that does not reach the executor (a through-reach reading, not a wake-only one,
+  because the parent enqueues while running and a driver drains queued work before parking); the parked-wake
+  rule is `sharedPush`'s, exercised by SC2 (an injected completion waking a waiting `blockOn`), with SC18's
   non-carrier wake beside it, rather than re-proved here.
 - **Scenario evidence**: SC25 (`defuncEcho … spawn`) serves identical children with two join orders and
   answers `BBBAAA` for `0` and `AAABBB` for `1` — a completion-order collector would give one order in both,
@@ -167,6 +161,20 @@ rather than multiplying the silent-wrongness surface.
 - **Acceptance**: the example builds and serves; CI runs the threeway and the contract suite on the example's
   path; the guide's every command executes (the repo's documentation rule).
 - **Evidence**: the example's scenario, the CI job, the guide's commands run and recorded.
+- **Landed**: `Io.acceptRaw l push` is the callback form of accept — an arrived connection resumes in the
+  step, a parked accept resumes through the app's inject when the loop delivers — so a compiled accept loop
+  needs no stock task. The machine syntax's first parameter is now typed by its declaration rather than fixed
+  to `Conn`, which lets an accept loop carry its listener; connection loops are unchanged. `lean_exe hello`
+  (`LeanIn/Exe/Hello.lean`) binds, serves and answers with three machines — `helloConn`, `helloServe`
+  (accept, spawn per connection, recurse), and the per-connection spawn as an executor item. `SC27` drives
+  it over loopback: two sequential connections each read the pinned HTTP response byte-exactly (`cmp`
+  against a byte file), with no socket bound on the read, the invocation's 20 s watchdog as the completion
+  detector, and a silent connection under a 1 s client bound as the detector's control.
+- **Guide**: `docs/asyncmachine-guide.md` names the effect set, the threading and ascription rules, the loud
+  failures, the runtime you need, and the limits; every command it displays names its own inputs.
+- **CI**: the scenario job's list runs through `SC27`, and the same job runs `bench/threeway.sh` (one level)
+  after the scenario loop, because the comparison needs the `server`/`stdServer` binaries and libuv, not a
+  ratio gate.
 
 ## 3. What each model is for, after this lands
 

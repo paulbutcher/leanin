@@ -594,6 +594,23 @@ def accept (l : Listener) : Task.EAsync IO.Error Conn :=
           | .ok _               => .error (.userError "Io.accept: the loop delivered a mismatched completion")
           | .error e            => .error e) ctx') ctx⟩
 
+/-- **Accept, raw**: the callback form of `accept`, for compiled machines. An already-arrived connection is
+handed over in this step; otherwise the accept parks and the loop delivers the resume through `push` — the
+app's inject — when a connection arrives. A resume therefore runs as an executor item on a carrier, never on
+the loop thread. -/
+def acceptRaw (l : Listener) (push : Task.Item → BaseIO Unit)
+    (resume : Except IO.Error Conn → IO Unit) : IO Unit := do
+  let cell ← (Task.Join.new : IO (Task.Join (Except IO.Error Result)))
+  match ← claim l cell push with
+  | .error e       => resume (.error e)
+  | .ok (some idx) => resume (.ok ⟨idx, l.loop⟩)
+  | .ok none =>
+    let ctx := Task.Ctx.at (← Task.Cancel.new) (fun _ it => push it) push {} 0
+    Task.Join.onReady cell ctx (fun r _ => resume (match r with
+      | .ok (.accepted idx) => .ok ⟨idx, l.loop⟩
+      | .ok _               => .error (.userError "Io.acceptRaw: the loop delivered a mismatched completion")
+      | .error e            => .error e))
+
 /-- **Accept without waiting**: a connection the loop has already accepted and no accept has claimed, or `none`.
 This is the non-blocking attempt `Runtime.serveUntilStopped` polls with, so its cost is the table's lock and not
 a scheduling round; a connection still in the kernel's backlog is `none` until the loop reports it, which is the
@@ -624,16 +641,23 @@ def recv (c : Conn) (size : UInt64) : Task.EAsync IO.Error (Option ByteArray) :=
             | .ok _         => .error (.userError "Io.Conn.recv: the loop delivered a mismatched completion")
             | .error e      => .error e) ctx') ctx⟩
 
+/-- **A submission the loop refused owns its own cleanup.** This path never reaches `readDone`/`opDone` — no
+completion will arrive — so the primitive closes the connection here, and a shim that refuses the close too is
+raised: the alternative is a connection left open with a step that has ended. -/
+private def closeOnRefusal (c : Conn) (what : String) : IO Unit := do
+  unless (← npUvClose c.idx) == 1 do
+    throw (IO.userError s!"Io: the shim refused the cleanup close of connection {c.idx} after {what}")
+
 /-- **Receive, raw** (defunctionalization experiment): like `recv`, but `resume` runs *on the loop thread* —
 no `Join` cell, `Item`, inject or carrier hop. The bytes arrive by the same `read`/`readDone` shim path; only the
-delivery is different. This and `sendRaw` measure what the `Join`-cell delivery costs against a direct resume. -/
-def recvRaw (c : Conn) (size : UInt64) (resume : Except IO.Error (Option ByteArray) → IO Unit) : IO Unit := do
+delivery is different. This and `sendRaw` measure what the `Join`-cell delivery costs against a direct resume. -/def recvRaw (c : Conn) (size : UInt64) (resume : Except IO.Error (Option ByteArray) → IO Unit) : IO Unit := do
   registerRaw c.idx .read (fun r => resume (match r with
     | .ok (.read d) => .ok d
     | .ok _         => .error (.userError "Io.recvRaw: the loop delivered a mismatched completion")
     | .error e      => .error e))
   unless (← npUvRead c.idx size) != 0 do
     withdrawRaw c.idx .read
+    closeOnRefusal c "a refused read submission"
     resume (.error (.userError "Io.recvRaw: the loop refused a read submission"))
 
 /-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. A refused submission
@@ -644,6 +668,7 @@ def sendRaw (c : Conn) (data : ByteArray) (resume : Except IO.Error Unit → IO 
     | .error e => .error e))
   unless (← npUvWrite c.idx data) != 0 do
     withdrawRaw c.idx .write
+    closeOnRefusal c "a refused write submission"
     resume (.error (.userError "Io.sendRaw: the loop refused a write submission"))
 
 /-- **Sleep, raw**: resume after `d` on the clock's `schedule` (passed in so this file does not import the
@@ -659,6 +684,17 @@ def sleepRaw (schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit
 the shim accepted the submission, `false` when it refused -- a caller that reports a clean close must read it,
 because a refused close left the handle's end unreported. -/
 def closeRaw (c : Conn) : IO Bool := return (← npUvClose c.idx) == 1
+
+/-- **Close a connection a step is done with, loudly.** The cleanup a failed write or an end of stream owes:
+`closeRaw` answers `false` when the loop refuses the submission (the loop is stopped, or its submission queue
+is full, `MAX_SUBMIT`), and that refusal leaves the connection open while the step that owned it has ended —
+a state no reader of the connection can be told about. So the refusal is raised rather than discarded, naming
+the connection; a caller that genuinely has nothing to do with a refusal is the loop's own teardown, which has
+already ended. -/
+def closeAfterFailure (c : Conn) : IO Unit := do
+  unless ← closeRaw c do
+    throw (IO.userError
+      s!"Io.closeAfterFailure: the loop refused the cleanup close of connection {c.idx} — it is left open")
 
 /-- **Receive with a deadline, raw**: race a read against a timer armed via `schedule` (a clock's `schedule`,
 passed in so this file does not import the clock seam). The first to fire wins: a completed read cancels the
@@ -692,6 +728,7 @@ def sendAllRaw (c : Conn) (chunks : Array ByteArray) (resume : Except IO.Error U
     | .error e => .error e))
   unless (← npUvWritev c.idx chunks) != 0 do
     withdrawRaw c.idx .write
+    closeOnRefusal c "a refused write submission"
     resume (.error (.userError "Io.sendAllRaw: the loop refused a write submission"))
 
 /-- **Send one buffer**, awaiting its completion. The bytes are copied into memory the write request owns at the
