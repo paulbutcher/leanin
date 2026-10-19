@@ -866,15 +866,18 @@ free. It measured **0.968 at C=1 and 0.871 at C=32** against the HashMap build: 
 `Std.Mutex` are slower than the hash insert they replace even when the array is small, so the shape is rejected
 on its own merits rather than on a bug. The registry is not where the floor is.
 
-**Thread topology: the request path is single-threaded, and the earlier two-core reading is withdrawn.** The
-runtime runs three OS threads under the benchmark: Lean's initial thread (parked), the driver thread, and an idle
-pump. The **driver thread is the loop and the handler** — the non-quiet server prints the handler's thread id and
-it is the same thread that drives `blockOnIo` and burns the CPU (154 of 156 ticks in a two-second window) — so
-the request path is single-threaded, as `blockOnIo`'s design states. An experiment giving the process a second
-core first read 1.037 at C=1, but a control comparing one core against another read 0.965, and with one busy
-thread there is no mechanism for a second core to help: the earlier figure was placement and host noise and is
-withdrawn. The idle pump thread never exits even when `takeover` asks it to; that is noted as a defect (an idle
-thread, not a throughput cost) rather than treated as parallelism.
+**Thread topology: the request path is single-threaded.** The runtime shows three OS threads under the
+benchmark: the initial thread (parked in `futex`), the driver thread, and one idle thread parked in `ep_poll`
+whose creator is not yet identified. The **driver thread is the loop and the handler** — the non-quiet server
+prints the handler's thread id and it is the same thread that drives `blockOnIo` and burns the CPU (154 of 156
+ticks in a two-second window) — so the request path is single-threaded, as `blockOnIo`'s design states. The pump
+started by `startListener` (needed only in the window between `bind` and the driver's `takeover`) is asked to
+quit and does: traced with the synchronized flags, it enters and exits, and its id is absent afterwards. It is not
+the idle thread. The executor worker is excluded too: `workers := 0` still leaves three threads while the server
+serves correctly. So the extra threads are runtime scaffolding, one still unnamed; a literally single-threaded
+process would need Lean's own initial thread and that one removed, which is outside this runtime. An experiment
+giving the process a second core read 1.037 at C=1, but a one-core control read 0.965 and only one thread does
+work, so that figure was placement and host noise and is withdrawn.
 
 That investigation did surface a real violation: `pumpQuitRef` and `driverActiveRef` were plain `IO.Ref Bool`s
 written by the driver's thread and read by the pump thread and carriers — the cross-thread-state rule this
