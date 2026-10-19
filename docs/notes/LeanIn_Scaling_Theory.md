@@ -155,6 +155,13 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
 wins when replaced locally; every micro-change measured parity or worse.
 
+**Keep-armed reads: no measured win.** The shim was changed (scratch copy) to arm a connection's read once and
+buffer arrivals, delivering one event per pending read and re-arming after a take, with a 256 KiB backpressure
+cap. It is correct — SC19/20/23/24/27 and the diagnostics pass — but depth-1 throughput is indistinguishable from
+the one-read-per-submission shim (111.7–117.4 k baseline against 106.2–122.5 k, 7.9–8.2 µs either way) and depth
+16 differs only inside the spread. So the `epoll_ctl` pair was **not** the dominant part of the 5.1 µs per-event
+tax; the park/wake between completions and the write submission are what remain. Not landed.
+
 **Wake checks (does I/O wake the loop correctly?).** A missed wake shows up as latency quantised at the poll
 timeout, so each shape was measured with the *same client* against Node as the control: busy (20 k requests),
 5 ms gaps, and 100 ms idle. LeanIn: p50 11 µs / p99 20 / p99.9 72 busy, p99 1.07 ms gapped, p50 242 µs idle;
