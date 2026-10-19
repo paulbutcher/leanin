@@ -20,17 +20,15 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 |---|---|---|---|
 | Node 22 | 70 018 | 146 999 | 150 085 |
 | **leanin** | **77 891** | **114 058** | **104 369** |
-| compiled example, no parsing (`lake exe hello … keep`) | 77 150 | 197 070 | 168 592 |
 | shipped `Std.Http.Server` | 5 163 | 5 773 | 7 577 |
 
 **leanin is level with Node at one connection** (1.11× in the row above, inside the instrument's spread at that
 level) **and reads 0.78× and 0.70× of it at eight and thirty-two, while being 14–20× the Lean HTTP server that
 ships with the toolchain.** p50 is 12 µs for both servers at C=1, and
-44 µs (Node) against 63 µs (leanin) at C=8. The driver is itself a compiled `asyncMachine`; the no-parse row is
-the same compiler answering a fixed response, and it beats Node at every level — which places the gap in the
-protocol work: the driver spends 8.2 µs of CPU per request against Node's 6.7 µs and the no-parse control's
-4.8 µs, so ~3.4 µs per request is parse, pump and handler. How the numbers are taken, and the shapes where we
-are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+44 µs (Node) against 63 µs (leanin) at C=8. The driver is itself a compiled `asyncMachine`, and it spends
+8.2 µs of CPU per request against Node's 6.7 µs; a no-parse control of the same compiler, measured in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md), spends 4.8 µs — so ~3.4 µs per request is parse, pump and
+handler. How the numbers are taken, and the shapes where we are worse, are there too.
 
 ## Development Status
 
@@ -154,7 +152,8 @@ nix develop -c bash bench/threeway.sh 1 4 16   # chosen levels
 Both sides are pinned to distinct cores (server 1, client 2 — `THREEWAY_SERVER_CPU` and `THREEWAY_CLIENT_CPU`
 override), and the energy-performance preference must be `performance` for rows to be comparable; an unpinned
 run lets the two sides compete for the same cores and moves the rows by up to 50 %. The table at the top of this
-file is that four-arm run's output. Read the ratios, not the absolute figures:
+file is that run's three server rows; the compiled example it also drives is a control, not a server row. Read
+the ratios, not the absolute figures:
 this instrument's run-to-run spread is ±30 % ([`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §4.7), and a run
 taken on a loaded box reads depressed — an earlier four-way of this shape was recorded at load average 4.8–6.0
 and §4 carries the settled re-run beside it.
