@@ -845,6 +845,16 @@ Per request that is ~59 k instructions, and the profile's named contributors are
 (`lean_dec_ref_cold`, `lean_alloc_small_object_core`), GC marking (`lean_mark_mt`), malloc/free, and string
 building for the response (`lean_string_utf8_set`, `lean_string_append`, `Std.Http`'s `shouldKeepAlive`).
 
+**The C=32 "win" was Node's slow tail, and the distribution settles it.** Six alternating runs per level with
+both servers pinned and each kept up for the level: at C=8 Node read 103 735–146 120 (median 126 877) and ours
+101 003–135 711 (median 128 456); at C=32 Node read 113 494–141 220 (median 125 474) and ours 103 508–121 607
+(median 116 108). At C=1 the paired runs read Node 68–78 k and ours 62–73 k. So Node's spread is ~40 % at the
+high levels while ours is ~10 %; on medians we are level at C=8, ~4 % behind at C=1 and ~8 % behind at C=32, and
+at Node's best it is ahead at every level. The paired ratios are still the right instrument for a *comparison
+within one invocation*, but a ratio against a server whose own spread is 40 % cannot support a standing claim of
+the form "1.24× at C=32"; the earlier row that reported one is withdrawn, and the absolute distributions are the
+record.
+
 Two further attempts were measured and discarded. Suppressing the async wake for loop-thread submissions removed
 the empty poll but collapsed the server to ~1.5 k req/s: the wake is load-bearing on that path. Caching the stall
 table's earliest deadline (one lock and no per-iteration traversal) measured 0.990 against the current build — the
