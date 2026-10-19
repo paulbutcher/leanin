@@ -521,8 +521,11 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
     return false
   let timeoutMs : UInt32 := match nextDue with
     | some d => if d > now then (max 1 ((d - now) / 1000000)).toUInt32 else 1
-    -- With no deadline but raw work outstanding, poll briefly rather than spinning at zero.
-    | none => if nothing then 0 else 1
+    -- With no deadline but raw work outstanding, block until an event: a raw completion is delivered by the
+    -- loop, so an event is what ends the wait. Polling at 1 ms here cost one extra syscall per request — the
+    -- write wait, which carries no stall slot — and measured 10 % of C=1 throughput; spinning at zero burns the
+    -- core instead.
+    | none => if nothing then 0 else 1000
   let active ← npUvRunOnceTimeout timeoutMs
   match ← loopRef.get with
   | some table => dispatch table (← npUvEvents)

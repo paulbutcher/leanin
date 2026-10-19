@@ -19,18 +19,19 @@ connections.**
 
 | connections | C=1 | C=8 | C=32 |
 |---|---|---|---|
-| leanin / Node 22 (paired median) | **0.91×** | **1.00×** | **1.24×** |
-| interval (IQR of the per-round ratios) | 0.90–0.93 | 0.96–1.01 | 1.18–1.27 |
+| leanin / Node 22 (paired median) | **0.94×** | **1.00×** | **1.24×** |
+| interval across runs / IQR | 0.91–0.95 | 0.96–1.01 | 1.18–1.27 |
 
 **`bench/paired.sh` pairs the arms inside each round — both servers up, order alternated, the ratio taken per
 round before any averaging — and restarts both servers at each level, because a server that has served a level
-carries state into the next. Nine rounds per level: we are ~9 % slower than Node at one connection, level at
-eight, and ~24 % ahead at thirty-two, and the intervals are narrow enough to say so.** The C=1 deficit is the
-protocol driver, not the I/O path: the same runtime with no protocol work (`hello keep`) is faster than Node at
-C=1, so the ~3 µs difference is parse, pump and response encoding. Against the Lean HTTP server that ships with
-the toolchain we remain 12–24× ahead (`bench/threeway.sh`, medians of three invocations). Absolute single rows
-move with the host's state — read the paired ratios. How the numbers are taken, what they decompose into, and
-the shapes where we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+carries state into the next. Nine rounds per level; at C=1 five pre-fix runs read 0.912–0.952 and two post-fix
+runs 0.936–0.937, so the C=1 figure is the median of runs and the range is the honest interval. We are ~6 % slower
+than Node at one connection, level at eight, and ~24 % ahead at thirty-two.** The C=1 deficit is the protocol
+driver, not the I/O path: the same runtime with no protocol work (`hello keep`) is faster than Node at C=1, so
+the difference is parse, pump and response encoding. Against the Lean HTTP server that ships with the toolchain
+we remain 12–24× ahead (`bench/threeway.sh`, medians of three invocations). Absolute single rows move with the
+host's state — read the paired ratios. How the numbers are taken, what they decompose into, and the shapes where
+we are worse: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 

@@ -801,26 +801,36 @@ does both, restarting both servers fresh at each level. Nine rounds per level, f
 
 | level | leanin / Node, median of round ratios | IQR | medians, node / leanin |
 |---|---|---|---|
-| C=1 | **0.912** | 0.901–0.931 | 68 717 / 62 883 |
+| C=1 | **0.94** (pre-fix runs: 0.912–0.952; post-fix: 0.936–0.937) | 0.926–0.956 | 68 074 / 64 826 |
 | C=8 | **1.002** | 0.958–1.006 | 124 501 / 123 819 |
 | C=32 | **1.237** | 1.179–1.274 | 84 565 / 106 753 |
 
-**So the C=1 deficit is real**, consistently ~9 %, and it is the protocol layer rather than the I/O path: in the
-same session the compiled driver with no protocol work (`hello keep`) read 79 692 against Node's 74 427 at C=1,
-so the runtime, shim and raw delivery are already faster than Node, and the ~3 µs gap is parse, pump, framing
-and response encoding. **The C=8 "0.84×" in earlier single-run rows was drift, not a deficit** — paired, the two
-are level (1.002, IQR straddling 1.0). At C=32 we are ahead by ~24 %; Node's absolute there settles near 85 k in
-this harness after warm-up, which is why the ratio, not the row, is the claim. The four-arm three-way remains the
-instrument for the shipped-server multiplier (medians of three invocations, load 3.31→6.76: Node 74 427 / 89 950
-/ 92 055, driver 69 096 / 122 546 / 109 623, `hello keep` 79 692 / 181 354 / 176 237, shipped server 4 306 /
-4 456 / 6 709 — 12–24× our favour). Per-request CPU still grows with connections (7.0 → 8.3 µs from C=8 to
-C=32), which is the remaining gap and the subject of the scaling note.
+**So the C=1 deficit is real but smaller than a single run suggests**: ~6 % across paired runs (0.91–0.95), and it
+is the protocol layer rather than the I/O path: in the same session the compiled driver with no protocol work
+(`hello keep`) read 79 692 against Node's 74 427 at C=1, so the runtime, shim and raw delivery are already faster
+than Node, and the ~3 µs gap is parse, pump, framing and response encoding. **The C=8 "0.84×" in earlier
+single-run rows was drift, not a deficit** — paired, the two are level (1.002, IQR straddling 1.0). At C=32 we
+are ahead by ~24 %; Node's absolute there settles near 85 k in this harness after warm-up, which is why the
+ratio, not the row, is the claim. The four-arm three-way remains the instrument for the shipped-server
+multiplier (medians of three invocations, load 3.31→6.76: Node 74 427 / 89 950 / 92 055, driver 69 096 / 122 546
+/ 109 623, `hello keep` 79 692 / 181 354 / 176 237, shipped server 4 306 / 4 456 / 6 709 — 12–24× our favour).
+Per-request CPU still grows with connections (7.0 → 8.3 µs from C=8 to C=32), which is the remaining gap and
+the subject of the scaling note.
 
-**What did not move.** Three Lean-side replacements of the raw-registration `HashMap` with fixed slots all read
-~9 k rps at ~104 µs CPU/request — one request per millisecond per connection, i.e. served off the driver's idle
-poll rather than the epoll wake — and a shim path that attempted `uv_try_write` on the loop thread read 3/5 at
-C=32 and 4/5 at C=8 with 0–2 % differences. Neither is in the tree; the measurements and the diagnosis are in
-[`notes/LeanIn_Scaling_Theory.md`](notes/LeanIn_Scaling_Theory.md).
+**Part of that C=1 deficit was ours, and it is now mostly recovered.** The pre-change build (`1f1afdf^`, before
+the deadline sweep) paired two-armed against the post-change one read **1.097 at C=1 — 9/9 rounds** (IQR
+1.091–1.104), so the changes cost ~9 % at one connection; attribution by the same method put ~7.4 % on the sweep
+and ~2 % on keep-armed. Four ablations of the deadline commit — the per-iteration stall scans, the per-read stall
+bookkeeping, the `if cfg.clock.swept` branch, and the `rawLive` probe — each still measured ~1.09–1.10, so the
+cost was not in any one of those pieces. A poll trace found it instead: the deadline's slot exists only for
+reads, so while a response **write** was outstanding there was no deadline at all, `nextDue` was `none`, and the
+driver polled at **1 ms** — one extra `epoll_wait` per request (241 045 polls for 239 660 requests, where the
+pre-change driver had none). Blocking on an event instead of a 1 ms timeout (`| none => if nothing then 0 else
+1000`) measured **+6.2 % at C=1 (9/9, IQR 1.059–1.072)** and is neutral at C=8 (0.996) and C=32 (1.000). With it
+the paired C=1 ratio against Node reads **0.936–0.937** across two runs (Node 77.6–78.1 k, ours 72.9–73.1 k),
+against 0.945 before the change and ~1.04 for the pre-change build; one traced iteration per request remains
+(2.99 polls/request against the pre-change 2.1) and is not yet removed. At C=8 and C=32 the same changes are
+what the wins above measure: ~15.6 % and ~10 % ahead of the pre-change build paired (1/0.865 and 1/0.909, 9/9).
 
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
