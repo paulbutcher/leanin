@@ -208,11 +208,20 @@ private initialize signalWaiterRef : Std.Mutex (Option (Nat × Task.Join Int × 
 /-- Set while a single-carrier driver (`Runtime.run`'s `blockOnIo`) is driving the loop itself: `liveSchedule`
 and `startListener` must not start a pump thread, because the driver is the pump. Cleared when the driver
 finishes. -/
-private initialize driverActiveRef : IO.Ref Bool ← IO.mkRef false
+private initialize driverActiveRef : Std.Mutex Bool ← Std.Mutex.new false
 
 /-- Set to ask a running pump thread to yield to a taking-over driver — it exits without stopping the loop,
 which the driver then drives. Reset once the pump has yielded. -/
-private initialize pumpQuitRef : IO.Ref Bool ← IO.mkRef false
+private initialize pumpQuitRef : Std.Mutex Bool ← Std.Mutex.new false
+
+/-- Read a cross-thread flag under its lock. These flags are set by the driver's thread and read by the pump
+thread and by carriers (`liveSchedule`, `ensurePump`), so a plain `IO.Ref` is a data race and the pump can miss
+the quit request — which leaves the driver waiting in `takeover` forever, the pump owning the loop, and the
+handler running on a carrier instead of the driver's thread. -/
+private def flagGet (r : Std.Mutex Bool) : IO Bool := r.atomically do pure (← get)
+
+/-- Set a cross-thread flag under its lock, so the release is visible to the thread that polls it. -/
+private def flagSet (r : Std.Mutex Bool) (b : Bool) : IO Unit := r.atomically do set b
 
 namespace Io
 
@@ -535,32 +544,32 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
 /-- The pump thread's loop: drive until the loop is stopped or there is nothing left to drive, or until a
 single-carrier driver takes it over (`pumpQuitRef`). -/
 private partial def pumpLoop : IO Unit := do
-  if ← pumpQuitRef.get then pure ()
+  if ← flagGet pumpQuitRef then pure ()
   else if ← driveOnce false then pumpLoop else pure ()
 
 /-- **Take the loop over for a single-carrier driver.** A pump thread started before the driver began — by the
 listener bind or a scheduled timer — is asked to yield (it exits without stopping the loop), and the driver flag
 is set so nothing starts another pump while this driver runs. -/
 def takeover : IO Unit := do
-  driverActiveRef.set true
-  pumpQuitRef.set true
+  flagSet driverActiveRef true
+  flagSet pumpQuitRef true
   npUvWheelWake
   match ← pumpRef.get with
   | some t =>
       let _ ← IO.wait t
       pumpRef.set none
   | none => pure ()
-  pumpQuitRef.set false
+  flagSet pumpQuitRef false
 
 /-- **Release the loop** when a single-carrier driver finishes: the flag is cleared so a later listener or timer
 can start a pump again. -/
-def releaseDriver : IO Unit := driverActiveRef.set false
+def releaseDriver : IO Unit := flagSet driverActiveRef false
 
 /-- **Start a pump thread** for an entry whose carriers do not drive the loop — the multi-carrier entry and the
 virtual-clock driver, whose carriers park on the executor's condvar while real sockets still need a thread on
 the loop. No-op while a single-carrier driver is active or a pump is already running. -/
 def ensurePump : IO Unit := do
-  if ← driverActiveRef.get then pure ()
+  if ← flagGet driverActiveRef then pure ()
   else
     match ← pumpRef.get with
     | some _ => pure ()
@@ -576,7 +585,7 @@ armed strands without it (SC11's shape), so it is sent unconditionally rather th
 could be read stale. -/
 def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit := do
   timerPending.atomically (modify (·.push { deadline, cancel, fire }))
-  unless ← driverActiveRef.get do ensurePump
+  unless ← flagGet driverActiveRef do ensurePump
   npUvWheelWake
 
 /-- **Stop the running loop**: fail everything parked, drop the queued and wheeled timers, ask the shim to stop,
@@ -627,7 +636,7 @@ def startListener (addr : Std.Net.SocketAddress) (_backlog : UInt32) : IO Listen
     throw (IO.userError s!"Io.startListener: could not bind 127.0.0.1:{port}")
   let table ← Std.Mutex.new ({} : Table)
   loopRef.set (some table)
-  unless ← driverActiveRef.get do ensurePump
+  unless ← flagGet driverActiveRef do ensurePump
   return ⟨.v4 ⟨⟨#v[127, 0, 0, 1]⟩, bound.toUInt16⟩, table⟩
 
 /-- The address this listener is bound to — the one libuv reported at bind time, so an ephemeral port is the one
