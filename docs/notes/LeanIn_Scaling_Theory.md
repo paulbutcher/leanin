@@ -155,6 +155,13 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
 wins when replaced locally; every micro-change measured parity or worse.
 
+**Growing the maps out of Lean (approach 1, failed).** Replacing the raw-registration `HashMap` with a fixed
+Lean `Array` and take-out discipline was measured at **~9 k rps at both C=8 and C=32 (0/5 wins)** against a
+120–140 k baseline: the 16 k-entry array is still copied per operation, so `Array.set!` under this mutation
+pattern is not in-place. The copy the profile attributes at C=32 (10 %) therefore cannot be removed from Lean
+source; the storage has to live on the C side (`conn_t` slots with `lean_inc`/`lean_dec`), which also subsumes
+the stall map and the merged per-connection slot.
+
 **Keep-armed reads: landed, +5–6 % at depth 1.** The shim arms a connection's read once, buffers arrivals,
 delivers one event per pending read, drains on `np_uv_take` and re-arms, with a 256 KiB backpressure cap. The
 first A/B (host load 4.5) read as noise; the sign test settles it: **5/5 wins in two separate five-pair runs on
