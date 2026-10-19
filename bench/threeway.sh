@@ -4,8 +4,9 @@
 #   nix develop -c bash bench/threeway.sh           # default levels: 1 8 32
 #   nix develop -c bash bench/threeway.sh 1 4 16    # chosen levels
 #
-# Every arm runs on this box inside one invocation, in the same mode: a handler that builds a per-request
-# response (leanin's own `reply`, the shipped server's, and `bench/node-server.mjs`), driven by `bench/load.mjs`
+# Every arm runs on this box inside one invocation, in the same mode: a keep-alive handler answering `/bench`
+# (leanin's own `reply`, the shipped server's, `bench/node-server.mjs`, and the compiled `asyncMachine` example
+# `lake exe hello … keep`), driven by `bench/load.mjs`
 # in keep-alive for 5 s per level at path `/bench`. One row per (arm, level) — the client reports
 # `rps`/`completed`/`errors`/`p50us`/`p99us`.
 #
@@ -18,7 +19,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 # The two binaries this drives are not default targets -- every executable in the package links the socket shim,
 # which needs libuv, so a bare `lake build` does not produce one -- and so they are built here explicitly.
-lake build server stdServer >/dev/null || exit 1
+lake build server stdServer hello >/dev/null || exit 1
 
 if [ "$#" -gt 0 ]; then levels=("$@"); else levels=(1 8 32); fi
 
@@ -49,3 +50,4 @@ run_arm() { # <label> <port> <cmd...>
 run_arm "node" 8310 node bench/node-server.mjs 8310
 run_arm "leanin" 8311 ./.lake/build/bin/server 8311 quiet
 run_arm "lean-http" 8312 ./.lake/build/bin/stdServer 8312
+run_arm "machine" 8313 ./.lake/build/bin/hello 8313 keep

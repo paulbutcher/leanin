@@ -103,7 +103,6 @@ nix develop -c lake exe dynamics        # the model probe: is each contract's hy
 nix develop -c lake exe server          # the HTTP server on our runtime, port 8080
 nix develop -c lake exe stdServer       # the same response via the shipped Std.Http.Server, port 8090
 nix develop -c lake exe h1bench         # the head-parse microbenchmark
-nix develop -c lake exe spike           # measure Lean's own scheduler (the harness behind docs/evidence.md)
 nix develop -c lake exe defuncEcho      # the same echo: CPS closures against the compiled state machine
 
 nix develop -c bash tests/executor-contract.sh SC1    # one scenario (SC1..SC22)
@@ -153,6 +152,7 @@ and §4 carries the settled re-run beside it.
 | [`docs/primitive-theory.md`](docs/primitive-theory.md) | What the externs guarantee: axioms, discharge, control tests |
 | [`docs/tokio-map.md`](docs/tokio-map.md) | What we are taking from Tokio, component by component, with line anchors |
 | [`docs/async-vm.md`](docs/async-vm.md) | The defunctionalization approach: raw delivery, `VM`, `asyncMachine` |
+| [`docs/asyncmachine-guide.md`](docs/asyncmachine-guide.md) | Writing a server with `asyncMachine`: the effect set, the rules, the loud failures, the limits |
 | [`docs/lean-scheduler.md`](docs/lean-scheduler.md) | The scheduler Lean actually uses today, read out of the runtime source |
 | [`docs/lean-concurrency-today.md`](docs/lean-concurrency-today.md) | What Lean 4.35 already gives you, and the measured gaps |
 | [`docs/reading-list.md`](docs/reading-list.md) | Annotated primary sources for proving scheduler facts, with verification status |

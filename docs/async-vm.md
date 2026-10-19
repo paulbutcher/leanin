@@ -1,5 +1,12 @@
 # The defunctionalization approach (`async!` / the `VM`)
 
+> **Status note (2026-10-16).** The modules this page documents — `LeanIn/Runtime/HttpServer.lean`,
+> `LeanIn/Runtime/VMHttp.lean`, `LeanIn/Runtime/SmEcho.lean` — are **deleted**, superseded by
+> `LeanIn/Runtime/Http.lean`'s `drive`: the same `asyncMachine` engine, on the repo's own `LeanIn.Http.H1`
+> machine, as the production driver (`lake exe server`, SC19/SC20, `bench/threeway.sh`'s leanin arm). The
+> measurements below stand as taken when the modules lived; the current driver and its numbers are milestone 3
+> in `docs/tokio-workplan.md`.
+
 Status: **a working `Std.Http` replacement.** `LeanIn/Runtime/HttpServer.lean` is an HTTP/1.1 server on the
 `asyncMachine` engine — each connection's `serveConn` compiles the full H1 drive (the `vmDrive` shape: `pump`
 the machine, write, then `halted`? close : `recvTimeout` → EOF/stalled/feed) to a per-function state machine.

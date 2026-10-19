@@ -703,6 +703,24 @@ and a peer that never sends a byte, whose connection ends at the harness clock's
 read (`at == stall`, `stall = 30`, `clientGot` empty and `bounded == no`). Each clause's detector is exercised
 against its own near misses in the same invocation, and SC19, SC7 and SC14 remain green.
 
+**Milestone 3, landed: the driver, compiled.** The connection loop above is now an `asyncMachine`: `drive`
+compiles the read → feed → step → dispatch → write cycle to a per-function state machine, so a request costs a
+state step and a raw resume rather than a `bind`, a cell and an item. The protocol is `LeanIn.Http.H1` — our own
+parser and machine — not the stdlib's; the milestones above describe the stdlib machine this one replaces. The
+handler is a `VM`: it may suspend — read a backend, wait on a timer — and its suspension joins the connection's
+machine through `VM.runAsync`, while a handler that raises is answered `500` + `Connection: close` rather than
+killing the connection in silence, as milestone 2 states. Three machine-level facts carry the loop: the machine
+closes by flushing first (`userClosedBody` and `noMoreInput` mark `closing`, and `halted` follows the flush, so
+an answer is never dropped); `send` says `Connection: close` on the wire when the machine will close; and the
+body `Conn.serve` wraps completes only when the machine's terminal close fires `onClose` — a connection's
+lifetime is still its body's. The macro learned two rules for this: a bare statement in a machine body is an
+action and is sequenced as one (`let _ :=` would bind the action as a value and never run it — that defect
+swallowed the first `onClose`), and only a parameter the body *rebinds* is threaded across `recurse`, so the
+machine that must advance is rebound in every arm. Measured against the driver this replaces, same session,
+`bench/threeway.sh` 5 s per level: 61206/82981/78382 req/s against 43154/55113/49906 req/s at C=1/8/32 — a
+×1.42/×1.51/×1.57 multiplier per level, zero errors — with SC19's and SC20's records byte-identical between the
+two drivers.
+
 **Still out of scope (this milestone does not close W9).** Streaming request bodies (so `pullBody` is not yet
 exercised by the driver); streaming or chunked response bodies; a cumulative per-head deadline — the bound is
 per read, so a peer that sends one byte before each deadline keeps a connection alive and the time to a complete

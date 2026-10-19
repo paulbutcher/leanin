@@ -4,7 +4,7 @@ Every load-bearing claim in this plan is traceable to one of three kinds of sour
 
 | Tag | Meaning |
 |---|---|
-| **[M]** | **M**easured first-hand on this machine, by a program in this repo. Reproducible: `lake exe spike`. |
+| **[M]** | **M**easured first-hand on this machine, by a program in this repo. The `spike`/`wakerspike` harnesses the early entries cite were retired once their numbers were recorded here (2026-10-16); the records below stand as taken on that machine. |
 | **[S]** | **S**ource read first-hand — a file in an installed toolchain, or a paper/artifact read by a research subagent with a URL. The anchor is given. |
 | **[R]** | **R**eported by a research subagent from a named source, not independently re-read. Treat as a lead, not a fact. |
 
@@ -47,7 +47,8 @@ ______________________________________________________________________
 
 ## 2. Measured: what Lean 4.35's scheduler actually does
 
-Harness: `LeanIn/Exe/Spike.lean`, built and run as `lake exe spike`. It spawns tasks, samples
+Harness: `LeanIn/Exe/Spike.lean`, built and run as `lake exe spike` (harness retired 2026-10-16, after the
+numbers below were recorded; the run is not repeatable from this tree). It spawns tasks, samples
 `IO.getTID`, and times blocking vs. non-blocking sleeps under contention.
 Output, verbatim (single run, idle machine):
 
@@ -173,7 +174,8 @@ ______________________________________________________________________
 
 ## 5. Measured: the `Task`-as-waker bridge
 
-Harness: `LeanIn/Exe/WakerSpike.lean`, run through the nix dev shell. Reproduces the O3 spike behind D10 in
+Harness: `LeanIn/Exe/WakerSpike.lean`, run through the nix dev shell (harness retired 2026-10-16, after the
+runs below were recorded; not repeatable from this tree). Reproduces the O3 spike behind D10 in
 [`decisions.md`](decisions.md).
 
 ```

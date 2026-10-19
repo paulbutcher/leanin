@@ -754,6 +754,24 @@ connections queue on a single thread while Node's one event loop stays ahead by 
 `e2b2988` row above is left as history and not re-read — it is a superseded commit, and re-reading it costs a
 build of that commit for a path nothing runs now.
 
+**The compiled `asyncMachine` driver, four arms** — `nix develop -c bash bench/threeway.sh 1 8 32`, which now
+also builds `hello`; one invocation, 5 s per point, load average 2.56. `server` is not a hand-written loop: it
+serves through `Runtime.Http.serveConn`, whose per-connection loop is `asyncMachine drive` (H1 parse, `VM`
+handler, the same wire behavior), so its row is the compiled path's fair comparison. The `hello` row runs the
+same compiler with a fixed response and no parsing, as a control for where the time goes.
+
+| server | C=1 | C=8 | C=32 |
+|---|---|---|---|
+| Node 22 | 38 663 (p50 20 µs) | 128 721 (48 µs) | 130 621 (215 µs) |
+| compiled driver (`server`) | **53 688 (16 µs)** | 71 644 (99 µs) | 67 793 (435 µs) |
+| compiled, no protocol work (`hello`) | 51 374 (16 µs) | 106 450 (61 µs) | 101 195 (298 µs) |
+| shipped `Std.Http.Server` | 2 157 | 3 324 | 2 602 |
+
+Against Node: **1.39× at C=1**, 0.56× at C=8, 0.52× at C=32. The no-protocol control reads 106 450 against
+71 644 at C=8, so roughly 30 % of that level is parse/frame/handler and the rest is the single-carrier driver
+(one carrier, no handoff parallelism). At one connection the compiled path leads Node on both throughput and
+p50. The instrument's ±30 % spread (§4.7) applies; this is one pair of same-session readings.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always

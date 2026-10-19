@@ -32,10 +32,14 @@ jobs:
       - name: the executor scenarios
         run: |
           for s in SC1 SC2 SC3 SC4 SC5 SC6 SC7 SC8 SC9 SC10 SC11 \
-                   SC12 SC13 SC14 SC15 SC16 SC17 SC18 SC19 SC20 SC21 SC22; do
+                   SC12 SC13 SC14 SC15 SC16 SC17 SC18 SC19 SC20 SC21 SC22 \
+                   SC23 SC24 SC25 SC26 SC27; do
             echo "== $s =="
             bash tests/executor-contract.sh "$s"
           done
+      - name: the threeway comparison
+        run: |
+          bash bench/threeway.sh 8
       - name: the bridge scenarios
         run: |
           for s in BT1 BT2 BT3; do

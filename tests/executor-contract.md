@@ -1459,7 +1459,9 @@ which SC17's clause three already uses.
    the same socket, read until they equal it again, then shut the socket down. The record is
    `ka|handled=<the requests the handler answered>|first=<escaped response 1>|second=<escaped response 2>|carrierThreads=<n>|clientAmongServer=<b>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
 2. **Clause two — a failing handler (`fa|`).** A second listener and run in the same invocation, whose handler
-   returns `error` for every request. The client sends the same request and reads until end of stream. The record is
+   **suspends first** — one millisecond on the server clock — and only then returns `error` for every request, so
+   the failure is raised in a *resumed* continuation rather than in the extent the handler was first called in.
+   The client sends the same request and reads until end of stream. The record is
    `fa|status=<the code the client parsed out of the status line>|got=<escaped bytes read>|carrierThreads=<n>|heldBefore=<n>|inFlightAfter=<n>|pendingHooks=<n>|runUs=<n>`.
 3. **Clause three — a stalled peer (`idle|`).** A third listener and run, driven by
    `IO.asTask (Runtime.runVirtual hc e prog)` on its own thread, with `cfg.clock := HarnessClock.clock hc` and
@@ -2014,3 +2016,196 @@ counts bound a wait so that a lost wake is a reading rather than a wedge, and `r
 asserted. (v) The completion arm's `continuationTid` is not compared by O2 on purpose: the route's reading is
 O1's, and this record's clause is about the chain's completion — a reader wanting both readings wants both
 records.
+
+### SC23 — composition: a parent machine awaits a child machine over a real socket
+
+**Actor.** A Lean executable server (`./.lake/build/bin/defuncEcho 8390 parentT`): `amParentT`, an
+`asyncMachine` state machine that awaits `amChunkT` — another compiled machine — twice on one accepted
+connection, each call suspending the parent until the child's terminal `halt` fires the parent's own
+continuation as the child's `onDone`. Both machines report thread ids as they run, and the harness reports its
+own and a dedicated task's. The peer is a shell pipeline writing two chunks with pauses — deliberately not
+ours. The child's continuation parameter is filled by the generator with the parent's continuation: a machine
+awaiting a machine is a raw resume, and no cell is allocated for the call.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC23`, which builds `defuncEcho`, serves it on a
+fixed loopback port, and exchanges two chunks with the served parent over `/dev/tcp`. Nothing here calls a
+private function: the records asserted on are the wire's own byte stream with the read's own bound, and the
+server's `sc23|` tid records on its stdout.
+
+**When.** The client writes `AAAA` and, after a pause, `BBBB`. The served parent awaits the child for the
+first chunk, then for the second, then sends both answers back together. The read runs under the fixture's own
+5 s bound, whose firing is recorded as `bounded`, exactly SC20-O3's shape: the bound is an invocation bound
+and a conjunct of the relation, never the relation itself.
+
+**Then.** Four conjuncts, each its own detector, with the controls below read in the same invocation.
+
+- **SC23-O1, completion.** `bounded == no`: the composed exchange completed — the parent's resend arrived
+  before the bound. A composition whose child's `onDone` never resumes the parent produces a prefix and this
+  bound.
+- **SC23-O2, order.** The stream is exactly `AAAABBBBAAAABBBB`: the child's two echoes in order, then the
+  parent's combined resend — the resend's *presence* being the child's `onDone` having resumed the parent
+  with both answers.
+- **SC23-O3, resumption thread.** Each call's `resumeTid` equals its `childStepTid`: the parent resumed on the
+  child's own completion thread, which is what a raw resume is; a resume delivered through a cell and an item
+  would land wherever the carrier was.
+- **SC23-O4, one driver.** Every recorded tid — both `childStepTid`, both `resumeTid`, and the accept loop's —
+  equals the harness's `mainTid`: in the single-carrier driver, the accept loop, the connection's effects and
+  the resume are one thread, and a hop to another thread is a delivery, not a resume.
+
+**Controls, in the same invocation.** (i) The bound detector reports `bounded=yes` on a real timeout: a
+connection that stays open and silent, read under a 1 s bound, must exit 124, or the `bounded == no` reading
+is an absence a broken detector could always report. (ii) The tid detector reads the harness's dedicated task
+as a different thread from `mainTid`, so the equalities in O3 and O4 are readings rather than a detector that
+cannot differ. (iii) The tid records are shape-checked before they are read: two `childStepTid`, two
+`resumeTid`, and one each of `acceptTid`, `mainTid`, `dedicatedTid`, and a missing or repeated record is a
+setup error, never a pass.
+
+**Limits, stated.** A single-carrier harness cannot distinguish a cell-mediated resume from a raw one by
+thread (a `Join` plus inject would read the same driver thread here), and the multi-carrier entry does not
+serve this shape (the `runCarriers` serving defect recorded beside `LeanIn/Exe/Server.lean`), so O3/O4 read
+resumption and driver-unity, not the absence of a cell: the no-cell fact is structural (the generator passes
+the caller's continuation as the callee's last parameter, and the expansion names no cell) and is costed by
+the M2 benchmark in `docs/asyncmachine-workplan.md`. The port is fixed (`8390`) inside the invocation's own
+loopback; the readiness probe's connection is an ordinary parked read and changes no record. Nothing here
+measures the call's cost; this scenario asserts order, completion, and resumption.
+
+### SC24 — time as an effect: sleeps and deadline races at the harness clock's stated instants
+
+**Actor.** A Lean executable server (`lake exe controls --runtime-machine-time`): two clauses, each a compiled
+machine served under `Runtime.runVirtual` with the harness clock injected as the machine's clock, and each
+awaited by the run through a `Join` cell the machine resolves on its close *submission* — so the run holds
+until the machine's terminal step rather than its first suspension, with the socket's closure observed
+separately by the client reading to EOF. Clause one is `amDelayed` (read, `sleepRaw` `d`,
+answer, close); clause two is `amStall` (a `recvTimeoutRaw` race against the same instant). The client is
+`Std.Async`'s, driven by `Async.block` on the mode's thread.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC24`, which invokes the public `controls`
+executable. Both listeners are bound by the invocation (`Runtime.loopback 0`); no live clock is read on a
+harness run — an instant is a number, and the virtual driver advances to the earliest pending timer one idle
+round at a time.
+
+**When.** Clause one: the client sends `tick tock`; the machine must not answer until the harness clock reaches
+`delay` (30). Clause two: the client connects and never sends; the deadline must win at `stall` (30), with
+nothing written.
+
+**Then.** Two records, read by their named fields.
+
+- **SC24-O1 (`dl|`).** `at == delay` — the answer arrived at the harness clock's own stated instant, not
+  before it and not after (the virtual driver stops when the run's cell resolves, so `at` is the instant the
+  machine's close fired). `got == "tick tock"` — the answer carried the request. `bounded == no` — the
+  client's live-time bound never fired, so the answer was not a bound-truncated reading. `pendingAfter == 0`
+  and `inFlightAfter == 0` — the clause left no timer and no step behind.
+- **SC24-O2 (`st|`).** `at == stall`, `clientGot` empty, `pendingAfter == 0`, `inFlightAfter == 0`,
+  `carrierThreads == 1` (the single server-side thread recorded at entry): the deadline ended the connection
+  at its stated instant with nothing written and nothing left in flight. O2's empty reading is controlled
+  by O1's non-empty `got` in the same invocation — the same client-read detector reported bytes in one clause
+  and none in the other — so the absence is a reading rather than a detector that cannot differ.
+
+**Limits, stated.** `at` is the harness clock's own reading, not a wall-clock measurement: the virtual driver
+advances exactly to the next pending instant and stops when the run completes, so the relation `at == stated
+instant` is about the machine's scheduling against its injected clock, never about real elapsed time. The
+client's live-time bound is an invocation bound, recorded (`bounded`) and asserted only as `no`. The mode's
+clock wrapper is the harness's own composition — arming a timer from the loop's thread also nudges the parked
+driver through the executor's inject, the load-bearing wake `Io.liveSchedule` documents for the live clock;
+without it the arm strands.
+
+### SC25 — spawn: a machine scheduled as an executor item, joined through its completion cell
+
+**Actor.** A Lean executable server (`lake exe defuncEcho <port> spawn`): each accepted connection is served
+by `amSpawn`, which reads one request byte (the join-order selector), spawns two `amChunkOf` children through
+`Runtime.sharedPush` — the first carrying `BBB`, the second `AAA`, always in that order — joins the two cells
+in the order the selector names (`0`: first spawned then second; `1`: the reverse), echoes the joined bytes,
+and closes. Each child is a single `onDone` step whose boot runs as an executor item, and its completion
+resolves the cell the parent awaits.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC25`, on loopback. One client — `ec_client`,
+which connects, optionally sends, and reads to EOF under a bound — serves both the assertion and the control.
+
+**When.** Two connections on the same server: one sends `0`, one sends `1`.
+
+**Then.** The answers are `BBBAAA` and `AAABBB`, both completed within the client's 5 s bound (which did not
+fire).
+
+- **SC25-O1, completion and through-reach.** Neither read hit the client's 5 s bound: the boot items reached the
+  executor through the app's inject and their resolutions resumed the parked parent. The detector is the
+  client's own bound, and its affirmative control in the same invocation is that same client against a `cps`
+  echo with an empty request and a 1 s bound, which must exit 124. This asserts **reach**, not the wake:
+  the parent enqueues both boots while it is running, and the driver drains queued work before parking, so a
+  push that enqueued without waking would still be taken here. The wake a parked driver needs is
+  `Runtime.sharedPush`'s — the inject SC2 exercises (an injected completion waking a waiting `blockOn`), with
+  SC18's wake from a non-carrier thread as its companion. The spawn adds no wake path: it calls the same
+  inject every other push does.
+- **SC25-O2, join order governs.** The two clauses spawn identical children (BBB first) and differ only in
+  the join order, and they answer `BBBAAA` and `AAABBB`. A collector that returned completions in completion
+  order would give one order in both clauses; a value-sorting collector cannot satisfy both. So the bytes
+  bind the join order to the handle that owns each payload.
+- **SC25-O3, typed handles.** The handles are `RawCell ByteArray` field values carried across the parent's
+  suspension to the joins; the generated spawner's payload type comes from the child's own `onDone` domain.
+
+**Limits, stated.** The scenario observes order, completion and through-reach; it does not observe which
+carrier ran a boot, and neither clause controls the completion order itself — that is why two swapped joins
+are used rather than a staged completion. The children carry a connection they do not use (the spawn surface
+takes one so the handle type stays the child's own). The port is fixed inside the invocation's loopback.
+
+### SC26 — select: first-wins over two cells, with registration order as the tie rule
+
+**Actor.** A Lean executable server (`lake exe defuncEcho <port> select`): each accepted connection is served
+by `amSelect`, which reads one request byte and selects over two cells it creates itself, answering with the
+winning index paired with that cell's own payload. On `A` the second cell (payload `one`) resolves before the
+select and the first (`zero`) after it; on `B` both resolve before the select.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC26`, on loopback; the same `ec_client`
+detector as SC25, with the same `cps`/1 s-bound control in the same invocation.
+
+**When.** Two connections on the select server carrying `A` and `B`, each read to its end under a bound.
+
+**Then.** The answers are `A1one` and `B0zero`, both completed within the client's 5 s bound (which did not
+fire).
+
+- **SC26-O1, first-resolved wins, with its value.** `A1one`: the cell resolved before the select resumed it
+  with index 1 and with that cell's payload, even though the other cell registered first; the loser's later
+  resolution produced no second resume (the answer carries one pair and the connection ends).
+- **SC26-O2, registration order is the tie rule.** `B0zero`: with both cells already resolved, the first
+  registered cell wins, with its own payload, as `Task.select` documents.
+- **SC26-O3, completion.** Both reads completed within the 5 s client bound: neither select nor the loser's
+  parked waiter held the connection open.
+
+**Controls, in the same invocation.** (i) The two clauses report different winners and payloads (`1one`
+then `0zero`), so the winner field is a reading rather than a constant. (ii) The bound detector is the same
+client under a 1 s bound against a silent `cps` connection, which must exit 124.
+
+**Limits, stated.** The loser's parked waiter remains registered until its cell resolves and then no-ops; the
+scenario observes that no second resume reaches the machine, not the waiter's storage. The select's value type
+is the cells' own, and the tie rule is the registration order of the two awaits in `selectRaw`.
+
+### SC27 — the compiled server: bind, serve, a handler
+
+**Actor.** `lake exe hello <port>` (`LeanIn/Exe/Hello.lean`): a compiled accept loop (`helloServe`) parks on
+`Io.acceptRaw`, spawns `helloConn` per accepted connection through the app's inject, and recurses; the
+connection machine reads the request, writes one fixed response, closes, and reports the close to the spawn
+handle. No `Std.Http.Server` and no stock `Task` is in the serving path.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC27`, on loopback. The exchanges use a client
+whose socket read carries **no bound**, so the request and the expected response travel as files and the
+comparison is `cmp` (byte-for-byte; no command substitution can strip or rewrite bytes). The invocation is
+watchdogged at 20 s, and a watchdog hit fails O3 — the completion proposition is asserted without a socket
+bound, under a watchdog whose firing is itself the observation that the stream never ended. The control uses
+the bounded `ec_client` against a silent connection.
+
+**When.** Two sequential connections, each sending the four-line request
+`GET / HTTP/1.1` / `Host: 127.0.0.1` / `Connection: close` / an empty line, from a file.
+
+**Then.** Each connection reads, byte-for-byte, `HTTP/1.1 200 OK`, `Connection: close`,
+`Content-Length: 5`, an empty line, then `hello`; both reads reached end of stream.
+
+- **SC27-O1, the response.** Both exchanges are byte-exact against the pinned response, so the handler's
+  write and the close are both observed by the client.
+- **SC27-O2, the loop recurs.** The second connection is accepted and answered after the first: the accept
+  loop resumed and recursed, and its per-connection spawn ran as an executor item.
+- **SC27-O3, completion.** Both reads reached end of stream and the invocation watchdog did not fire; the
+  control is the bounded client under a 1 s bound against a connection that sends nothing, which must exit 124 — the handler waits for a request, so an
+  unanswered connection is the detector's affirmative case.
+
+**Limits, stated.** The scenario reads the compiled path's own output on a real socket; it does not compare
+throughput (that is `bench/threeway.sh`'s separate instrument, run in CI). The response is fixed, so nothing
+here exercises the HTTP protocol machine — SC19/SC20 do.

@@ -8,10 +8,10 @@ import LeanIn.Runtime.Http
 # An HTTP server on `leanin`'s runtime
 
 Run it with `lake exe server [port]` — the port defaults to 8080. It binds the loopback address, prints the
-address it took, and serves every connection on an executor of our own, driving `Std.Http.Protocol.H1`'s pure
-machine through `Runtime.Http.serveConn`. The protocol is reused (parsing, framing, keep-alive and the limits
-stay in `H1` and its `Config`) and the driver, the accept loop and every await are ours, so a handler runs on one
-of our carriers rather than on the stock `Task` pool.
+address it took, and serves every connection on an executor of our own, driving `LeanIn.Http.H1`'s pure machine
+through `Runtime.Http.serveConn` — a per-connection state machine compiled by `asyncMachine`. The protocol is
+ours as well (parsing, framing, keep-alive and the limits live in `LeanIn.Http.H1`), and the driver, the accept
+loop and every await are ours, so a handler runs on one of our carriers rather than on the stock `Task` pool.
 
 `Runtime.serveUntilStopped` is the accept loop. It polls a non-blocking `tryAccept` between sleeps because the
 interface has no selector yet, so a stop drains at one poll interval's latency rather than immediately; that
@@ -83,7 +83,7 @@ def main (args : List String) : IO UInt32 := do
     return reply head
   IO.println s!"leanin server listening on {addr}"
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    Runtime.serveForever hooks l (Runtime.Http.serveConn hooks cfg · handler)
+    Runtime.serveForever hooks l (Runtime.Http.serveConn cfg · handler)
   -- Driven by `Runtime.run`: the caller's thread runs the executor while it waits, which is what pumps the
   -- live clock's timer. The multi-carrier entry `Runtime.runCarriers` does **not** serve here — a connection is
   -- accepted by the kernel and never answered, because its caller waits on a cell without pumping and the accept
