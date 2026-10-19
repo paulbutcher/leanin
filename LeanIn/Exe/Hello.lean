@@ -20,6 +20,11 @@ open LeanIn
 def helloResponse : ByteArray :=
   "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello".toUTF8
 
+/-- The keep-alive response the benchmark arm serves: the same body, the connection left open so the client
+sends its next request on it (the shape `bench/load.mjs` drives). -/
+def helloKeepResponse : ByteArray :=
+  "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".toUTF8
+
 -- One connection's work: read the request, answer, close, and report the close. The write is deliberately
 -- unbound: the compiler's policy for an unbound send is to close the connection when it fails, which is this
 -- example's boundary handling — a failed write ends that connection and reaches no other connection.
@@ -29,10 +34,16 @@ asyncMachine helloConn (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit 
   let closed := await (LeanIn.Runtime.Io.closeRaw c)
   onDone (if closed then .ok () else .error (IO.userError "helloConn: the loop refused the close"))
 
+-- A keep-alive connection loop, for the benchmark arm: request, answer, request again on the same connection.
+asyncMachine helloKeep (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+  let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
+  await (LeanIn.Runtime.Io.sendAllRaw c #[helloKeepResponse])
+  recurse
+
 -- The accept loop: one connection at a time, its handler spawned as an executor item, then recurse. The
--- listener and the inject are the loop's carried state; an accept failure ends the loop loudly.
+-- listener, the inject and the mode are the loop's carried state; an accept failure ends the loop loudly.
 asyncMachine helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item → BaseIO Unit)
-    (onDone : Except IO.Error Unit → IO Unit) := do
+    (keep : Bool) (onDone : Except IO.Error Unit → IO Unit) := do
   let c : Except IO.Error LeanIn.Runtime.Conn := await (LeanIn.Runtime.Io.acceptRaw l push)
   match c with
   | .error e =>
@@ -42,11 +53,16 @@ asyncMachine helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item �
     -- Handlers are unsupervised here: the handle is discarded deliberately. A connection's failure is
     -- confined to that connection by the handler's own policy, and the loop's only terminal is an accept the
     -- listener can no longer complete — which is what reaches the run's continuation and `main`.
-    await (helloConn.spawn push conn)
-    recurse
+    if keep then
+      await (helloKeep.spawn push conn)
+      recurse
+    else
+      await (helloConn.spawn push conn)
+      recurse
 
 def main (args : List String) : IO UInt32 := do
   let port := (args.head?.bind (·.toNat?)).getD 8085
+  let keep := args.getD 1 "close" == "keep"
   let l ← LeanIn.Runtime.Listener.bind (LeanIn.Runtime.loopback port.toUInt16)
   let e ← LeanIn.Sched.Executor.new LeanIn.Task.Item 256 1
   let push := LeanIn.Runtime.sharedPush e
@@ -56,7 +72,7 @@ def main (args : List String) : IO UInt32 := do
   -- The compiled loop owns the connection; only its terminal — an accept the loop can no longer complete —
   -- reaches the wrapper's continuation, which is what lets `main` report it.
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    ⟨fun k ctx => helloServe.run l push (fun r => k r ctx)⟩
+    ⟨fun k ctx => helloServe.run l push keep (fun r => k r ctx)⟩
   match (← (LeanIn.Runtime.run e prog : IO (Except IO.Error Unit))) with
   | .ok () => return 0
   | .error e =>
