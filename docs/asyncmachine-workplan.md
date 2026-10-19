@@ -89,11 +89,26 @@ rather than multiplying the silent-wrongness surface.
 
 ### M3 — Time as an effect
 
-- `sleepRaw` and `timeout` as classifier effects, on the injected `Clock` (the shape `VM.sleep` already
-  proves; harness-driven clocks keep scenarios deterministic).
-- **Acceptance**: a machine that sleeps between writes, and a machine whose operation loses a timeout race,
-  both driven by `HarnessClock` with stated-instant assertions in the SC20-O3 idiom (`at == stall`).
-- **Evidence**: scenario + fixture; the harness clock drives every assertion, no live timing.
+- **Landed**: `Io.sleepRaw` (one timer per suspension on the injected clock's `schedule`) as a classifier
+  effect; the deadline half is the already-landed `recvTimeoutRaw`, exercised here at the machine level rather
+  than through the HTTP driver. A general `timeout` over arbitrary suspensions is `select`, which is M4.
+- **Acceptance met**: SC24 — a machine that sleeps between writes (`dl|`) and one whose operation loses a
+  timeout race (`st|`), both driven by `HarnessClock`, each asserted at the harness clock's stated instant
+  (`at == delay`, `at == stall`) with the same client-read detector reporting bytes in one clause and none in
+  the other. Red: the sleep cut (`at=0` vs `delay=30`, the fixture's own assertion) and the pre-M3 surface
+  rejection (`unsupported effect in await`) both observed.
+- **Two runtime facts the milestone surfaced**: a harness instant lives in the clock's own list, not libuv's
+  wheel, so the thread that must reach it is the *driver* parked on the executor's condvar — `HarnessClock.clockWithWake`
+  composes the schedule with the inject nudge such a park needs (a bare `npUvWheelWake` would end the loop
+  pump's park, not the driver's); and pattern-derived liveness was collecting constructor idents (a phantom
+  `ok` state field from `.ok ()` terms) — fixed by skipping receiver-less dot heads in `usedNames`, skipping
+  application heads and dot heads in `patBoundNames`, and binding a suspension's source ascription into the
+  binder so a mismatch fails live or dead.
+- **Performance reading**: at the virtual clock the stated instants cost nothing in wall time — both clauses
+  complete in ~1 ms of live time for a 30 ms virtual instant (the driver advances to the pending instant and
+  stops when the run resolves). In production `sleepRaw` pays one wheel push and one wake per suspension —
+  the same cost every live timer already pays through the clock's `schedule` — and the harness-only additions
+  (a mutex insert and an inject push per arm) never run on the live path.
 
 ### M4 — spawn and select
 

@@ -6,12 +6,18 @@ cd "$(dirname "$0")/.."
 export LEAN_PATH=.lake/build/lib/lean
 ok=1
 
-expect_error() { # <file> <named fragment>
-  local out
-  out="$(lean "tests/asyncmachine-diagnostics/$1" 2>&1)" && {
-    echo "diag: $1 elaborated; expected rejection mentioning [$2]" >&2; ok=0; return; }
-  grep -qF "$2" <<<"$out" || {
-    echo "diag: $1 rejected but without [$2]; got:" >&2; echo "$out" >&2; ok=0; }
+expect_error() { # <file> <phrase>... — each phrase must appear contiguously in the flattened rejection
+  # The elaborator wraps diagnostics across lines, so the output is flattened before matching: a phrase that
+  # binds an actual type to its expected type must match as one run of text, not as scattered tokens.
+  local file="$1"; shift
+  local out flat frag
+  out="$(lean "tests/asyncmachine-diagnostics/$file" 2>&1)" && {
+    echo "diag: $file elaborated; expected rejection mentioning [$*]" >&2; ok=0; return; }
+  flat="$(tr '\n' ' ' <<<"$out" | tr -s ' ')"
+  for frag in "$@"; do
+    grep -qF "$frag" <<<"$flat" || {
+      echo "diag: $file rejected but without [$frag]; got:" >&2; echo "$out" >&2; ok=0; return; }
+  done
 }
 
 expect_ok() { # <file>
@@ -23,6 +29,10 @@ expect_ok() { # <file>
 expect_error unascribed-field.lean 'cannot determine the type of state field `mystery`'
 expect_error destructuring-let.lean 'destructuring `let` is not supported'
 expect_ok    unthreaded-param.lean
+expect_error sleep-bound-mismatch.lean 'has type Unit but is expected to have type Nat'
+expect_error sleep-bound-dead-mismatch.lean 'has type Unit but is expected to have type Nat'
+expect_error send-bound-dead-mismatch.lean 'has type Nat → IO Unit but is expected to have type Except IO.Error Unit → IO Unit'
+expect_ok    sleep-bound-ok.lean
 
 [ "$ok" = 1 ] && echo "asyncmachine-diagnostics: all checks passed" || echo "asyncmachine-diagnostics: FAILED" >&2
 [ "$ok" = 1 ]

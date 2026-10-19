@@ -86,7 +86,13 @@ def HarnessClock.now (hc : HarnessClock) : IO Nat :=
 def HarnessClock.pending (hc : HarnessClock) : IO Nat :=
   hc.state.atomically do return (← get).timers.length
 
-/-- **Schedule a fire at `instant`**, keeping the list sorted and FIFO among equal instants. -/
+/-- **Schedule a fire at `instant`**, keeping the list sorted and FIFO among equal instants.
+
+The insertion alone is not a wake. Unlike the live clock (`Io.liveSchedule`, whose `npUvWheelWake` ends the
+loop pump's park), a harness instant lives in this list, not in libuv's wheel, and the thread that must reach
+it is the *driver* — parked on the executor's condition variable. `HarnessClock.clockWithWake` is the
+composition that supplies that wake; a caller using the bare `clock` arms instants that a driver already
+parked will not see. -/
 def HarnessClock.schedule (hc : HarnessClock) (instant : Nat) (fire : IO Unit) : BaseIO Unit :=
   hc.state.atomically do
     let s ← get
@@ -133,6 +139,21 @@ def HarnessClock.clock (hc : HarnessClock) : Clock :=
   , schedule := fun d cancel fire => do
       let now0 ← hc.now
       hc.schedule (now0 + d.val.toNat) (do unless ← Task.Cancel.isSet cancel do fire) }
+
+/-- **The harness clock, composed with the executor wake a virtual driver needs.**
+
+A timer armed from a thread other than the driver's — a raw resume on the loop's thread, say — strands
+without this: the driver advances the harness clock only on an idle round, and a driver already parked on the
+executor's condition variable receives no idle round for an arm. `push` is the off-carrier route (an
+executor's `sharedPush`); the arm schedules the instant and then pushes a no-op item whose notification wakes
+the park, and the driver's next idle round advances to it. A timer armed *before* the driver parks needs
+nothing more than `clock`, which is why both exist. -/
+def HarnessClock.clockWithWake (hc : HarnessClock) (push : Task.Item → BaseIO Unit) : Clock :=
+  let base := HarnessClock.clock hc
+  { base with
+    schedule := fun d cancel fire => do
+      base.schedule d cancel fire
+      push (Task.Item.ofAction (pure ())) }
 
 /-- **Run a computation with a harness clock driving it.** The general driver with this clock's reading for the
 metered path and one advance per idle round for the pool-empty wait. -/

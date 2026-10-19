@@ -2060,13 +2060,6 @@ cannot differ. (iii) The tid records are shape-checked before they are read: two
 `resumeTid`, and one each of `acceptTid`, `mainTid`, `dedicatedTid`, and a missing or repeated record is a
 setup error, never a pass.
 
-**Red, staged and observed.** (i) The behavior cut: with the child's `onDone` invocation removed, the fixture
-reports `SC23 Then: the composed exchange did not complete (bounded=yes)` with `observed prefix: [AAAA]` —
-the first call never resumes the parent, so even the second chunk is never read, and O1 fails on its own
-conjunct. (ii) The surface cut: on the pre-M2 compiler the composition machines do not elaborate —
-`asyncMachine: a path does not end in recurse or a close` (no `halt` terminal) and `Unknown identifier await`
-(no typed `await`, no machine-call classification) — the boundary the scenario crosses did not exist.
-
 **Limits, stated.** A single-carrier harness cannot distinguish a cell-mediated resume from a raw one by
 thread (a `Join` plus inject would read the same driver thread here), and the multi-carrier entry does not
 serve this shape (the `runCarriers` serving defect recorded beside `LeanIn/Exe/Server.lean`), so O3/O4 read
@@ -2075,3 +2068,43 @@ the caller's continuation as the callee's last parameter, and the expansion name
 the M2 benchmark in `docs/asyncmachine-workplan.md`. The port is fixed (`8390`) inside the invocation's own
 loopback; the readiness probe's connection is an ordinary parked read and changes no record. Nothing here
 measures the call's cost; this scenario asserts order, completion, and resumption.
+
+### SC24 — time as an effect: sleeps and deadline races at the harness clock's stated instants
+
+**Actor.** A Lean executable server (`lake exe controls --runtime-machine-time`): two clauses, each a compiled
+machine served under `Runtime.runVirtual` with the harness clock injected as the machine's clock, and each
+awaited by the run through a `Join` cell the machine resolves on its close *submission* — so the run holds
+until the machine's terminal step rather than its first suspension, with the socket's closure observed
+separately by the client reading to EOF. Clause one is `amDelayed` (read, `sleepRaw` `d`,
+answer, close); clause two is `amStall` (a `recvTimeoutRaw` race against the same instant). The client is
+`Std.Async`'s, driven by `Async.block` on the mode's thread.
+
+**Boundary.** `nix develop -c bash tests/executor-contract.sh SC24`, which invokes the public `controls`
+executable. Both listeners are bound by the invocation (`Runtime.loopback 0`); no live clock is read on a
+harness run — an instant is a number, and the virtual driver advances to the earliest pending timer one idle
+round at a time.
+
+**When.** Clause one: the client sends `tick tock`; the machine must not answer until the harness clock reaches
+`delay` (30). Clause two: the client connects and never sends; the deadline must win at `stall` (30), with
+nothing written.
+
+**Then.** Two records, read by their named fields.
+
+- **SC24-O1 (`dl|`).** `at == delay` — the answer arrived at the harness clock's own stated instant, not
+  before it and not after (the virtual driver stops when the run's cell resolves, so `at` is the instant the
+  machine's close fired). `got == "tick tock"` — the answer carried the request. `bounded == no` — the
+  client's live-time bound never fired, so the answer was not a bound-truncated reading. `pendingAfter == 0`
+  and `inFlightAfter == 0` — the clause left no timer and no step behind.
+- **SC24-O2 (`st|`).** `at == stall`, `clientGot` empty, `pendingAfter == 0`, `inFlightAfter == 0`,
+  `carrierThreads == 1` (the single server-side thread recorded at entry): the deadline ended the connection
+  at its stated instant with nothing written and nothing left in flight. O2's empty reading is controlled
+  by O1's non-empty `got` in the same invocation — the same client-read detector reported bytes in one clause
+  and none in the other — so the absence is a reading rather than a detector that cannot differ.
+
+**Limits, stated.** `at` is the harness clock's own reading, not a wall-clock measurement: the virtual driver
+advances exactly to the next pending instant and stops when the run completes, so the relation `at == stated
+instant` is about the machine's scheduling against its injected clock, never about real elapsed time. The
+client's live-time bound is an invocation bound, recorded (`bounded`) and asserted only as `no`. The mode's
+clock wrapper is the harness's own composition — arming a timer from the loop's thread also nudges the parked
+driver through the executor's inject, the load-bearing wake `Io.liveSchedule` documents for the live clock;
+without it the arm strands.

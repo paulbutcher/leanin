@@ -125,13 +125,28 @@ local variable a state must carry, the full form never matches one. -/
 private partial def usedNames (stx : Syntax) (acc : List Name := []) : List Name :=
   match stx with
   | .ident _ _ n _ => n :: n.getRoot :: acc
+  -- A receiver-less dot head (`.ok`, `.error`, `.2`) is a constructor or projection, never a variable a
+  -- state could carry — skip the node whole. (A dotted name like `m.feed` is a plain compound ident and
+  -- still carries its root `m`.)
+  | .node _ `Lean.Parser.Term.dotIdent _ => acc
   | .node _ _ args => args.foldl (fun a s => usedNames s a) acc
   | _ => acc
 
-/-- The names bound by a pattern (for scope and liveness). -/
+/-- The names bound by a pattern (for scope and liveness). Pattern semantics, from the syntax alone: an
+identifier **applied to sub-patterns** is a constructor head, never a binding (`some (.ok …)`, `.ok …`), so
+the head of an application is skipped and only its arguments are searched; a bare identifier may be a variable
+or a nullary constructor — the syntax cannot tell those apart (`none` and `true` resolve only against the
+expected type), so they are taken as bindings, which is inert unless the same name is also used as a bare term
+after a suspension, where the field-type inference then fails loudly with the name. A preresolved identifier
+is a constructor and is skipped as well, where the caller's syntax carries resolution. -/
 private partial def patBoundNames (stx : Syntax) (acc : List Name := []) : List Name :=
   match stx with
-  | .ident _ _ n _ => if n.isAnonymous || n == `_ then acc else n :: acc
+  | .ident _ _ n pre => if n.isAnonymous || n == `_ || !pre.isEmpty then acc else n :: acc
+  -- The head of an application is the constructor (`some x`, `.ok x`); only the arguments bind.
+  | .node _ `Lean.Parser.Term.app args =>
+    (args[1:].foldl (fun a s => patBoundNames s a) acc)
+  -- A receiver-less dot head (`.ok`, `.none`) is a constructor wherever it appears, bare or applied.
+  | .node _ `Lean.Parser.Term.dotIdent _ => acc
   | .node _ _ args => args.foldl (fun a s => patBoundNames s a) acc
   | _ => acc
 
@@ -209,6 +224,7 @@ private partial def piShape (e : Lean.Expr) : Nat × Bool :=
 private inductive Eff where
   | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
   | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
+  | sleep (sched : Term) (deadline : Term)  -- `Io.sleepRaw sched d` → `Unit`
   | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
   | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's `onDone` payload
   | sendAll (data : Term)
@@ -223,6 +239,7 @@ private partial def unparen (s : Syntax) : Syntax :=
 private def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   match unparen e with
   | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => pure (.recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩)
+  | `(LeanIn.Runtime.Io.sleepRaw $s $d) => pure (.sleep ⟨s⟩ ⟨d⟩)
   | `(LeanIn.Runtime.VM.runAsync $m) => pure (.runVM ⟨m⟩)
   | `(LeanIn.Runtime.Io.recvRaw $_ $_) => pure .recv
   | `(LeanIn.Runtime.Io.recvRaw $_) => pure .recv
@@ -415,9 +432,17 @@ private def resultBind (eff : Eff) : Bind :=
   | .runMachine .. => .pureB
   | _ => .pureB
 
-/-- The suspension for one effect, with continuation `cont`. -/
-private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term) : MacroM Term := do
+/-- The suspension for one effect, with continuation `cont`. A source ascription (`let x : T := await …`)
+applies to the binder itself, so a mismatched ascription fails at elaboration whether the value is live into a
+later state or not — the alternative is that a dead binding's ascription silently disappears. -/
+private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Option Term)
+    (cont : Term) : MacroM Term := do
   let c := mkIdent ctx.conn
+  -- A binder carrying the source ascription when there is one.
+  let annot (bv : Name) : MacroM Term :=
+    match ty? with
+    | some t => `(fun ($(mkIdent bv) : $t) => $cont)
+    | none => `(fun $(mkIdent bv) => $cont)
   match eff with
   | .recv =>
     let bv := bnd.getD `bs
@@ -425,33 +450,56 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (cont : Term
     -- gone; its result is discarded. The shim refuses a close only with the loop down or the submit queue
     -- full (`MAX_SUBMIT`) — both runtime-wide states, which the loop already fails loudly on its own
     -- convention (a refused cleanup close in `readDone`/`opDone` kills the loop thread deliberately).
+    -- A pattern cannot carry the ascription, so it is checked in the branch body.
+    let checked : MacroM Term :=
+      match ty? with
+      | some t => `(let _ : $t := $(mkIdent bv); $cont)
+      | none => pure cont
+    let body ← checked
     `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
-        | .ok (some $(mkIdent bv)) => $cont
+        | .ok (some $(mkIdent bv)) => $body
         | .ok none => discard (LeanIn.Runtime.Io.closeRaw $c)
         | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
   | .recvTimeout sched d z =>
     let bv := bnd.getD `r
-    `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z (fun $(mkIdent bv) => $cont))
+    let k ← annot bv
+    `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z $k)
+  | .sleep sched d =>
+    -- The resume takes no argument; a bound sleep result is `()`, bound in the continuation so a
+    -- `let u := await (sleepRaw …)` has its name in scope (`u : Unit`; an ascription to another type is a
+    -- loud elaboration mismatch on the binding itself).
+    match bnd with
+    | none => `(LeanIn.Runtime.Io.sleepRaw $sched $d ($cont))
+    | some bv =>
+      match ty? with
+      | some t => `(LeanIn.Runtime.Io.sleepRaw $sched $d (let $(mkIdent bv) : $t := (); $cont))
+      | none => `(LeanIn.Runtime.Io.sleepRaw $sched $d (let $(mkIdent bv) := (); $cont))
   | .runVM m =>
     let bv := bnd.getD `v
-    `(LeanIn.Runtime.VM.runAsync $m (fun $(mkIdent bv) => $cont))
+    let k ← annot bv
+    `(LeanIn.Runtime.VM.runAsync $m $k)
   | .runMachine fn args =>
     let bv := bnd.getD `v
     let argTs := args.toArray
-    `($fn $argTs* (fun $(mkIdent bv) => $cont))
+    let k ← annot bv
+    `($fn $argTs* $k)
   -- A failed write ends the connection rather than continuing as if the bytes were sent — unless the body
   -- bound the effect's result (`let r := await …`), in which case the whole `Except` is delivered and the
   -- body owns the outcome.
   | .sendAll d =>
     match bnd with
-    | some bv => `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun $(mkIdent bv) => $cont))
+    | some bv =>
+      let k ← annot bv
+      `(LeanIn.Runtime.Io.sendAllRaw $c $d $k)
     | none =>
       `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun
           | .ok _ => $cont
           | .error _ => discard (LeanIn.Runtime.Io.closeRaw $c)))
   | .send d =>
     match bnd with
-    | some bv => `(LeanIn.Runtime.Io.sendRaw $c $d (fun $(mkIdent bv) => $cont))
+    | some bv =>
+      let k ← annot bv
+      `(LeanIn.Runtime.Io.sendRaw $c $d $k)
     | none =>
       `(LeanIn.Runtime.Io.sendRaw $c $d (fun
           | .ok _ => $cont
@@ -546,7 +594,7 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
       let scope' := scope ++ bnd.toList.map (fun n =>
         (n, match ty? with | some t => .typed t | none => resultBind eff))
       let cont ← genCont ctx rest scope'
-      suspendTerm ctx eff bnd cont
+      suspendTerm ctx eff bnd ty? cont
   | .if_ c t e :: rest => do
     let cont? ← hoistCont ctx rest scope
     let suffix := cont?.toList

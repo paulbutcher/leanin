@@ -4696,6 +4696,84 @@ check_sc23() {
     "${child_tids[0]}" "$dedicated_tid"
 }
 
+# --- SC24 — time as an effect: sleeps and deadline races at the harness clock's stated instants ————————
+# The server is the public `controls` executable in its `--runtime-machine-time` mode: two clauses, each a
+# compiled machine served under `Runtime.runVirtual` with its completion awaited through a Join cell so the run
+# holds until the machine's close. Clause one (`dl|`) sleeps 30 on the harness clock between read and answer;
+# clause two (`st|`) races a read against the same instant and the peer never sends. The client is
+# `Std.Async`'s. The records are the mode's own readings of the harness clock (`at`), so the relation each
+# clause asserts is `at == stated instant` — never a wall-clock measurement.
+check_sc24() {
+  local out status line ctl line2 acc comp clo lhw pap
+  local delay at got bounded pending threads held inflight
+  local stall at2 cgot bounded2 pending2 threads2 inflight2
+  local -a dl=() st=()
+  out="$(bounded lake exe controls --runtime-machine-time)"
+  status=$?
+  check_status SC24 "$status" "lake exe controls --runtime-machine-time"
+  require_header "$out"
+  mapfile -t dl < <(grep '^dl|' <<<"$out" || true)
+  mapfile -t st < <(grep '^st|' <<<"$out" || true)
+  [ "${#dl[@]}" -eq 1 ] ||
+    fail "SC24 Then: the delayed-answer clause was not observed exactly once" \
+      "expected exactly one dl| record, saw ${#dl[@]}"
+  [ "${#st[@]}" -eq 1 ] ||
+    fail "SC24 Then: the stalled-peer clause was not observed exactly once" \
+      "expected exactly one st| record, saw ${#st[@]}"
+  line="${dl[0]}"
+  record_is "${line#dl|}" delay at got bounded pendingAfter carrierThreads heldBefore inFlightAfter runUs ||
+    fail "SC24 Then: the delayed-answer record is not the expected shape" "[$line]"
+  bound_field delay delay "$line" "SC24 Then"
+  bound_field at at "$line" "SC24 Then"
+  bound_field got got "$line" "SC24 Then"
+  bound_field bounded bounded "$line" "SC24 Then"
+  bound_field pending pendingAfter "$line" "SC24 Then"
+  bound_field threads carrierThreads "$line" "SC24 Then"
+  bound_field inflight inFlightAfter "$line" "SC24 Then"
+  # O1: the answer arrived at the harness clock's own stated instant, and carried the request.
+  [ "$at" = "$delay" ] ||
+    fail "SC24 Then (O1): the delayed answer did not arrive at the stated instant" \
+      "at=$at, delay=$delay — the machine slept d on the harness clock, so the answer is owed at exactly d"
+  [ "$got" = "tick tock" ] ||
+    fail "SC24 Then (O1): the delayed answer did not carry the request" "got=[$got]"
+  [ "$bounded" = "no" ] ||
+    fail "SC24 Then (O1): the delayed answer never arrived (bounded=$bounded)" \
+      "the client's live-time bound fired: the virtual instant was not reached"
+  [ "$pending" = "0" ] && [ "$inflight" = "0" ] && [ "$threads" = "1" ] ||
+    fail "SC24 Then (O1): the clause left work behind or ran on more than one server thread" \
+      "pendingAfter=$pending inFlightAfter=$inflight carrierThreads=$threads"
+  line2="${st[0]}"
+  # `clientGot` is allowed to be empty — a clause that reads nothing is one of the outcomes this scenario must
+  # be able to observe — so the shape is read field by field, the byte field through `field_may_be_empty`.
+  cgot="$(field_may_be_empty clientGot "${line2#st|}")" ||
+    fail "SC24 Then: the stalled-peer record is not the expected shape" "[$line2]"
+  bound_field stall stall "$line2" "SC24 Then"
+  bound_field at2 at "$line2" "SC24 Then"
+  bound_field pending2 pendingAfter "$line2" "SC24 Then"
+  bound_field threads2 carrierThreads "$line2" "SC24 Then"
+  bound_field inflight2 inFlightAfter "$line2" "SC24 Then"
+  bound_field bounded2 bounded "$line2" "SC24 Then"
+  # O2: the deadline won at its stated instant, with nothing written — and its empty reading is controlled by
+  # clause one's non-empty `got` in the same invocation.
+  [ "$at2" = "$stall" ] ||
+    fail "SC24 Then (O2): the stalled connection did not end at the stated instant" \
+      "at=$at2, stall=$stall"
+  [ -z "$cgot" ] ||
+    fail "SC24 Then (O2): the stalled peer was answered" "clientGot=[$cgot]"
+  # O2 asserted `bounded == no` too: an empty read produced by the client's own bound is not the server's
+  # close, and must not pass as one.
+  [ "$bounded2" = "no" ] ||
+    fail "SC24 Then (O2): the empty reading came from the client's bound, not the server's close" \
+      "bounded=$bounded2"
+  [ "$pending2" = "0" ] && [ "$inflight2" = "0" ] && [ "$threads2" = "1" ] ||
+    fail "SC24 Then (O2): the deadline left work behind or the clause ran on more than one server thread" \
+      "pendingAfter=$pending2 inFlightAfter=$inflight2 carrierThreads=$threads2"
+  [ "$got" = "tick tock" ] ||
+    setup_error "SC24: the non-empty reading control is missing" \
+      "clause one's got=[$got]; the empty clientGot in clause two proves nothing without it"
+  printf 'SC24 ok: delayed answer at at=%s==delay, carrying the request; stall ended at at=%s==stall with nothing written — both at the harness clock'"'"'s stated instants\n' "$at" "$at2"
+}
+
 case "${1:-}" in
 SC1) check_sc1 ;;
 SC2) check_sc2 ;;
@@ -4720,8 +4798,9 @@ SC20) check_sc20 ;;
 SC21) check_sc21 ;;
 SC22) check_sc22 ;;
 SC23) check_sc23 ;;
+SC24) check_sc24 ;;
 *)
-  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23\n' >&2
+  printf 'usage: bash tests/executor-contract.sh SC1|SC2|SC3|SC4|SC5|SC6|SC7|SC8|SC9|SC10|SC11|SC12|SC13|SC14|SC15|SC16|SC17|SC18|SC19|SC20|SC21|SC22|SC23|SC24\n' >&2
   exit 2
   ;;
 esac

@@ -646,6 +646,15 @@ def sendRaw (c : Conn) (data : ByteArray) (resume : Except IO.Error Unit → IO 
     withdrawRaw c.idx .write
     resume (.error (.userError "Io.sendRaw: the loop refused a write submission"))
 
+/-- **Sleep, raw**: resume after `d` on the clock's `schedule` (passed in so this file does not import the
+clock seam — the same seam `recvTimeoutRaw` arms through). One timer, one resume, on the thread the clock's
+timer fires on; the `Cancel` is made here so the deadline can be cancelled by the clock's own machinery, but
+nothing here cancels it. -/
+def sleepRaw (schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit)
+    (d : Std.Time.Millisecond.Offset) (resume : IO Unit) : IO Unit := do
+  let cancel ← Task.Cancel.new
+  schedule d cancel resume
+
 /-- **Close, raw** (experiment): close the connection's handle on the loop thread. The result is `true` when
 the shim accepted the submission, `false` when it refused -- a caller that reports a clean close must read it,
 because a refused close left the handle's end unreported. -/

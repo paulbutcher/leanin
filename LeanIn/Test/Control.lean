@@ -8,6 +8,7 @@ import LeanIn.Runtime.Leaf
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Time
 import LeanIn.Runtime.Blocking
+import LeanIn.Test.Machines
 import LeanIn.Task.Sync
 import LeanIn.Task.Registry
 
@@ -1398,6 +1399,155 @@ def runtimeHttpService : IO UInt32 := do
   return 0
 
 
+
+/-- **M3's evidence: time as an effect in a compiled machine, at the harness clock's stated instants.**
+
+Two clauses in one invocation, each with its own listener, executor and `HarnessClock`, and each served by a
+compiled machine whose close submission the run awaits through a `Join` cell (so the run holds until the
+machine's terminal step, not its first suspension; the client's read to EOF observes the socket's closure). Clause one is `amDelayed` — read a request, `sleepRaw` `d` on the harness
+clock, answer, close: the client must see nothing until the clock reaches `d`, and then the echo, so its
+readings are the affirmative control for clause two's empty one. Clause two is `amStall` — a `recvTimeoutRaw`
+race against the same stated instant: the client never sends, so the deadline wins, the connection ends with
+nothing written, and `at` is the harness clock's own reading when the run has returned, exactly SC20-O3's
+relation. The client is deliberately `Std.Async`'s, driven by `Async.block` on this thread.
+
+Records: `dl|` and `st|`, each with the stated instant, `at`, the bytes its client read (escaped as
+`escBytes` does), `pendingAfter` (the harness clock's own outstanding-timer count), the server-side threads,
+and the executor's holdings (`heldBefore` read while three items are deliberately queued).
+
+Diagnostic: `lake exe controls --runtime-machine-time`. -/
+def runtimeMachineTime : IO UInt32 := do
+  let request : ByteArray := "tick tock".toUTF8
+  let d : Std.Time.Millisecond.Offset := 30
+  let dMs : Nat := d.val.toNat
+  let clientBound : Std.Time.Millisecond.Offset := 5000
+
+  -- ================= clause one: a delayed answer (`dl|`) — sleepRaw on the harness clock =================
+  let dlStart ← IO.monoNanosNow
+  let hooks1 ← Runtime.Hooks.new
+  let l1 ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep1 ← IO.mkRef l1
+  let addr1 ← Runtime.Listener.sockName l1
+  let e1 ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids1 ← IO.mkRef ([] : List UInt64)
+  for _ in List.range 3 do e1.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore1, _) ← e1.observe
+  let hc1 ← Runtime.HarnessClock.new
+  let push1 := Runtime.sharedPush e1
+  -- The reusable wake composition: arming from the loop's thread also nudges the parked driver through the
+  -- inject (see `HarnessClock.clockWithWake`'s own note).
+  let clock1 := Runtime.HarnessClock.clockWithWake hc1 push1
+  let cell1 ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
+  let server1 : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids1.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    let c ← Runtime.Listener.accept l1 hooks1
+    monadLift (amDelayed.run c clock1 d (fun r => Task.Join.resolve cell1 push1 r))
+    let cancel ← monadLift (Task.Cancel.new : IO Task.Cancel)
+    let r ← LeanIn.Task.EAsync.ofAsync
+      (LeanIn.Task.Async.await (show LeanIn.Task.Task (Except IO.Error Unit) from ⟨cell1, cancel⟩))
+    match r with
+    | .error e => throw e
+    | .ok _ => pure ()
+  let server1T ← IO.asTask (Runtime.runVirtual hc1 e1 server1) _root_.Task.Priority.dedicated
+  let dlClient ←
+    try
+      Except.ok <$> Std.Async.Async.block (do
+        let c ← Std.Async.TCP.Socket.Client.mk
+        c.connect addr1
+        c.send request
+        let (bytes, bounded) ← clientRead c none clientBound
+        if bounded then
+          let _ ← try c.shutdown catch _ => pure ()
+        return (bytes, bounded))
+    catch e => pure (Except.error e)
+  let (got1, bounded1) := match dlClient with
+    | .ok rb => rb
+    | .error _ => (ByteArray.empty, true)
+  -- Grace rounds on **both** paths: on the normal one the run has already completed (the machine's terminal
+  -- step resolved the cell the run awaits), so these rounds cost nothing; on a bounded read they give the
+  -- stalled run a bounded chance to finish. Expiry is loud rather than an unbounded wait.
+  let mut rounds1 := 0
+  while (← IO.getTaskState server1T) != .finished && rounds1 < 500 do
+    let _ ← Std.Async.Async.block (Std.Async.sleep 20)
+    rounds1 := rounds1 + 1
+  if (← IO.getTaskState server1T) != .finished then
+    IO.eprintln "runtime-machine-time: the delayed-answer server is still running after the grace rounds"
+    return 1
+  let dlOutcome ← IO.wait server1T
+  let _ ← Runtime.Listener.sockName (← keep1.get)
+  let at1Ms ← Runtime.HarnessClock.now hc1
+  let pendingAfter1 ← Runtime.HarnessClock.pending hc1
+  let tids1 ← srvTids1.get
+  let distinct1 := distinctOf tids1
+  let (inFlightAfter1, _) ← e1.observe
+  let dlUs := ((← IO.monoNanosNow) - dlStart) / 1000
+  match dlOutcome with
+  | .error err => IO.println s!"dl|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"dl|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"dl|delay={dMs}|at={at1Ms}|got={escBytes got1}|bounded={if bounded1 then "yes" else "no"}|pendingAfter={pendingAfter1}|carrierThreads={distinct1.length}|heldBefore={heldBefore1}|inFlightAfter={inFlightAfter1}|runUs={dlUs}"
+
+  -- ================= clause two: a stalled peer (`st|`) — the recvTimeout race on the harness clock ==========
+  let stStart ← IO.monoNanosNow
+  let hooks2 ← Runtime.Hooks.new
+  let l2 ← Runtime.Listener.bind (Runtime.loopback 0)
+  let keep2 ← IO.mkRef l2
+  let addr2 ← Runtime.Listener.sockName l2
+  let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let srvTids2 ← IO.mkRef ([] : List UInt64)
+  for _ in List.range 3 do e2.submit (LeanIn.Task.Item.ofAction (pure ()))
+  let (heldBefore2, _) ← e2.observe
+  let hc2 ← Runtime.HarnessClock.new
+  let cell2 ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
+  let push2 := Runtime.sharedPush e2
+  let server2 : LeanIn.Task.EAsync IO.Error Unit := do
+    srvTids2.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
+    let c ← Runtime.Listener.accept l2 hooks2
+    monadLift (amStall.run c (Runtime.HarnessClock.clockWithWake hc2 push2) d (fun r => Task.Join.resolve cell2 push2 r))
+    let cancel ← monadLift (Task.Cancel.new : IO Task.Cancel)
+    let r ← LeanIn.Task.EAsync.ofAsync
+      (LeanIn.Task.Async.await (show LeanIn.Task.Task (Except IO.Error Unit) from ⟨cell2, cancel⟩))
+    match r with
+    | .error e => throw e
+    | .ok _ => pure ()
+  let server2T ← IO.asTask (Runtime.runVirtual hc2 e2 server2) _root_.Task.Priority.dedicated
+  let stClient ←
+    try
+      Except.ok <$> Std.Async.Async.block (do
+        let c ← Std.Async.TCP.Socket.Client.mk
+        c.connect addr2
+        let (bytes, bounded) ← clientRead c none clientBound
+        if bounded then
+          let _ ← try c.shutdown catch _ => pure ()
+        return (bytes, bounded))
+    catch e => pure (Except.error e)
+  let (got2, bounded2) := match stClient with
+    | .ok rb => rb
+    | .error _ => (ByteArray.empty, true)
+  -- Grace rounds on **both** paths: on the normal one the run has already completed (the machine's terminal
+  -- step resolved the cell the run awaits), so these rounds cost nothing; on a bounded read they give the
+  -- stalled run a bounded chance to finish. Expiry is loud rather than an unbounded wait.
+  let mut rounds2 := 0
+  while (← IO.getTaskState server2T) != .finished && rounds2 < 500 do
+    let _ ← Std.Async.Async.block (Std.Async.sleep 20)
+    rounds2 := rounds2 + 1
+  if (← IO.getTaskState server2T) != .finished then
+    IO.eprintln "runtime-machine-time: the stalled-peer server is still running after the grace rounds"
+    return 1
+  let stOutcome ← IO.wait server2T
+  let _ ← Runtime.Listener.sockName (← keep2.get)
+  let at2Ms ← Runtime.HarnessClock.now hc2
+  let pendingAfter2 ← Runtime.HarnessClock.pending hc2
+  let tids2 ← srvTids2.get
+  let distinct2 := distinctOf tids2
+  let (inFlightAfter2, _) ← e2.observe
+  let stUs := ((← IO.monoNanosNow) - stStart) / 1000
+  match stOutcome with
+  | .error err => IO.println s!"st|failed={err}"; return 1
+  | .ok (.error err) => IO.println s!"st|failed={err}"; return 1
+  | .ok (.ok ()) =>
+    IO.println s!"st|stall={dMs}|at={at2Ms}|clientGot={escBytes got2}|bounded={if bounded2 then "yes" else "no"}|pendingAfter={pendingAfter2}|carrierThreads={distinct2.length}|heldBefore={heldBefore2}|inFlightAfter={inFlightAfter2}|runUs={stUs}"
+  return 0
 
 /-- Throwaway, for W1's outbound direction and W3's acceptance: do `Std.Async`'s leaves work through the seam,
 and do timers overlap on one carrier? Four tasks each awaiting a 50ms `Std.Async.sleep` should take about 50ms,
@@ -4964,6 +5114,7 @@ def runMode (args : List String) : IO UInt32 := do
   | "--runtime-net" :: _ => return ← runtimeNet
   | "--runtime-http" :: _ => return ← runtimeHttp
   | "--runtime-http-service" :: _ => return ← runtimeHttpService
+  | "--runtime-machine-time" :: _ => return ← runtimeMachineTime
   | "--runtime-time" :: _ => return ← runtimeTime
   | "--runtime-connect" :: _ => return ← runtimeConnect
   | "--runtime-drain" :: _ => return ← runtimeDrain
