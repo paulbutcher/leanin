@@ -95,10 +95,14 @@ instructions at C=32; `pump` is ~34 % and flat across levels.
   client's completed count covers the whole run, and an attempt to gate counting with `--instr-atstart=no` plus
   `callgrind_control -i on/-d` produced implausible totals (≈300 Ir/request). No reliable per-site allocation
   counts were obtained with the available unprivileged tools; the Ir *shares* above remain indicative.
-- *Slot arrays for raw registrations*: replacing the `HashMap (conn, op) → resume` with a fixed 16 k-entry array
-  was **catastrophically slower** (9.2 k rps, 10.4 µs/request against 128–135 k, 7.1 µs) — the `set!` copies the
-  array per operation. Reverted. A retry needs a genuinely mutable store (or the shim's own slot table), not
-  `Array.set!` under a mutex.
+- *Slot arrays for raw registrations*: a first attempt was **catastrophically slower** (9.2 k rps, 10.4 µs
+  against 128–135 k, 7.1 µs). The cause was aliasing, not the design: reading the array out of the cell leaves a
+  second reference in it, so `set!` copies the whole array per operation. Taking the value out of the cell
+  (leaving it empty), updating in place, and putting it back — the discipline a single-carrier runtime allows —
+  restores parity exactly: **6.96–7.19 µs at C=8 and 8.15–8.28 at C=32 against the map's 7.04–7.10 and
+  8.19–8.43**. No gain, so it was reverted: the hash map's hashing and per-op allocation are not the C-growth
+  either. The discipline itself is the reusable lesson — in-place updates are available, but every reference
+  held during the update must be removed first.
 
 **That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
 representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
