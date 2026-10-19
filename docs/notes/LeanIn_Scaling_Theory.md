@@ -195,6 +195,11 @@ Both reverted. Parallelism is not available through the current machinery: one l
 and a cross-thread wake per completion. Getting it would need a delivery design that batches completions per
 carrier — a project of its own, not a configuration.
 
+**Direct writes from the loop thread (approach 4): within noise.** The shim was changed to attempt `uv_try_write`
+for a submission made on the loop thread when nothing is queued or in flight, pushing the completion in the same
+iteration (partial writes and `EAGAIN` fall back to the queue). Correct — SC19/20/27 pass — but the interleaved
+sign test read 3/5 at C=32 and 4/5 at C=8 with 0–2 % differences: not a win, not landed.
+
 **That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
 representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
 cost is what grows with connections. The note's fixed-frame proposal should be re-read against this profile
