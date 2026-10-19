@@ -69,10 +69,27 @@ Three integration defects were found and fixed on the way:
 | before | 112.4 / 111.3 / 115.4 k | 8.39 / 8.59 / 8.37 | 63 / 65 / 63 µs |
 | **swept deadline** | **120.4 / 128.0 / 132.7 k** | **7.66 / 7.44 / 7.28** | **58 / 56 / 55 µs** |
 
-That is ~1.0 µs less CPU per request (+12 % throughput, p50 −12 %), and the pinned threeway reads 116 191
-against Node's 100 431 at C=8 (1.16×) and 106 673 against 103 433 at C=32 (1.03×). The remaining distance to the
-prototype's 7.05 µs is per-iteration bookkeeping (`sweepDue`, `stallNext?`, `rawLive`); that is the next small
-step, after which the pump is the only remaining per-request item.
+That is ~1.0 µs less CPU per request (+12 % throughput, p50 −12 %). The pinned threeway in the fast host state
+reads ~0.94× Node at C=8 and ~0.81× at C=32; repeated medians, not single runs, are the number to quote.
+
+**Next lever, measured: the sweep's per-iteration scans.** Per-request CPU rises with connections — 7.04 µs at
+C=8, 7.46 at C=16, 8.32 at C=32 — and a variant that skips `sweepDue`/`stallNext?` entirely reads 25–35 %
+faster in the same session. So the scans are the C-growth. Two replacement designs were tried and **both
+regressed**:
+
+- two indexes (by connection, by deadline): the request path grew two map writes plus bucket filtering, −25 %;
+- a FIFO of deadlines (array + head index): collapsed to 17 µs/request — the array grows without compaction.
+
+The next design should keep the request path at one insert and one erase: a **`List`-headed FIFO with stale
+skipping and periodic compaction**, or a cached minimum recomputed only when the minimum leaves. Validate with
+the same attribution harness before any threeway claim.
+
+**Then the pump**: driver minus no-parse is now ~2.3 µs/request, of which `h1bench` attributes 0.41 to parsing.
+That is the last per-request item before carriers.
+
+**Measurement hygiene**: two benchmark servers from an interrupted run survived their `kill` and distorted a
+round of A/Bs, and the host can carry unrelated load (observed 4.9); check `pgrep` and the load average before
+believing any absolute figure, and trust only same-session pairs.
 
 ## The theory
 
