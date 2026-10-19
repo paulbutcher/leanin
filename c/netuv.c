@@ -96,6 +96,7 @@ typedef struct {
      event per delivery; `np_uv_take` drains the buffer and re-arms if backpressure stopped it. */
   int reading;
   int pending;
+  int writes;        /* writes in flight through the queue; a loop-thread write goes direct only at 0 */
   int eof;
   int rerr;      /* SUB_SHUTDOWN was applied: the write side is going away, so a close must drain first */
 } conn_t;
@@ -380,6 +381,7 @@ static void on_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b) {
 static void on_write(uv_write_t *req, int status) {
   write_req_t *w = (write_req_t *)req;
   conn_t *c = w->c;
+  if (c->writes > 0) c->writes--;
   free(w->p);
   free(w);
   push_ev(EV_WRITE, (uint64_t)c->idx, (uint64_t)(int64_t)status);
@@ -703,6 +705,39 @@ LEAN_EXPORT lean_object *np_uv_write(uint32_t idx, lean_object *bytes) {
 LEAN_EXPORT lean_object *np_uv_writev(uint32_t idx, lean_object *chunks) {
   size_t total = 0;
   size_t k = lean_array_size(chunks);
+  conn_t *c = (idx < MAX_CONN) ? &g_conns[idx] : NULL;
+  /* A write the loop thread submits itself, with nothing queued and none in flight, goes straight out: the
+     completion is pushed in this same iteration, so the driver does not park on it and the queue/wake is not
+     touched. Partial writes and EAGAIN fall back to the ordinary submission, preserving order. */
+  if (c != NULL && c->used && g_loop_running && g_sub_n == 0 && c->writes == 0 && k > 0 && k <= 8) {
+    uv_buf_t bufs[8];
+    size_t sum = 0;
+    for (size_t i = 0; i < k; i++) {
+      lean_object *ch = lean_array_get_core(chunks, i);
+      bufs[i].base = lean_sarray_cptr(ch);
+      bufs[i].len = lean_sarray_size(ch);
+      sum += bufs[i].len;
+    }
+    if (sum == 0) { push_ev(EV_WRITE, idx, 0); return lean_io_result_mk_ok(lean_box_uint32(1)); }
+    int r = uv_try_write((uv_stream_t *)&c->handle, bufs, (unsigned)k);
+    if (r == (int)sum) { push_ev(EV_WRITE, idx, 0); return lean_io_result_mk_ok(lean_box_uint32(1)); }
+    if (r >= 0) {
+      size_t rem = sum - (size_t)r, off = (size_t)r, done = 0;
+      char *q = malloc(rem);
+      if (q == NULL) return lean_io_result_mk_ok(lean_box_uint32(0));
+      for (size_t i = 0; i < k && done < rem; i++) {
+        size_t len = bufs[i].len;
+        if (off >= len) { off -= len; continue; }
+        size_t take = len - off;
+        if (take > rem - done) take = rem - done;
+        memcpy(q + done, (const char *)bufs[i].base + off, take);
+        done += take; off = 0;
+      }
+      c->writes++;
+      return lean_io_result_mk_ok(lean_box_uint32((uint32_t)push_submit(SUB_WRITE, idx, q, rem, 0)));
+    }
+    if (r != UV_EAGAIN) { push_ev(EV_WRITE, idx, (uint64_t)(int64_t)r); return lean_io_result_mk_ok(lean_box_uint32(1)); }
+  }
   for (size_t i = 0; i < k; i++) total += lean_sarray_size(lean_array_get_core(chunks, i));
   char *p = NULL;
   if (total > 0) {

@@ -833,6 +833,23 @@ against 0.945 before the change and ~1.04 for the pre-change build; one traced i
 step toward C=1 parity. At C=8 and C=32 the same changes are what the wins above measure: ~15.6 % and ~10 %
 ahead of the pre-change build paired (1/0.865 and 1/0.909, 9/9).
 
+**Direct writes from the loop thread (the next 2.6 %, and where C=1 now stands).** The shim now attempts
+`uv_try_write` for a submission the loop thread makes when nothing is queued and no write is in flight, pushing
+the completion in the same iteration; partial writes and `EAGAIN` queue the remainder, preserving order. Paired
+against the same build: **+2.6 % at C=1 (9/9, IQR 1.012–1.028)**, 1.000 at C=8 and 0.991 at C=32. The paired
+C=1 ratio against Node still reads **0.933** (node 72.8 k, ours 68.4 k), so the A/B gain is real but sits inside
+the run-to-run spread of the node comparison; it is not enough to overtake Node at one connection. The reason is
+visible in per-request cost: at C=1 the server spends **11.6 µs of CPU per request against Node's 8.3 µs**
+(`/proc` deltas over a pinned window; round trip 14.3 against 13.4 µs, so the CPU is what the gap is made of).
+Per request that is ~59 k instructions, and the profile's named contributors are refcount traffic
+(`lean_dec_ref_cold`, `lean_alloc_small_object_core`), GC marking (`lean_mark_mt`), malloc/free, and string
+building for the response (`lean_string_utf8_set`, `lean_string_append`, `Std.Http`'s `shouldKeepAlive`).
+
+Two further attempts were measured and discarded. Suppressing the async wake for loop-thread submissions removed
+the empty poll but collapsed the server to ~1.5 k req/s: the wake is load-bearing on that path. Caching the stall
+table's earliest deadline (one lock and no per-iteration traversal) measured 0.990 against the current build — the
+2.3 % that removing the scan calls had shown did not come from the traversal. Neither is in the tree.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
