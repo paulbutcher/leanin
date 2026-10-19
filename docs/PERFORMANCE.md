@@ -866,6 +866,13 @@ free. It measured **0.968 at C=1 and 0.871 at C=32** against the HashMap build: 
 `Std.Mutex` are slower than the hash insert they replace even when the array is small, so the shape is rejected
 on its own merits rather than on a bug. The registry is not where the floor is.
 
+**Thread topology is worth ~4 % at C=1, and the one-core comparison is conservative.** The runtime runs the
+loop and a carrier as two threads; under the benchmark's default both inherit one pinned core, while Node is a
+single thread. Paired, giving the server two cores reads **1.037 at C=1** (median; IQR 1.03–1.08) and **1.000 at
+C=32**. So the standing one-core-per-side rows understate us slightly at C=1 — the two-core ratio against Node
+would be ~0.975 — but the effect is not the ~6–10 % the C=1 gap needs, and it is a deployment allowance rather
+than a code win. The benchmark keeps the one-core convention for both sides so the comparison stays conservative.
+
 **Sustained load, the realistic shape.** One server at a time, pinned, driven back to back for 150 s at C=32 and
 120 s at C=1 (5 s samples, no gaps), to test whether leaving the server up favours ours:
 
