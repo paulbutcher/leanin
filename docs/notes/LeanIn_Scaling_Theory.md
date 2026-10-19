@@ -155,6 +155,13 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
 wins when replaced locally; every micro-change measured parity or worse.
 
+**Wake checks (does I/O wake the loop correctly?).** A missed wake shows up as latency quantised at the poll
+timeout, so each shape was measured with the *same client* against Node as the control: busy (20 k requests),
+5 ms gaps, and 100 ms idle. LeanIn: p50 11 µs / p99 20 / p99.9 72 busy, p99 1.07 ms gapped, p50 242 µs idle;
+Node: p50 12 / p99 61 / **p99.9 2.3 ms** busy, p99 1.27 ms gapped, p50 409 µs idle. Both arms share the tails and
+LeanIn's are smaller, so the outliers are client/host scheduling, not a stalled loop. Per-request orchestration is
+also ~0 (Deque.pop 0.30/req, every other executor call 0.00), consistent with the raw path resuming inline.
+
 **Carriers, measured two ways — both fail.**
 
 - *Wired and correct, no effect.* With `Runtime.runCarriers` fixed to drive the loop while it waits (the caller
