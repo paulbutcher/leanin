@@ -153,8 +153,22 @@ total (the format drops some position encodings), so treat self-cost *rankings* 
   short-circuiting `findSome?` scans, and the single pass visits every header instead of stopping early.
 
 So the profile's named sites (`String.mapAux`, literal allocation, `Range.forIn`) do not translate into wall-time
-wins when replaced locally; every micro-change measured parity or worse. The remaining levers are structural:
-the per-transition state allocation (frame) and carriers.
+wins when replaced locally; every micro-change measured parity or worse.
+
+**Carriers, measured two ways — both fail.**
+
+- *Wired and correct, no effect.* With `Runtime.runCarriers` fixed to drive the loop while it waits (the caller
+  pumps; `Io.takeover` so one driver), a `carriers=2/3` server serves correctly but reads 130.9–132.9 k at C=8
+  and 113.7–116.0 k at C=32 — identical to one carrier. Raw completions resume **inline on the loop thread**, so
+  extra carriers execute no connection work.
+- *Inject delivery.* Routing raw completions through the executor's inject (so steps run on carriers) is **much
+  worse and anti-scaling**: C=8 reads 82 k with two carriers and 79 k with three against 125 k inline, at 2.5–3.3
+  µs/request against 0.72. One push and wake per completion costs more than any parallelism gained, and more
+  carriers lose more.
+
+Both reverted. Parallelism is not available through the current machinery: one loop thread that must also pump,
+and a cross-thread wake per completion. Getting it would need a delivery design that batches completions per
+carrier — a project of its own, not a configuration.
 
 **That makes allocation the target, and it revives the supervisor note's direction** with evidence: a state
 representation that allocates a constructor per transition feeds both `dec_ref` and the mark phase, and the mark
