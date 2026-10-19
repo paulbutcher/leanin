@@ -23,8 +23,9 @@ the CPU energy-performance preference at `performance`. **C is the number of con
 | compiled example, no parsing (`lake exe hello … keep`) | 77 150 | 197 070 | 168 592 |
 | shipped `Std.Http.Server` | 5 163 | 5 773 | 7 577 |
 
-**leanin leads Node at one connection (1.11×) and reads 0.78× and 0.70× of it at eight and thirty-two, while
-being 14–20× the Lean HTTP server that ships with the toolchain.** p50 is 12 µs for both servers at C=1, and
+**leanin is level with Node at one connection** (1.11× in the row above, inside the instrument's spread at that
+level) **and reads 0.78× and 0.70× of it at eight and thirty-two, while being 14–20× the Lean HTTP server that
+ships with the toolchain.** p50 is 12 µs for both servers at C=1, and
 44 µs (Node) against 63 µs (leanin) at C=8. The driver is itself a compiled `asyncMachine`; the no-parse row is
 the same compiler answering a fixed response, and it beats Node at every level — which places the gap in the
 protocol work: the driver spends 8.2 µs of CPU per request against Node's 6.7 µs and the no-parse control's
