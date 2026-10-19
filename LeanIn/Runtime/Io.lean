@@ -129,6 +129,9 @@ private inductive Result where
   | read (data : Option ByteArray)
   /-- A write or a shutdown completed. -/
   | done
+  /-- The stall bound expired before the read completed. Delivered by the driver's sweep as *data*, so the
+  stall slot need not publish the read's continuation into a global table. -/
+  | timedOut
 
 /-- One operation parked for the loop to complete: the connection it is on, what it is, the cell its result
 lands in, and the route the loop thread delivers on — the submitting step's own shared route. -/
@@ -428,7 +431,6 @@ registration on the hot path at all. The driver sweeps expired slots on its own 
 `driveOnce`), which is where the stall bound is enforced. -/
 private structure StallSlot where
   deadline : Nat
-  fire     : IO Unit
 
 private initialize stallRef : Std.Mutex (Std.TreeMap UInt32 StallSlot) ←
   Std.Mutex.new Std.TreeMap.empty
@@ -460,8 +462,8 @@ private def sweepDue : IO Bool := do
     let due := m.toList.filter (fun (_, s) => s.deadline ≤ now)
     set (due.foldl (fun m (c, _) => m.erase c) m)
     pure due
-  for (_, s) in due do
-    s.fire
+  for (c, _) in due do
+    rawResume c .read (.ok .timedOut)
   pure (!due.isEmpty)
 
 /-- **One pump of the I/O loop**, the loop's only driver. Drain the timers carriers scheduled into the wheel,
@@ -732,11 +734,20 @@ def recvStallRaw (c : Conn) (d : Std.Time.Millisecond.Offset) (size : UInt64)
     (resume : Option (Except IO.Error (Option ByteArray)) → IO Unit) : IO Unit := do
   let now ← IO.monoNanosNow
   stallRef.atomically do
-    modify (·.insert c.idx { deadline := now + d.toInt.toNat * 1000000,
-                             fire := do withdrawRaw c.idx .read; resume none })
-  recvRaw c size (fun r => do
+    modify (·.insert c.idx { deadline := now + d.toInt.toNat * 1000000 })
+  -- Registered directly rather than through `recvRaw`, whose wrapper maps any non-`read` result to an error:
+  -- the sweep's `timedOut` must arrive here as `none`, the driver's timeout signal.
+  registerRaw c.idx .read (fun r => do
     stallRef.atomically do modify (·.erase c.idx)
-    resume (some r))
+    match r with
+    | .ok .timedOut    => resume none
+    | .ok (.read d)    => resume (some (Except.ok d))
+    | .ok _            => resume (some (Except.error (.userError "Io.recvStallRaw: the loop delivered a mismatched completion")))
+    | .error e         => resume (some (Except.error e)))
+  unless (← npUvRead c.idx size) != 0 do
+    withdrawRaw c.idx .read
+    closeOnRefusal c "a refused read submission"
+    resume (some (Except.error (.userError "Io.recvStallRaw: the loop refused a read submission")))
 
 /-- **Send, raw** (experiment): like `send`, with the completion run on the loop thread. A refused submission
 resumes an error rather than dropping the continuation: a write that never happened is not a completion. -/

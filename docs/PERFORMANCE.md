@@ -860,6 +860,22 @@ semantics-preserving as written, because it returns before arming the wheel time
 Neither variant is in the tree. The counters and the owner contract remain the useful artefacts: they settle that
 the old branch was inert (`gate_loop=200, attempts=0`) and that activating it is not a win on this driver.
 
+**Clean per-request attribution, and candidate 3.** Differencing profiles at 300 and 1000 requests gives
+**58 807 Ir/request** (700-request delta, startup cancels). The top terms: `lean_dec_ref_cold` 8 668 (14.7 %),
+`mi_free` 4 535 (7.7 %), **`lean_mark_mt` 4 282 (7.3 %)**, `lean_alloc_small_object_core` 2 390 (4.1 %),
+`Std.Mutex.atomically` on a cancellation token 2 095 (3.6 %), `lean_apply_2` 1 517, pthread lock/unlock 2 267,
+string building (`utf8_set` + `append` + `shouldKeepAlive`) 2 954, `driveOnce` 1 098, `findLF` 1 018,
+`copy_expand_array` 1 008. The review note's candidate 3 has a real 7.3 % ceiling, and the ablation of the whole
+stall machinery measures 2 941 Ir/request (5.0 %).
+
+**The stall slot now carries data, not a continuation.** `StallSlot` holds only its deadline, and the sweep
+delivers the timeout as `.ok .timedOut` through the raw registration instead of calling a stored `fire` closure.
+`recvStallRaw` registers directly (the `recvRaw` wrapper maps any non-`read` result to an error, which would have
+turned a timeout into a mismatch error). This removes the per-read closure allocation and its publication into
+the global stall table — 1 083 Ir/request (1.8 %). Paired: **1.016 at C=1, 1.025 at C=8, 1.012 at C=32**. SC24
+still reports the stall at the exact instant and every other scenario passes. The remaining publication is the
+raw registry's resume closure, which is where the rest of the 7.3 % marking term lives.
+
 
 **What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
 **12.07 µs** per request against Node's **8.92 µs**, but the same runtime and shim with **no protocol at all**
