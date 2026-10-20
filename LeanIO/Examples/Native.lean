@@ -224,7 +224,7 @@ def uploadSave : Handler :=
 `Content-Length` body, while a streaming route would `recv` and `write` instead. -/
 def echo : Handler :=
   fun req w => do
-    let body ← LeanIO.Backend.LeanIn.readAll req.body .empty
+    let body ← req.body.readAll
     LeanIO.Backend.LeanIn.respond w 200 "OK" body
 
 def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :=

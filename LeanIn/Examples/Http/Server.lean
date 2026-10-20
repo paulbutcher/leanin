@@ -261,6 +261,19 @@ structure BodyReader where
   /-- Bytes after the body: the machine resumes from these when the connection is reused. -/
   leftover : VM ByteArray
 
+namespace BodyReader
+
+/-- Read the whole body through the reader. A stock `Body.Stream` client's `readAll` maps to this; it
+accumulates, so it is for bounded bodies, while `recv` is the streaming path. -/
+partial def readAllLoop (r : BodyReader) (acc : ByteArray) : VM ByteArray := do
+  match ← r.recv 65536 with
+  | some chunk => readAllLoop r (acc ++ chunk)
+  | none => pure acc
+
+def readAll (r : BodyReader) : VM ByteArray := readAllLoop r .empty
+
+end BodyReader
+
 /-- A response body as the handler writes it. `start` sends the head and fixes the framing: a declared
 `Content-Length`, else chunked on HTTP/1.1, else close-delimited. A transport failure in any of the three sends
 — the head, a body chunk, the terminating chunk of `finish` — aborts rather than raising: there is no peer left

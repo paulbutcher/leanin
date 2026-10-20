@@ -12,6 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
+| 2026-10-20 | `Server.BodyReader.readAll` | the stock `body.readAll` call shape exists on the native reader; it accumulates, so bounded bodies only |
 | 2026-10-20 | `Backend.LeanIn`: Std `Method`/`Version`/`Headers` parts extractors and a `Request.line` view | stock-style middleware/handler accessors work without rewriting; only an explicit stock request type remains a source change |
 | 2026-10-20 | `Backend.LeanIn.Middlewares`: `catchErrors`, `requestLogger`, `withExtension`, `auth` over the native handler; native `Request` carries typed extensions | the built-in middleware is usable natively with the stock names/parameters; only custom HandlerFn middleware remains a source change |
 | 2026-10-20 | `Backend.LeanIn`: `IntoResponseM`/`RunBody`, so stock-style route bodies (`=> "text"`, status tuples, JSON values, `Except`, `ResponseHead × ByteArray`) work on the native backend; native `FromRequestBodyM` for `Form`/`ByteArray`; `FromRequestPartsM` for `Path` and `URI.Query` | the native route syntax can use the body and parts binder forms, not only JSON/text |
@@ -79,6 +80,22 @@ drives a half-closed peer at the public socket: it reads zero post-close respons
 fresh connection afterwards. The middleware no longer classifies by message text — an `Http:`-prefixed
 **application** error is an ordinary raise, answered 500 with its `toString` body (`HC2`) — and the buffered
 entrypoint has no scope, so an explicit abort in one of its handlers fails loudly rather than closing.
+
+### Migrating an application to the native API
+
+Route declarations and built-in middleware are source-compatible under `set_option leanio.backend.native true`;
+three boundaries change:
+
+| Stock | Native |
+|---|---|
+| `(req : Request Body.Stream)` | omit the annotation (inferred native `Request`) or name `LeanIO.Backend.LeanIn.Request`; `req.line.*`, `req.header?`, `req.path`, `req.extensions` are the same shape |
+| `← req.body.readAll` in `ContextAsync` | `← req.body.readAll` in `VM` (`BodyReader.readAll`), or `req.body.recv n` for streaming |
+| custom middleware `fun next req => do …` over `HandlerFn` | `fun next req w => do …` over `Request → ResponseWriter → VM Unit`; respond with `LeanIO.Backend.LeanIn.respond`/`w.start`/`w.write`/`w.finish` |
+| stock streaming `Body.Stream`/`Response Body.Any` | `BodyReader.recv` and `ResponseWriter` chunks; responses are framed by the writer |
+
+Built-ins (`catchErrors`, `requestLogger`, `withExtension`, `auth`) need only the import
+`LeanIO.Backend.LeanIn.Middlewares`; auth validators run in `VM Bool`. Explicit stock class constraints
+(`FromRequestBody`/`FromRequestParts`) become the native `...M` classes; binder syntax is unchanged.
 
 ## Working rules
 
