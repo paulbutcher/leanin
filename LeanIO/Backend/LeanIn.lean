@@ -6,6 +6,7 @@ import Std.Http.Data.Method
 import Lean
 import LeanIO.Data.Headers.MimeType
 import LeanIO.Request.FromRequestBody
+import LeanIO.Request.Form
 
 /-!
 # The LeanIn backend
@@ -127,6 +128,20 @@ def jsonBody (α : Type) [Lean.FromJson α] [LeanIO.MimeType.HasMimeTypes (LeanI
         match Lean.FromJson.fromJson? (α := α) j with
         | .ok a => .ok a
         | .error e => .error (422, s!"body does not fit: {e}")
+
+/-- Decode an `application/x-www-form-urlencoded` body. The query parser and `FromForm` are LeanIO's; only the
+transport (buffered bytes instead of a stock body stream) is the backend's. -/
+def formBody (α : Type) [LeanIO.FromForm α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Form α)] (r : Request) :
+    Except (Nat × String) α :=
+  if !r.mimeOk (LeanIO.Form α) then
+    .error (415, "unsupported media type")
+  else
+    match LeanIO.parseQuery {} r.body.iter with
+    | .success _ query =>
+      match LeanIO.FromForm.fromForm (α := α) query with
+      | .ok v => .ok v
+      | .error e => .error (422, s!"body does not fit: {e}")
+    | .error _ _ => .error (400, "malformed form body")
 
 /-- A plain-text body, with the same media-type check. -/
 def textBody (r : Request) : Except (Nat × String) String :=

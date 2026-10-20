@@ -58,6 +58,16 @@ def postText : Handler :=
     | .ok text => pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"text: {text}\n".toUTF8)
     | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
 
+/-- Form extraction: LeanIO's query parser and `FromForm` over the buffered body. -/
+def postForm : Handler :=
+  fun head body =>
+    match (LeanIO.Backend.LeanIn.formBody (Std.HashMap String String) { head, body }
+            : Except (Nat × String) (Std.HashMap String String)) with
+    | .ok m =>
+      let user := (m.get? "user").getD ""
+      pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"user={user}\n".toUTF8)
+    | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
+
 /-- Echo the buffered request body, at whatever length the body delivered. -/
 def echo : Handler :=
   fun _ body => pure (LeanIO.Backend.LeanIn.response 200 "OK" body)
@@ -69,6 +79,7 @@ def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
     |>.addRoute .post [Segment.lit "echo"] echo
     |>.addRoute .post [Segment.lit "todos"] postTodo
     |>.addRoute .post [Segment.lit "text"] postText
+    |>.addRoute .post [Segment.lit "form"] postForm
 
 end LeanIO.Examples.Native
 
