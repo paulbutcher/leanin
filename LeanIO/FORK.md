@@ -12,7 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
-| 2026-10-20 | `Backend.LeanIn`: `withMultipartStream`, `MReader`/`PartReader` with `stream`/`bytes`/`discard`/`save` | per-part streaming multipart on the native reader; the buffered `withMultipart` remains for whole-part consumers |
+| 2026-10-20 | `MultiPartForm` parameterised over `BodySource m body` (defaults `ContextAsync`/`Body.Stream`); native `BodySource VM BodyReader`; `readUntilGo` extracts from the read's start position | one upstream multipart parser serves both backends; the cursor fix makes headers split across reads parse correctly |
 
 ## Port status
 
@@ -47,10 +47,11 @@ native backend regardless of the option. A native body is an `AppM` computation 
 environment) and binders read through the native `FromRequestBodyM`/`NativeExtractor` classes;
 `nativeRoute GET "/ping" ping` takes an already-built handler.
 
-Multipart has both shapes: `withMultipart` reads whole parts, and `withMultipartStream` yields a `PartReader`
-per part with an incremental `recv`; `PartReader` also provides `stream`, `bytes`, `discard` and `save`.
-These are the native equivalents of the upstream part operations; the upstream `MultiPartForm`/`FormFile`
-class stack itself remains stock-typed.
+Multipart is the upstream parser parameterised over its body source: `BodySource m body` with defaults
+`ContextAsync`/`Body.Stream` keeps the stock API unchanged, and the native backend adds
+`BodySource VM BodyReader`. `MultiPartForm`/`FormFile`/`MultipartEntry` are therefore the same types and
+operations on both backends - `nextEntry`, `stream`, `discard`, `save` - and `withMultipartForm` runs them
+over the native request reader. One parser serves both.
 
 Cancellation is the transport's: a body or response operation that fails raises through the handler, and
 `catchErrors` re-raises transport failures rather than turning them into a 500 the peer can no longer receive.

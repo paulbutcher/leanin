@@ -8,6 +8,7 @@ public import Std.Http.Data.Method
 public import Lean
 public import LeanIO.Data.Headers.MimeType
 public import LeanIO.Request.FromRequestBody
+public import LeanIO.Request.MultiPartForm.Api
 public import LeanIO.Request.Form
 
 public section
@@ -267,15 +268,7 @@ def reasonFor : Nat → String
   | 501 => "Not Implemented"
   | _   => "Internal Server Error"
 
-/-- One part of a multipart form: its disposition, content type, headers and body. -/
-structure Part where
-  name : String
-  filename : Option String := none
-  contentType : String := "text/plain"
-  headers : Array (String × String) := #[]
-  body : ByteArray := .empty
-
-/-- Strip one pair of surrounding double quotes, as disposition parameters may carry them. -/
+/-- Strip one pair of surrounding double quotes. -/
 def unquote (s : String) : String :=
   if s.length ≥ 2 && s.startsWith "\"" && s.endsWith "\"" then
     (s.drop 1).dropEnd 1 |>.toString
@@ -289,251 +282,35 @@ def boundary? (r : Request) : Option String :=
       | ["boundary", b] => some (unquote (b.trimAscii.toString))
       | _ => none
 
-/-- Naive byte search: the index of `needle` in `hay` at or after `from`. -/
-def findBytes (hay : ByteArray) (needle : ByteArray) (start : Nat) : Option Nat := Id.run do
-  if needle.size == 0 || hay.size < needle.size then return none
-  let mut i := start
-  while i + needle.size ≤ hay.size do
-    let mut j := 0
-    while j < needle.size && hay.get! (i + j) == needle.get! j do j := j + 1
-    if j == needle.size then return some i
-    i := i + 1
-  return none
+/-- The native body source for the upstream multipart parser. -/
+instance : LeanIO.BodySource LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader where
+  recv r := r.recv 65536
 
-/-- A streaming multipart reader's state. -/
-structure MState where
-  buf : ByteArray := .empty
-  pos : Nat := 0
-  /-- 0: before the first delimiter, 1: headers, 2: part body, 3: done. -/
-  phase : Nat := 0
-  boundary : ByteArray := .empty
-deriving Inhabited
-
-/-- One part of a multipart body, read incrementally. -/
-structure PartReader where
-  name : String
-  filename : Option String := none
-  contentType : String := "text/plain"
-  headers : Array (String × String) := #[]
-  recv : Nat → LeanIn.Runtime.VM (Option ByteArray)
-
-/-- The streaming multipart reader. -/
-structure MReader where
-  next : LeanIn.Runtime.VM (Option PartReader)
-
-namespace PartReader
-
-/-- Stream a part body chunk by chunk; nothing is accumulated. -/
-partial def stream (p : PartReader) (cb : ByteArray → LeanIn.Runtime.VM Unit) : LeanIn.Runtime.VM Unit := do
-  match ← p.recv 65536 with
-  | some chunk => cb chunk; stream p cb
-  | none => pure ()
-
-/-- Read a part body whole (small parts only). -/
-partial def bytesLoop (p : PartReader) (acc : ByteArray) : LeanIn.Runtime.VM ByteArray := do
-  match ← p.recv 65536 with
-  | some chunk => bytesLoop p (acc ++ chunk)
-  | none => pure acc
-
-def bytes (p : PartReader) : LeanIn.Runtime.VM ByteArray := bytesLoop p .empty
-
-/-- Consume a part body without keeping it. -/
-def discard (p : PartReader) : LeanIn.Runtime.VM Unit :=
-  stream p (fun _ => pure ())
-
-/-- Write a part body to a file, chunk by chunk. -/
-def save (p : PartReader) (path : System.FilePath) : LeanIn.Runtime.VM Unit := do
-  let handle ← (monadLift (IO.FS.Handle.mk path .write) : LeanIn.Runtime.VM _)
-  let fs := IO.FS.Stream.ofHandle handle
-  stream p (fun chunk => monadLift (fs.write chunk : IO Unit))
-  monadLift (fs.flush : IO Unit)
-
-end PartReader
-
-namespace MP
-
-def getSt (st : IO.Ref MState) : LeanIn.Runtime.VM MState :=
-  monadLift (st.get : IO MState)
-
-def setSt (st : IO.Ref MState) (s : MState) : LeanIn.Runtime.VM Unit :=
-  monadLift (st.set s : IO Unit)
-
-def delim (boundary : ByteArray) : ByteArray := "\r\n--".toUTF8 ++ boundary
-
-/-- Append one socket read to the buffer; `false` at EOF. -/
-def more (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader) : LeanIn.Runtime.VM Bool := do
-  match ← c.recv 65536 with
-  | some chunk =>
-    let s ← getSt st
-    let compact := s.pos > 65536
-    let buf := if compact then s.buf.extract s.pos s.buf.size else s.buf
-    let pos := if compact then 0 else s.pos
-    setSt st { s with buf := buf ++ chunk, pos }
-    pure true
-  | none => pure false
-
-/-- Read until `marker` is in the buffer; the position of its start, or `none` at EOF. -/
-partial def seekMarker (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader)
-    (marker : ByteArray) : LeanIn.Runtime.VM (Option Nat) := do
-  let s ← getSt st
-  match findBytes s.buf marker s.pos with
-  | some i => pure (some i)
-  | none => if ← more st c then seekMarker st c marker else pure none
-
-def parseHeaderLines (head : String) : Array (String × String) :=
-  head.splitOn "\r\n" |>.filterMap (fun line =>
-    match line.splitOn ":" with
-    | n :: vs => some (n.trimAscii.toString.toLower, String.intercalate ":" vs |>.trimAscii.toString)
-    | _ => none) |>.toArray
-
-def param (hs : Array (String × String)) (key : String) : Option String :=
-  let disp := hs.findSome? fun (n, v) => if n == "content-disposition" then some v else none
-  disp.bind fun v =>
-    (v.splitOn ";").findSome? fun p =>
-      match p.trimAscii.toString.splitOn "=" with
-      | [k, x] => if k == key then some (unquote (x.trimAscii.toString)) else none
-      | _ => none
-
-/-- Consume the delimiter at the cursor and either finish (closing `--`) or move to the next part's headers. -/
-def finishPart (s : MState) : MState :=
-  let after := s.pos + 4 + s.boundary.size
-  if after + 2 ≤ s.buf.size && s.buf.get! after == 0x2D && s.buf.get! (after + 1) == 0x2D then
-    { s with pos := after + 2, phase := 3 }
-  else
-    { s with pos := after + 2, phase := 1 }
-
-/-- `recv` for one part: body bytes, stopping at the delimiter. -/
-partial def partRecv (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader) (n : Nat)
-    : LeanIn.Runtime.VM (Option ByteArray) := do
-  let s ← getSt st
-  let needle := delim s.boundary
-  match findBytes s.buf needle s.pos with
-  | some i =>
-    if i == s.pos then
-      if s.buf.size < s.pos + 4 + s.boundary.size + 2 then
-        if ← more st c then partRecv st c n
-        else throw (IO.userError "Multipart: multipart body ended at a delimiter")
-      else
-        setSt st (finishPart s)
-        pure none
-    else
-      let k := min n (i - s.pos)
-      setSt st { s with pos := s.pos + k }
-      pure (some (s.buf.extract s.pos (s.pos + k)))
-  | none =>
-    let safe := s.buf.size - s.pos - (needle.size - 1)
-    if safe > 0 then
-      let k := min n safe
-      setSt st { s with pos := s.pos + k }
-      pure (some (s.buf.extract s.pos (s.pos + k)))
-    else if ← more st c then partRecv st c n
-    else throw (IO.userError "Multipart: multipart body ended before its delimiter")
-
-/-- Parse the next part's headers, or finish. -/
-partial def nextPart (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader)
-    : LeanIn.Runtime.VM (Option PartReader) := do
-  let s ← getSt st
-  match s.phase with
-  | 3 => pure none
-  | 0 =>
-    match ← seekMarker st c ("--".toUTF8 ++ s.boundary) with
-    | none => pure none
-    | some i =>
-      let s ← getSt st
-      let after := i + 2 + s.boundary.size
-      if after + 2 ≤ s.buf.size && s.buf.get! after == 0x2D && s.buf.get! (after + 1) == 0x2D then
-        setSt st { s with pos := after + 2, phase := 3 }
-        pure none
-      else
-        setSt st { s with pos := after + 2, phase := 1 }
-        nextPart st c
-  | 1 =>
-    match ← seekMarker st c "\r\n\r\n".toUTF8 with
-    | none => throw (IO.userError "Multipart: truncated multipart headers")
-    | some i =>
-      let s ← getSt st
-      let hs := parseHeaderLines (String.fromUTF8? (s.buf.extract s.pos i) |>.getD "")
-      setSt st { s with pos := i + 4, phase := 2 }
-      pure (some {
-        name := (param hs "name").getD ""
-        filename := param hs "filename"
-        contentType := (hs.findSome? fun (n, v) => if n == "content-type" then some v else none).getD "text/plain"
-        headers := hs
-        recv := partRecv st c })
-  | _ => throw (IO.userError "Multipart: multipart phase lost")
-
-end MP
-
-/-- Stream a multipart body: `next` yields each part with its own incremental `recv`. -/
-def withMultipartStream (f : MReader → Handler) : Handler :=
-  fun req w => do
-    match boundary? req with
-    | none =>
-      w.start { status := 400, reason := "Bad Request",
-                headers := #[("Content-Length", toString "missing multipart boundary".toUTF8.size)] }
-      w.write "missing multipart boundary".toUTF8
-      w.finish
-    | some b =>
-      if req.mediaType? != some "multipart/form-data" then
-        w.start { status := 415, reason := "Unsupported Media Type",
-                  headers := #[("Content-Length", toString "unsupported media type".toUTF8.size)] }
-        w.write "unsupported media type".toUTF8
-        w.finish
-      else
-        let st ← (monadLift (IO.mkRef ({ boundary := b.toUTF8 } : MState)) : LeanIn.Runtime.VM _)
-        f { next := MP.nextPart st req.body } req w
-
-/-- Split a multipart body into parts. The delimiters are `--boundary`; a part ends at the next delimiter,
-and the closing delimiter is followed by `--`. Part headers are separated from the part body by a blank line.
-The body is the reader's bytes, so this is the buffered form; a streaming part reader is a later step. -/
-def parseParts (boundary : String) (body : ByteArray) : Except String (Array Part) := Id.run do
-  let text := String.fromUTF8? body |>.getD (String.fromUTF8! body)
-  let segs := (text.splitOn ("--" ++ boundary))
-  if segs.length < 2 then return .error "no boundary delimiter in body"
-  let mut parts : Array Part := #[]
-  for seg in segs.drop 1 do
-    if seg.startsWith "--" then break
-    let seg := if seg.startsWith "\r\n" then (seg.drop 2).toString else seg
-    match seg.splitOn "\r\n\r\n" with
-    | head :: rest =>
-      let content := String.intercalate "\r\n\r\n" rest
-      let content := if content.endsWith "\r\n" then (content.dropEnd 2).toString else content
-      let lines := head.splitOn "\r\n"
-      let hs : Array (String × String) := lines.filterMap (fun line =>
-        match line.splitOn ":" with
-        | n :: vs => some (n.trimAscii.toString.toLower, String.intercalate ":" vs |>.trimAscii.toString)
-        | _ => none) |>.toArray
-      let disp := hs.findSome? fun (n, v) => if n == "content-disposition" then some v else none
-      let param (key : String) : Option String :=
-        disp.bind fun v =>
-          (v.splitOn ";").findSome? fun p =>
-            match p.trimAscii.toString.splitOn "=" with
-            | [k, x] => if k == key then some (unquote (x.trimAscii.toString)) else none
-            | _ => none
-      let ctype := (hs.findSome? fun (n, v) => if n == "content-type" then some v else none).getD "text/plain"
-      parts := parts.push { name := (param "name").getD "", filename := param "filename",
-                            contentType := ctype, headers := hs, body := content.toUTF8 }
-    | [] => pure ()
-  if parts.isEmpty then .error "no parts" else .ok parts
-
-/-- A multipart request's parts, or the response status to answer with. -/
-def multipartBody (r : Request) : LeanIn.Runtime.VM (Except (Nat × String) (Array Part)) := do
-  if r.mediaType? != some "multipart/form-data" then
+/-- Build the upstream `MultiPartForm` over the native request reader. -/
+def multipartForm (req : Request) :
+    LeanIn.Runtime.VM (Except (Nat × String)
+      (LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)) := do
+  if req.mediaType? != some "multipart/form-data" then
     return .error (415, "unsupported media type")
-  else
-    match boundary? r with
-    | none => return .error (400, "missing multipart boundary")
-    | some b =>
-      let body ← readAll r.body .empty
-      return (match parseParts b body with
-        | .ok parts => .ok parts
-        | .error e => .error (400, e))
+  match boundary? req with
+  | none => return .error (400, "missing multipart boundary")
+  | some b =>
+    let boundSep := ("\r\n--" ++ b).toUTF8
+    let inner : LeanIO.MultipartInner LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader := {
+      boundStart := boundSep.extract 2 boundSep.size
+      boundSepSearch := LeanIO.Search.new (LeanIO.ChunkBuffer.ofByteArray boundSep)
+      stream := req.body }
+    let ref ← (monadLift (IO.mkRef inner) : LeanIn.Runtime.VM _)
+    return .ok { inner := ref }
 
-/-- Compose a multipart parser with a handler, like `withExtract`. -/
-def withMultipart (f : Array Part → Handler) : Handler :=
+/-- Compose the upstream multipart API with a handler. The entries and `FormFile` operations are the same
+types the stock backend uses, instantiated at `VM`/`BodyReader`. -/
+def withMultipartForm
+    (f : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader → Handler) :
+    Handler :=
   fun req w => do
-    match ← multipartBody req with
-    | .ok parts => f parts req w
+    match ← multipartForm req with
+    | .ok mp => f mp req w
     | .error (status, msg) =>
       w.start { status, reason := reasonFor status,
                 headers := #[("Content-Length", toString msg.toUTF8.size)] }

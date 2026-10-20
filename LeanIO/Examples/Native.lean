@@ -112,47 +112,59 @@ def npingOption : LeanIO.Backend.LeanIn.NativeRoute :=
 
 end
 
-/-- A multipart upload: each part's name, filename and body length. -/
+/-- Count a file body by streaming it, without keeping the bytes. -/
+def countStream (f : LeanIO.FormFile LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader) :
+    LeanIn.Runtime.VM Nat := do
+  let r ← (monadLift (IO.mkRef (0 : Nat)) : LeanIn.Runtime.VM _)
+  f.stream fun chunk => monadLift (r.modify (· + chunk.size) : IO Unit)
+  monadLift (r.get : IO Nat)
+
+/-- The upstream multipart API on the native reader: each entry is a field or a `FormFile`. -/
+partial def uploadWalk (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
+    (i : Nat) (acc : String) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+  | w => do
+    match ← mp.nextEntry with
+    | none => LeanIO.Backend.LeanIn.respond w 200 "OK" s!"parts={i} {acc.trimAscii.toString}\n".toUTF8
+    | some (.field name value) =>
+      uploadWalk mp (i + 1) (acc ++ s!"{name}:-:{value.toUTF8.size}:text/plain ") w
+    | some (.file f) =>
+      let n ← countStream f
+      uploadWalk mp (i + 1) (acc ++ s!"{f.name}:{f.filename}:{n}:{f.contentType} ") w
+
 def upload : Handler :=
-  LeanIO.Backend.LeanIn.withMultipart fun parts _req w => do
-    let describe (p : LeanIO.Backend.LeanIn.Part) : String :=
-      s!"{p.name}:{p.filename.getD "-"}:{p.body.size}:{p.contentType}"
-    LeanIO.Backend.LeanIn.respond w 200 "OK"
-      (s!"parts={parts.size} " ++ String.intercalate " " (parts.toList.map describe) ++ "\n").toUTF8
+  LeanIO.Backend.LeanIn.withMultipartForm fun mp _req w => uploadWalk mp 0 "" w
 
-/-- Drain one streamed part, counting its bytes. -/
-partial def drainPart (p : LeanIO.Backend.LeanIn.PartReader) (n : Nat) : LeanIn.Runtime.VM Nat := do
-  match ← p.recv 4096 with
-  | some chunk => drainPart p (n + chunk.size)
-  | none => pure n
-
-/-- Walk a streamed multipart body, counting each part's bytes without buffering it. -/
-partial def walkParts (m : LeanIO.Backend.LeanIn.MReader) (i : Nat) (acc : String) :
-    LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+/-- Count streamed parts with `FormFile.stream`. -/
+partial def uploadStreamWalk
+    (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
+    (i : Nat) (acc : String) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
   | w => do
-    match ← m.next with
-    | none =>
-      LeanIO.Backend.LeanIn.respond w 200 "OK" (s!"streamed={i} {acc}\n").toUTF8
-    | some p =>
-      let n ← drainPart p 0
-      walkParts m (i + 1) (acc ++ s!"{p.name}:{n};") w
+    match ← mp.nextEntry with
+    | none => LeanIO.Backend.LeanIn.respond w 200 "OK" s!"streamed={i} {acc}\n".toUTF8
+    | some (.field name value) =>
+      uploadStreamWalk mp (i + 1) (acc ++ s!"{name}:{value.toUTF8.size};") w
+    | some (.file f) =>
+      let n ← countStream f
+      uploadStreamWalk mp (i + 1) (acc ++ s!"{f.name}:{n};") w
 
-/-- A multipart upload read part by part: the response is written after the walk, but no part is buffered. -/
 def uploadStream : Handler :=
-  LeanIO.Backend.LeanIn.withMultipartStream fun m _req w => walkParts m 0 "" w
+  LeanIO.Backend.LeanIn.withMultipartForm fun mp _req w => uploadStreamWalk mp 0 "" w
 
-/-- Save each streamed part to `/tmp/leanio-part-<n>`, exercising the part `save` operation. -/
-partial def saveParts (m : LeanIO.Backend.LeanIn.MReader) (i : Nat) :
-    LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+/-- Save each file part to `/tmp/leanio-part-<n>`; fields are consumed as values. -/
+partial def saveParts (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
+    (i : Nat) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
   | w => do
-    match ← m.next with
+    match ← mp.nextEntry with
     | none => LeanIO.Backend.LeanIn.respond w 200 "OK" s!"saved={i}\n".toUTF8
-    | some p =>
-      LeanIO.Backend.LeanIn.PartReader.save p s!"/tmp/leanio-part-{i}"
-      saveParts m (i + 1) w
+    | some (.field _ value) =>
+      monadLift (IO.FS.writeBinFile s!"/tmp/leanio-part-{i}" value.toUTF8 : IO Unit)
+      saveParts mp (i + 1) w
+    | some (.file f) =>
+      f.save s!"/tmp/leanio-part-{i}"
+      saveParts mp (i + 1) w
 
 def uploadSave : Handler :=
-  LeanIO.Backend.LeanIn.withMultipartStream fun m _req w => saveParts m 0 w
+  LeanIO.Backend.LeanIn.withMultipartForm fun mp _req w => saveParts mp 0 w
 
 /-- Echo the request body. The reader delivers it incrementally; this route accumulates it to answer with one
 `Content-Length` body, while a streaming route would `recv` and `write` instead. -/
