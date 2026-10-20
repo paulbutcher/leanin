@@ -45,6 +45,68 @@ abbrev Handler := Request → LeanIn.Runtime.VM (H1.ResponseHead × ByteArray)
 /-- Middleware transforms a handler; composition order is nesting order (the leftmost/outermost runs first). -/
 abbrev Middleware := Handler → Handler
 
+/-- Applies middlewares the way the upstream router does: a left fold, so the **last** one added runs first
+(outermost). -/
+def applyMiddlewares (ms : Array Middleware) : Middleware :=
+  ms.foldl (fun h mw => mw h)
+
+/-- One declared route: method, pattern, handler and its own middlewares (innermost). -/
+structure NativeRoute where
+  method : Std.Http.Method
+  pattern : RoutePattern
+  handler : Handler
+  middlewares : Array Middleware := #[]
+
+/-- A router with the upstream composition semantics: route middlewares innermost, then the router's, mounts
+prefixed, and a `notFound` for misses. `toTrie` compiles it once, as upstream does at startup. -/
+structure NativeRouter where
+  routes : Array NativeRoute := #[]
+  mounts : Array (String × NativeRouter) := #[]
+  middlewares : Array Middleware := #[]
+  notFound : Option Handler := none
+
+namespace NativeRouter
+
+def empty : NativeRouter := {}
+
+/-- Add a route from a pattern string such as `/user/{id}`. -/
+def route (self : NativeRouter) (method : Std.Http.Method) (pattern : String) (handler : Handler) :
+    NativeRouter :=
+  let r : NativeRoute := { method, pattern := RoutePattern.ofString pattern, handler }
+  { self with routes := self.routes.push r }
+
+/-- Add a route with its own middlewares; they run inside the router's. -/
+def routeWith (self : NativeRouter) (method : Std.Http.Method) (pattern : String) (handler : Handler)
+    (middlewares : Array Middleware) : NativeRouter :=
+  let r : NativeRoute := { method, pattern := RoutePattern.ofString pattern, handler, middlewares }
+  { self with routes := self.routes.push r }
+
+/-- Append a router middleware. With the fold in `applyMiddlewares`, the last added runs first. -/
+def addMiddleware (mw : Middleware) (self : NativeRouter) : NativeRouter :=
+  { self with middlewares := self.middlewares.push mw }
+
+/-- Mount a sub-router under a prefix. -/
+def mount (self : NativeRouter) (pre : String) (sub : NativeRouter) : NativeRouter :=
+  { self with mounts := self.mounts.push (pre, sub) }
+
+/-- The handler for requests matching no route. -/
+def withNotFound (handler : Handler) (self : NativeRouter) : NativeRouter :=
+  { self with notFound := some handler }
+
+/-- Compile the router into a trie, composing middlewares once. -/
+partial def toTrie (self : NativeRouter) : RouteTrie Handler :=
+  let wrap := applyMiddlewares self.middlewares
+  let trie := self.routes.foldl (fun acc r =>
+    acc.addRoute r.method r.pattern.segments (wrap (applyMiddlewares r.middlewares r.handler)))
+    (RouteTrie.empty : RouteTrie Handler)
+  let trie := self.mounts.foldl (fun acc (pre, sub) =>
+    let preSegs := (RoutePattern.ofString pre).segments
+    RouteTrie.fold sub.toTrie (fun method segs handler acc =>
+      acc.addRoute method (preSegs ++ segs) (wrap handler)) acc) trie
+  { trie with notFound := self.notFound.map wrap }
+
+end NativeRouter
+
 /-- The method token as `Std.Http.Method`, or `none` when the token is not one it names. Unknown methods are
 refused explicitly at dispatch; they are never mapped onto a different method. -/
 def method? (h : H1.Head) : Option Std.Http.Method :=

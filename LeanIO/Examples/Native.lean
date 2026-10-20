@@ -88,17 +88,18 @@ def postForm : Handler :=
 def echo : Handler :=
   fun req => pure (LeanIO.Backend.LeanIn.response 200 "OK" req.body)
 
-def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
-  (RouteTrie.empty : RouteTrie Handler)
-    |>.addRoute .get [Segment.lit "ping"] ping
-    |>.addRoute .get [Segment.lit "slow"] (slow clock)
-    |>.addRoute .post [Segment.lit "echo"] echo
-    |>.addRoute .post [Segment.lit "todos"] postTodo
-    |>.addRoute .post [Segment.lit "text"] postText
-    |>.addRoute .post [Segment.lit "form"] postForm
-    |>.addRoute .get [Segment.lit "user", Segment.param "id"] (tag "users" userById)
-    |>.addRoute .get [Segment.lit "boom"] (LeanIO.Backend.LeanIn.catchErrors (boom clock))
-    |>.addRoute .get [Segment.lit "logged"] (LeanIO.Backend.LeanIn.requestLogger "req" ping)
+def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :=
+  LeanIO.Backend.LeanIn.NativeRouter.empty
+    |>.route .get "/ping" ping
+    |>.route .get "/slow" (slow clock)
+    |>.route .get "/user/{id}" (tag "users" userById)
+    |>.route .post "/echo" echo
+    |>.route .post "/todos" postTodo
+    |>.route .post "/text" postText
+    |>.route .post "/form" postForm
+    |>.route .get "/boom" (boom clock)
+    |>.route .get "/logged" (LeanIO.Backend.LeanIn.requestLogger "req" ping)
+    |>.addMiddleware LeanIO.Backend.LeanIn.catchErrors
 
 end LeanIO.Examples.Native
 
@@ -108,4 +109,4 @@ def main (args : List String) : IO UInt32 := do
   let port : UInt16 := ((args.headD "8787").toNat?.getD 8787).toUInt16
   let hooks ← LeanIn.Runtime.Hooks.new
   let clock := LeanIn.Runtime.Clock.live hooks
-  LeanIO.Backend.LeanIn.serveWith hooks (LeanIO.Backend.LeanIn.dispatch (routes clock)) port
+  LeanIO.Backend.LeanIn.serveWith hooks (LeanIO.Backend.LeanIn.dispatch (routes clock).toTrie) port
