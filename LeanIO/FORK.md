@@ -31,6 +31,23 @@ Not yet ported: the route macros and `FromRequestBody`/`FromRequestParts` classe
 `ContextAsync`/`Request Body.Stream`; streaming bodies/backpressure, multipart and the request-cancellation
 scope are later stages. The fork builds and its own tests run under `lake build LeanIO`.
 
+### The authoring seam is blocked by the module-system boundary
+
+`LeanIO/Router/Macro.lean` is a `module` file, and a `module` file cannot import a non-`module` one. LeanIn is
+not written in the module system, and neither is `LeanIO/Backend/LeanIn.lean` (it imports LeanIn). A
+backend-parameterised route macro therefore cannot refer to the native backend's types as things stand.
+
+Two ways out, to choose deliberately:
+
+1. **Convert to the module system** — LeanIn (its whole dependency closure) and the backend, so a `module`
+   macro can import them. Mechanical per file (`module` plus `public import` at re-export points) but it changes
+   re-export behaviour: code that relied on transitive names from a module's imports may need explicit imports.
+2. **An explicit native declaration syntax** in a non-module file (e.g. `LeanIO/NativeSyntax.lean`) with its own
+   keyword, leaving upstream's macros stock-only. Narrow and safe, but the route declaration syntax is not shared.
+
+Until that decision is taken, native route declaration is programmatic (`NativeRouter.route`) and
+`NativeRouter.routeWith` with the helpers in `LeanIO.Backend.LeanIn`.
+
 ## Working rules
 
 - The fork builds together with the rest of the package: `nix develop -c lake build LeanIO`.
