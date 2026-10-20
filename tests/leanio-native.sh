@@ -103,6 +103,11 @@ st, _, body = read_response(s)
 check("keep-alive after body", st.endswith("200 OK") and body == b"next", f"{st} {body!r}")
 s.close()
 
+# HEAD is served by the GET handler with the body dropped and Content-Length: 0.
+st, head, body = request(b"HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+check("HEAD from GET", st.endswith("200 OK") and body == b"" and b"content-length: 0" in head.lower(),
+      f"{st} {head!r} {body!r}")
+
 # Method contract.
 st, _, _ = request(b"POST /ping HTTP/1.1\r\nHost: x\r\n\r\n")
 check("known method, no route", st.endswith("405 Method Not Allowed"), st)

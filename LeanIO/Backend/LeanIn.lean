@@ -211,7 +211,18 @@ def dispatch (trie : RouteTrie Handler) : CoreHandler := fun head body =>
     match trie.lookup m (pathSegments head) with
     | .found params handler => handler { head, body, params }
     | .methodMismatch allowed =>
-      pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
+      -- LeanIO serves HEAD from the GET handler and drops the body; the response declares
+      -- `Content-Length: 0` rather than the length the body would have had, because declaring a length it
+      -- will not send would strand the client. This matches the upstream trie's documented behaviour.
+      if m == .head && allowed.contains .get then
+        match trie.lookup .get (pathSegments head) with
+        | .found params handler => do
+          let (respHead, _body) ← handler { head, body, params }
+          let headers := respHead.headers.filter (fun (n, _) => n.toLower != "content-length")
+          pure ({ respHead with headers := headers.push ("Content-Length", "0") }, .empty)
+        | _ => pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
+      else
+        pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
     | .noMatch =>
       match trie.notFound with
       | some handler => handler { head, body }

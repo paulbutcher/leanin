@@ -19,10 +19,10 @@ The fork's backend has been moved onto LeanIn for the native path:
 | piece | state |
 | --- | --- |
 | routing | upstream trie parameterised over its handler value; `LeanIO.Backend.LeanIn` stores native handlers and dispatches on a LeanIn connection |
-| method | token preserved by `H1.Head`, mapped to `Std.Http.Method` or refused (501); a known method with no route is 405 with `Allow` |
+| method | token preserved by `H1.Head`, mapped to `Std.Http.Method` or refused (501); a known method with no route is 405 with `Allow`; HEAD is served by the GET handler with the body dropped and `Content-Length: 0`, as upstream documents |
 | bodies | buffered delivery to handlers, bounded by `H1.Limits.maxBody` (1 MiB, 413); malformed/oversized heads answer 400/413/431 before close |
 | extraction | JSON, plain text and URL-encoded form over the buffered body (415/400/422), reusing LeanIO's MIME declarations, query parser and `FromForm` |
-| request | path parameters captured by the trie, query string/params, headers, media type; `Middleware := Handler → Handler` |
+| request | path parameters captured by the trie, query string/parameter decoding, headers, media type; `withExtract` composes an extractor with a handler; `Middleware := Handler → Handler` |
 | suspension | handlers are `VM` values; `GET /slow` parks 200 ms while a sibling request completes |
 | checks | `tests/leanio-native.sh` asserts all of the above at the public socket |
 
