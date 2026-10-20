@@ -3,6 +3,9 @@ import LeanIn.Examples.Http.H1
 import LeanIn.Examples.Http.Server
 import LeanIO.Router.RouteTrie
 import Std.Http.Data.Method
+import Lean
+import LeanIO.Data.Headers.MimeType
+import LeanIO.Request.FromRequestBody
 
 /-!
 # The LeanIn backend
@@ -82,6 +85,57 @@ def dispatch (trie : RouteTrie Handler) : Handler := fun h body =>
       match trie.notFound with
       | some handler => handler h body
       | none => pure (response 404 "Not Found" "not found\n".toUTF8)
+
+/-- A request as the native backend sees it: the parsed head and its buffered body. -/
+structure Request where
+  head : H1.Head
+  body : ByteArray
+
+/-- The first header value with this name, as text. -/
+def Request.header? (r : Request) (name : String) : Option String :=
+  H1.Head.headerValue? r.head name.toUTF8
+
+/-- The media type of `Content-Type`, lowercased and without parameters. -/
+def Request.mediaType? (r : Request) : Option String :=
+  (r.header? "content-type").map fun v =>
+    (v.splitOn ";" |>.headD v).trimAscii.toString.toLower
+
+/-- Whether the request's media type matches one the extractor type names. A request with no `Content-Type`
+does not match a type declaring media types: accepting it silently would make a JSON route answer to
+form-encoded or absent bodies. -/
+def Request.mimeOk (r : Request) (t : Type) [LeanIO.MimeType.HasMimeTypes t] : Bool :=
+  match LeanIO.MimeType.HasMimeTypes.mimes? t with
+  | none => true
+  | some mimes =>
+    match r.mediaType? with
+    | none => false
+    | some actual => mimes.any fun m => m.value.toLower == actual
+
+/-- Decode a JSON body. The failures are distinguishable: 415 for the wrong media type, 400 for malformed
+JSON, 422 when it parses but does not fit `α`. -/
+def jsonBody (α : Type) [Lean.FromJson α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Json α)] (r : Request) :
+    Except (Nat × String) α :=
+  if !r.mimeOk (LeanIO.Json α) then
+    .error (415, "unsupported media type")
+  else
+    match String.fromUTF8? r.body with
+    | none => .error (400, "body is not valid UTF-8")
+    | some text =>
+      match Lean.Json.parse text with
+      | .error e => .error (400, s!"malformed JSON: {e}")
+      | .ok j =>
+        match Lean.FromJson.fromJson? (α := α) j with
+        | .ok a => .ok a
+        | .error e => .error (422, s!"body does not fit: {e}")
+
+/-- A plain-text body, with the same media-type check. -/
+def textBody (r : Request) : Except (Nat × String) String :=
+  if !r.mimeOk LeanIO.PlainText then
+    .error (415, "unsupported media type")
+  else
+    match String.fromUTF8? r.body with
+    | none => .error (400, "body is not valid UTF-8")
+    | some text => .ok text
 
 /-- Serve `handler` on `port` with the given hooks (so an application can build handlers against the same live
 clock, e.g. to suspend on a timer). Blocks until the accept loop ends. -/

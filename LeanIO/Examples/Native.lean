@@ -32,6 +32,32 @@ def slow (clock : LeanIn.Runtime.Clock) : Handler :=
     let _ ← LeanIn.Runtime.VM.sleep clock 200
     pure (LeanIO.Backend.LeanIn.response 200 "OK" "slept\n".toUTF8)
 
+/-- A JSON body type: the first extraction shown over the native request pair. -/
+structure Todo where
+  title : String
+  done : Bool := false
+deriving Lean.FromJson, Lean.ToJson, Repr
+
+def reasonFor : Nat → String
+  | 413 => "Payload Too Large"
+  | 415 => "Unsupported Media Type"
+  | 422 => "Unprocessable Entity"
+  | _   => "Bad Request"
+
+/-- JSON extraction: 415 for the wrong media type, 400 for malformed JSON, 422 when it does not fit. -/
+def postTodo : Handler :=
+  fun head body =>
+    match (LeanIO.Backend.LeanIn.jsonBody Todo { head, body } : Except (Nat × String) Todo) with
+    | .ok todo => pure (LeanIO.Backend.LeanIn.response 200 "OK" (Lean.toJson todo).compress.toUTF8)
+    | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
+
+/-- Plain-text extraction with the same media-type contract. -/
+def postText : Handler :=
+  fun head body =>
+    match LeanIO.Backend.LeanIn.textBody { head, body } with
+    | .ok text => pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"text: {text}\n".toUTF8)
+    | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
+
 /-- Echo the buffered request body, at whatever length the body delivered. -/
 def echo : Handler :=
   fun _ body => pure (LeanIO.Backend.LeanIn.response 200 "OK" body)
@@ -41,6 +67,8 @@ def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
     |>.addRoute .get [Segment.lit "ping"] ping
     |>.addRoute .get [Segment.lit "slow"] (slow clock)
     |>.addRoute .post [Segment.lit "echo"] echo
+    |>.addRoute .post [Segment.lit "todos"] postTodo
+    |>.addRoute .post [Segment.lit "text"] postText
 
 end LeanIO.Examples.Native
 
