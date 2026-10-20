@@ -902,6 +902,38 @@ def serveWith (hooks : LeanIn.Runtime.Hooks) (handler : CoreHandler) (port : UIn
   | .ok _ => return 0
   | .error err => IO.eprintln s!"the accept loop ended: {err}"; return 1
 
+/-- A running native server: `stop` stops admission and lets in-flight connections drain; `join` returns the
+accept loop's outcome. -/
+structure ServerHandle where
+  executor : LeanIn.Sched.Executor LeanIn.Task.Item 256
+  task : _root_.Task (Except IO.Error (Except IO.Error Unit))
+
+namespace ServerHandle
+
+/-- Stop accepting; `serveUntilStopped` drains the connections already accepted. -/
+def stop (h : ServerHandle) : IO Unit := h.executor.stop
+
+/-- Wait for the accept loop and its drain to finish. -/
+def join (h : ServerHandle) : IO (Except IO.Error Unit) := do
+  match ← IO.wait h.task with
+  | .ok outcome => pure outcome
+  | .error e => pure (.error e)
+
+end ServerHandle
+
+/-- Start serving without blocking: the accept loop runs on a dedicated thread, and the returned handle stops
+and joins it. Uses `serveUntilStopped`, so `stop` is a drain rather than an abort. -/
+def serveWithHandle (hooks : LeanIn.Runtime.Hooks) (handler : CoreHandler) (port : UInt16) :
+    IO ServerHandle := do
+  let l ← LeanIn.Runtime.Listener.bind (LeanIn.Runtime.loopback port)
+  let e ← LeanIn.Sched.Executor.new LeanIn.Task.Item 256 1
+  let cfg : LeanIn.Examples.Http.Server.Config := { clock := LeanIn.Runtime.Clock.live hooks }
+  let prog : LeanIn.Task.EAsync IO.Error Unit :=
+    LeanIn.Runtime.serveUntilStopped hooks e l 20
+      (LeanIn.Examples.Http.Server.serveConnStream cfg · handler) []
+  let task ← IO.asTask (LeanIn.Runtime.run e prog) .dedicated
+  return { executor := e, task }
+
 /-- Serve `handler` on `port`, creating the hooks. -/
 def serve (handler : CoreHandler) (port : UInt16) : IO UInt32 := do
   let hooks ← LeanIn.Runtime.Hooks.new

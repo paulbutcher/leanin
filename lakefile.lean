@@ -82,6 +82,10 @@ lean_exe streamEcho where
   root := `LeanIn.Exe.StreamEcho
   moreLinkArgs := netuvLinkArgs
 
+lean_exe leanioDrain where
+  root := `LeanIO.Examples.Drain
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe leanioNative where
   root := `LeanIO.Examples.Native
   moreLinkArgs := netuvLinkArgs
