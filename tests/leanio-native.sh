@@ -142,6 +142,10 @@ check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", 
 st, _, body = get("/method")
 check("method/version extractors", st.endswith("200 OK") and body == b"GET HTTP/1.1\n", f"{st} {body!r}")
 
+# Stock-shaped request line.
+st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
+check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")
+
 # Native middleware: extensions, basic auth statuses.
 st, _, body = get("/ext")
 check("extension middleware", st.endswith("200 OK") and body == b"meta=hello\n", f"{st} {body!r}")

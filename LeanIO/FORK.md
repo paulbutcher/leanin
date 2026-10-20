@@ -12,6 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
+| 2026-10-20 | `Backend.LeanIn`: Std `Method`/`Version`/`Headers` parts extractors and a `Request.line` view | stock-style middleware/handler accessors work without rewriting; only an explicit stock request type remains a source change |
 | 2026-10-20 | `Backend.LeanIn.Middlewares`: `catchErrors`, `requestLogger`, `withExtension`, `auth` over the native handler; native `Request` carries typed extensions | the built-in middleware is usable natively with the stock names/parameters; only custom HandlerFn middleware remains a source change |
 | 2026-10-20 | `Backend.LeanIn`: `IntoResponseM`/`RunBody`, so stock-style route bodies (`=> "text"`, status tuples, JSON values, `Except`, `ResponseHead × ByteArray`) work on the native backend; native `FromRequestBodyM` for `Form`/`ByteArray`; `FromRequestPartsM` for `Path` and `URI.Query` | the native route syntax can use the body and parts binder forms, not only JSON/text |
 | 2026-10-20 | `MultiPartForm` parameterised over `BodySource m body` (defaults `ContextAsync`/`Body.Stream`); native `BodySource VM BodyReader`; `readUntilGo` extracts from the read's start position | one upstream multipart parser serves both backends; the cursor fix makes headers split across reads parse correctly |
@@ -54,10 +55,13 @@ native backend regardless of the option. Under the native backend a body may be 
 response value, as in LeanIO: `=> "text"`, `=> Status.created`, `=> (Status.ok, value)` (text or JSON),
 `=> (status × headers × value)`, `ByteArray`, `Except`, or `ResponseHead × ByteArray`; `RunBody` chooses the
 value or computation form. Binders read through the native extractor classes: bodies `Json α`, `PlainText`,
-`Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`) and `URI.Query`.
+`Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`), `URI.Query`, and Std `Method`,
+`Version` and `Headers`. Native `Request` also exposes a stock-shaped `line : Std.Http.Request.Head`, so
+middleware/handlers reading `req.line.method/uri/headers` need no accessor changes.
 `nativeRoute GET "/ping" ping` takes an already-built handler.
 
-Remaining non-drop-in surfaces: a raw `(req : Request Body.Stream)` binder, custom middleware written against
+Remaining non-drop-in surfaces: a raw `(req : Request Body.Stream)` type annotation (the accessor shape is
+present, but the type is the backend's `Request`), custom middleware written against
 the stock `HandlerFn`/`ContextAsync` pair (the built-ins have native equivalents with the same names and
 parameters), and the stock streaming request/response API. Native routes use the backend's
 `Request`/`ResponseWriter` and `Middleware := Handler → Handler`; `Request` carries typed extensions.

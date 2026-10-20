@@ -201,6 +201,37 @@ def Request.queryParam? (r : Request) (name : String) : Option String :=
 def Request.pathParam? (r : Request) (name : String) : Option String :=
   r.params.find? (·.1 == name) |>.map (·.2)
 
+/-- The request method as `Std.Http.Method`, or `none` for a token Std does not name. -/
+def Request.stdMethod? (r : Request) : Option Std.Http.Method := method? r.head
+
+/-- The request's headers as `Std.Http.Headers`, preserving names and repeated values. -/
+def Request.stdHeaders (r : Request) : Std.Http.Headers :=
+  r.head.headers.foldl (fun acc (n, v) =>
+    let name := (H1.Slice.toString? r.head.buf n).getD ""
+    let value := (H1.Slice.toString? r.head.buf v).getD ""
+    acc.insert! name value) Std.Http.Headers.empty
+
+/-- The request target as `Std.Http.RequestTarget`; origin-form is what the H1 parser accepts. -/
+def Request.stdTarget (r : Request) : Std.Http.RequestTarget :=
+  let target := r.head.targetString
+  let pathPart := (target.splitOn "?").headD target
+  let segments := (pathPart.splitOn "/").filter (fun s => !s.isEmpty)
+    |>.map Std.Http.URI.EncodedSegment.encode |>.toArray
+  let path : Std.Http.URI.Path := { segments, absolute := pathPart.startsWith "/" }
+  let query := if r.queryString?.isSome then r.query? else none
+  .originForm path query
+
+/-- A stock-shaped request line: `req.line.method`, `.version`, `.uri`, `.headers`. This is the view the
+LeanIO middleware and handlers read; the native request also carries the streaming body and typed extensions.
+An explicit `(req : Request Body.Stream)` annotation remains a stock type and is not this view. -/
+def Request.line (r : Request) : Std.Http.Request.Head :=
+  { method := (r.stdMethod?).getD .get
+    version := (match r.head.version with
+      | H1.Version.v10 => .v10
+      | H1.Version.v11 => .v11)
+    uri := r.stdTarget
+    headers := r.stdHeaders }
+
 /-- The first header value with this name, as text. -/
 def Request.header? (r : Request) (name : String) : Option String :=
   H1.Head.headerValue? r.head name.toUTF8

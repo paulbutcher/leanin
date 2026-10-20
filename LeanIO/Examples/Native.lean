@@ -166,6 +166,13 @@ def methodDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/method" (m : Std.Http.Method) (v : Std.Http.Version) =>
     (Std.Http.Status.ok, s!"{m} {v}\n")
 
+/-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
+def lineDemo : Handler :=
+  fun req w =>
+    let host := ((req.line.headers.get? .host).map (·.value)).getD ""
+    LeanIO.Backend.LeanIn.respond w 200 "OK"
+      s!"{req.line.method} {req.line.uri} host={host}\n".toUTF8
+
 /-- The upstream multipart API on the native reader: each entry is a field or a `FormFile`. -/
 partial def uploadWalk (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
     (i : Nat) (acc : String) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
@@ -241,6 +248,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinPath
     |>.add dropinJson
     |>.add methodDemo
+    |>.route .get "/line" lineDemo
     |>.route .get "/ext" extensionDemo
     |>.routeWith .get "/auth" secureDemo #[LeanIO.Backend.LeanIn.Middlewares.auth authDemo]
     |>.addMiddleware (LeanIO.Backend.LeanIn.Middlewares.withExtension Meta { value := "hello" })
