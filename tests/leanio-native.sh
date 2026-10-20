@@ -172,6 +172,10 @@ for _ in range(50):
     time.sleep(0.02)
 check("child ran", child_seen, f"{st} {body!r}")
 
+# Range header extractor.
+st, _, body = request(b"GET /range HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n")
+check("range extractor", st.endswith("200 OK") and body == b"ranges=true\n", f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

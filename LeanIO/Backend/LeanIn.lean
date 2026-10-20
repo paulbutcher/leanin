@@ -9,6 +9,7 @@ public import Lean
 public import LeanIO.Data.Headers.MimeType
 public import LeanIO.Request.FromRequestBody
 public import LeanIO.Request.FromRequestParts
+public import LeanIO.Request.HeaderRange
 public import LeanIO.Request.MultiPartForm.Api
 public import LeanIO.Request.Form
 
@@ -601,6 +602,13 @@ instance : FromRequestPartsM Std.Http.RequestTarget where
 /-- The URI path of the request target. -/
 instance : FromRequestPartsM Std.Http.URI.Path where
   readParts r := .ok r.stdTarget.path
+
+/-- The parsed `Range` header, as LeanIO's `HeaderRange`. -/
+instance : FromRequestPartsM LeanIO.HeaderRange where
+  readParts r :=
+    match r.header? "range" with
+    | some range => .ok { ranges := LeanIO.parseRange range }
+    | none => .ok { ranges := none }
 
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where

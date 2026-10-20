@@ -199,6 +199,11 @@ def countersDemo : Handler :=
     let k ← LeanIO.Backend.LeanIn.liftBase childCount.get
     LeanIO.Backend.LeanIn.respond w 200 "OK" s!"cleanup={c} child={k}\n".toUTF8
 
+/-- The Range header extractor. -/
+def rangeDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/range" (hr : LeanIO.HeaderRange) =>
+    (Std.Http.Status.ok, s!"ranges={hr.ranges.isSome}\n")
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -282,6 +287,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinJson
     |>.add methodDemo
     |>.route .get "/line" lineDemo
+    |>.add rangeDemo
     |>.route .get "/cleanup" cleanupDemo
     |>.route .get "/child" childDemo
     |>.route .get "/counters" countersDemo
