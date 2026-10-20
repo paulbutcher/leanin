@@ -876,6 +876,16 @@ the global stall table — 1 083 Ir/request (1.8 %). Paired: **1.016 at C=1, 1.0
 still reports the stall at the exact instant and every other scenario passes. The remaining publication is the
 raw registry's resume closure, which is where the rest of the 7.3 % marking term lives.
 
+**The raw registry's publication cost, measured, and why it is not simply removed.** Replacing the registry's
+`Std.Mutex` with an `IO.Ref` (same `HashMap`, no lock) saves **1 810 Ir/request (3.1 %)**, which locates the
+marking cost at the mutex publication rather than at the hash operation. It is not shippable as written:
+`recvRaw`/`sendRaw` are public, and an unsynchronized `IO.Ref` is a data race the moment a raw operation is
+submitted off the driver thread — the cross-thread-state rule this repository states elsewhere. The safe shape
+with the same effect is a per-connection **trampoline** registered in the synchronized table once at accept
+(it captures only a per-connection cell), with each request's continuation written into that cell and resumed by
+the trampoline; per-request publication then disappears while the synchronized registry stays for genuine
+cross-thread registration. That refactor is the concrete next step for the marking term.
+
 
 **What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
 **12.07 µs** per request against Node's **8.92 µs**, but the same runtime and shim with **no protocol at all**
