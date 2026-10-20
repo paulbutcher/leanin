@@ -138,6 +138,10 @@ st, _, body = get("/nuser/42")
 check("native path extractor", st.endswith("200 OK") and body == b"id=42\n", f"{st} {body!r}")
 st, _, body = post("/nform", "application/x-www-form-urlencoded", b"user=bob")
 check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", f"{st} {body!r}")
+# Parts extractors: method and version binders.
+st, _, body = get("/method")
+check("method/version extractors", st.endswith("200 OK") and body == b"GET HTTP/1.1\n", f"{st} {body!r}")
+
 # Native middleware: extensions, basic auth statuses.
 st, _, body = get("/ext")
 check("extension middleware", st.endswith("200 OK") and body == b"meta=hello\n", f"{st} {body!r}")

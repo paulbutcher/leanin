@@ -161,6 +161,11 @@ def authDemo : LeanIO.Backend.LeanIn.Middlewares.AuthConfig :=
 def secureDemo : Handler :=
   fun _ w => LeanIO.Backend.LeanIn.respond w 200 "OK" "secret-area\n".toUTF8
 
+/-- Parts extractors beyond Path/Query: method and version. -/
+def methodDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/method" (m : Std.Http.Method) (v : Std.Http.Version) =>
+    (Std.Http.Status.ok, s!"{m} {v}\n")
+
 /-- The upstream multipart API on the native reader: each entry is a field or a `FormFile`. -/
 partial def uploadWalk (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
     (i : Nat) (acc : String) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
@@ -235,6 +240,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinStatus
     |>.add dropinPath
     |>.add dropinJson
+    |>.add methodDemo
     |>.route .get "/ext" extensionDemo
     |>.routeWith .get "/auth" secureDemo #[LeanIO.Backend.LeanIn.Middlewares.auth authDemo]
     |>.addMiddleware (LeanIO.Backend.LeanIn.Middlewares.withExtension Meta { value := "hello" })

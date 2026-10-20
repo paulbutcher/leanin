@@ -493,6 +493,29 @@ instance [IntoResponseM R] : RunBody (AppM R) where
 /-- Apply a route body's response conversion. -/
 def runBody {F : Type} [RunBody F] (f : F) : AppM Unit := RunBody.runBody f
 
+/-- The request method as `Std.Http.Method`; an unknown token is refused rather than collapsed. -/
+instance : FromRequestPartsM Std.Http.Method where
+  readParts r :=
+    match method? r.head with
+    | some m => .ok m
+    | none => .error (501, "method not supported")
+
+/-- The HTTP version as `Std.Http.Version`. -/
+instance : FromRequestPartsM Std.Http.Version where
+  readParts r :=
+    .ok (match r.head.version with
+      | H1.Version.v10 => .v10
+      | H1.Version.v11 => .v11)
+
+/-- The request headers as `Std.Http.Headers`; duplicate names are preserved by `insert!`. -/
+instance : FromRequestPartsM Std.Http.Headers where
+  readParts r :=
+    let hs := r.head.headers.foldl (fun acc (n, v) =>
+      let name := (H1.Slice.toString? r.head.buf n).getD ""
+      let value := (H1.Slice.toString? r.head.buf v).getD ""
+      acc.insert! name value) Std.Http.Headers.empty
+    .ok hs
+
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where
   extractParts : Fn → Handler
