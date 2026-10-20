@@ -425,6 +425,20 @@ instance [LeanIO.FromForm α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Form α)] :
     | .ok a => pure (.ok { value := a })
     | .error e => pure (.error e)
 
+/-- A body accepted as either of two types, chosen by media type, mirroring LeanIO's `α ⊕ β` instance. -/
+instance [FromRequestBodyM α] [LeanIO.MimeType.HasMimeTypes α]
+    [FromRequestBodyM β] [LeanIO.MimeType.HasMimeTypes β] : FromRequestBodyM (α ⊕ β) where
+  read env := do
+    if env.req.mimeOk α then
+      match ← FromRequestBodyM.read (α := α) env with
+      | .ok a => pure (.ok (.inl a))
+      | .error e => pure (.error e)
+    else if env.req.mimeOk β then
+      match ← FromRequestBodyM.read (α := β) env with
+      | .ok b => pure (.ok (.inr b))
+      | .error e => pure (.error e)
+    else pure (.error (415, "unsupported media type"))
+
 /-- The raw body bytes in the native monad. -/
 instance : FromRequestBodyM ByteArray where
   read env := do

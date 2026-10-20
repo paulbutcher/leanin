@@ -142,6 +142,12 @@ check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", 
 st, _, body = get("/method")
 check("method/version extractors", st.endswith("200 OK") and body == b"GET HTTP/1.1\n", f"{st} {body!r}")
 
+# Dual body extractor by media type.
+st, _, body = post("/sum", "application/json", b'{"title":"sumjson","done":true}')
+check("sum json", st.endswith("200 OK") and body == b"json:sumjson\n", f"{st} {body!r}")
+st, _, body = post("/sum", "text/plain", b"sumtext")
+check("sum text", st.endswith("200 OK") and body == b"text:sumtext\n", f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

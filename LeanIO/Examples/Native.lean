@@ -166,6 +166,13 @@ def methodDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/method" (m : Std.Http.Method) (v : Std.Http.Version) =>
     (Std.Http.Status.ok, s!"{m} {v}\n")
 
+/-- Either JSON or plain text, chosen by media type. -/
+def sumBodyDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native POST "/sum" (b : LeanIO.Json Todo ⊕ LeanIO.PlainText) =>
+    match b with
+    | .inl j => (Std.Http.Status.ok, s!"json:{j.body.title}\n")
+    | .inr t => (Std.Http.Status.ok, s!"text:{t.body}\n")
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -249,6 +256,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinJson
     |>.add methodDemo
     |>.route .get "/line" lineDemo
+    |>.add sumBodyDemo
     |>.route .get "/ext" extensionDemo
     |>.routeWith .get "/auth" secureDemo #[LeanIO.Backend.LeanIn.Middlewares.auth authDemo]
     |>.addMiddleware (LeanIO.Backend.LeanIn.Middlewares.withExtension Meta { value := "hello" })
