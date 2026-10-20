@@ -197,6 +197,12 @@ check("cached response", st.endswith("200 OK") and b'"title":"cached"' in body a
 st, _, body = request(b"GET /cached HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + etag + b"\r\n\r\n")
 check("cached not modified", st.endswith("304 Not Modified") and body == b"", f"{st} {body!r}")
 
+# Range file: partial content and unsatisfiable range.
+st, head, body = request(b"GET /range-file HTTP/1.1\r\nHost: x\r\nRange: bytes=0-3\r\n\r\n")
+check("range file 206", st.endswith("206 Partial Content") and body == b"file" and b"content-range: bytes 0-3/10" in head.lower(), f"{st} {body!r} {head!r}")
+st, _, _ = request(b"GET /range-file HTTP/1.1\r\nHost: x\r\nRange: bytes=99-\r\n\r\n")
+check("range file 416", st.endswith("416 Range Not Satisfiable"), st)
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

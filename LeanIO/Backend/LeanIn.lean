@@ -8,6 +8,7 @@ public import Std.Http.Data.Method
 public import Lean
 public import LeanIO.Data.Headers.MimeType
 public import LeanIO.Response.BrowserCached
+public import LeanIO.Response.File.RangeFile
 public import LeanIO.Request.FromRequestBody
 public import LeanIO.Request.FromRequestParts
 public import LeanIO.Request.HeaderRange
@@ -15,6 +16,7 @@ public import LeanIO.Response.File.File
 public import LeanIO.Response.File.Utils
 public import LeanIO.Data.Headers.MimeType
 public import LeanIO.Response.BrowserCached
+public import LeanIO.Response.File.RangeFile
 public import LeanIO.Request.MultiPartForm.Api
 public import LeanIO.Request.Form
 
@@ -596,6 +598,81 @@ instance : IntoResponseM LeanIO.File where
                          ("ETag", toString etag)] }
         env.writer.start head
         streamFileHandle handle env.writer
+
+/-- Select the first range, marking an unsatisfiable start as `(fileSize, 0)` so the caller answers 416. (The
+stock `RangeFile.pickRange` maps that case to `(0,0)`, which would make a 0-length 206.) -/
+def pickRange (ranges : Option (Array LeanIO.Range)) (fileSize : Nat) : Option (Nat × Nat) :=
+  match ranges with
+  | none => none
+  | some rs =>
+    match rs[0]? with
+    | none => none
+    | some r =>
+      match r.start, r.stop with
+      | some s, some e => if s >= fileSize then some (fileSize, 0) else some (s, min e (fileSize - 1) - s + 1)
+      | some s, none => if s >= fileSize then some (fileSize, 0) else some (s, fileSize - s)
+      | none, some suffix =>
+        let suffix := min suffix fileSize
+        some (fileSize - suffix, suffix)
+      | none, none => some (0, fileSize)
+
+/-- Stream at most `n` bytes from a file handle. -/
+partial def streamFileHandleN (h : IO.FS.Handle) (w : LeanIn.Examples.Http.Server.ResponseWriter)
+    (n : Nat) : LeanIn.Runtime.VM Unit := do
+  if n == 0 then w.finish
+  else
+    let want := USize.ofNat (min n 65536)
+    let bytes ← (monadLift (h.read want : IO ByteArray))
+    if bytes.isEmpty then w.finish
+    else
+      w.write bytes
+      streamFileHandleN h w (n - bytes.size)
+
+/-- A file with `Range` support: 206 + `Content-Range` for a satisfiable range, 416 when the start is past
+the end, and ETag/304 before either. -/
+instance : IntoResponseM LeanIO.RangeFile where
+  write env f := do
+    let p := f.path
+    let fileExists ← (monadLift (p.pathExists : IO Bool))
+    let directory ← (monadLift (p.isDir : IO Bool))
+    if !fileExists || directory then
+      (AppM.respond 404 "Not Found" .empty) env
+    else
+      let md ← (monadLift (p.metadata : IO IO.FS.Metadata))
+      let size := md.byteSize.toNat
+      let etag := LeanIO.computeETag md
+      if env.req.header? "if-none-match" == some (toString etag) then
+        (AppM.respond 304 "Not Modified" .empty #[("ETag", toString etag)]) env
+      else
+        let handle ← (monadLift (IO.FS.Handle.mk p .read : IO IO.FS.Handle))
+        let ranges := (env.req.header? "range").bind LeanIO.parseRange
+        let ctype := toString (LeanIO.MimeType.mimeType p)
+        match pickRange ranges size with
+        | none =>
+          let head : H1.ResponseHead :=
+            { status := 200, reason := "OK",
+              headers := #[("Content-Length", toString size), ("Content-Type", ctype),
+                           ("ETag", toString etag), ("Accept-Ranges", "bytes")] }
+          env.writer.start head
+          streamFileHandleN handle env.writer size
+        | some (start, len) =>
+          if start >= size then
+            let head : H1.ResponseHead :=
+              { status := 416, reason := "Range Not Satisfiable",
+                headers := #[("Content-Range", s!"bytes */{size}"), ("Content-Length", "0"),
+                             ("ETag", toString etag)] }
+            env.writer.start head
+            env.writer.finish
+          else
+            let last := start + len - 1
+            monadLift (LeanIO.skipBytes handle start : IO Unit)
+            let head : H1.ResponseHead :=
+              { status := 206, reason := "Partial Content",
+                headers := #[("Content-Length", toString len), ("Content-Type", ctype),
+                             ("Content-Range", s!"bytes {start}-{last}/{size}"),
+                             ("ETag", toString etag), ("Accept-Ranges", "bytes")] }
+            env.writer.start head
+            streamFileHandleN handle env.writer len
 
 /-- A JSON response with an ETag and cache-control, answering 304 on `If-None-Match`. -/
 instance [Lean.ToJson α] : IntoResponseM (LeanIO.BrowserCached α) where

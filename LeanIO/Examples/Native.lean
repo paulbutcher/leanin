@@ -212,6 +212,10 @@ def fileDemo : LeanIO.Backend.LeanIn.NativeRoute :=
 def cachedDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/cached" => LeanIO.BrowserCached.new ({ title := "cached" : Todo })
 
+/-- A range file response. -/
+def rangeFileDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/range-file" => ({ path := "/tmp/leanio-native-file.txt" : LeanIO.RangeFile })
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -296,6 +300,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add methodDemo
     |>.route .get "/line" lineDemo
     |>.add fileDemo
+    |>.add rangeFileDemo
     |>.add cachedDemo
     |>.add rangeDemo
     |>.route .get "/cleanup" cleanupDemo

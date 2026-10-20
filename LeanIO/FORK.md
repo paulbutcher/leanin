@@ -12,7 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
-| 2026-10-20 | `Backend.LeanIn`: request-aware `IntoResponseM`; native `File` (streamed, ETag/304) and `BrowserCached` (JSON, ETag/304) | file and cached responses work natively; RangeFile/RemoteAddr/derive/BodyExt remain |
+| 2026-10-20 | `Backend.LeanIn`: request-aware `IntoResponseM`; native `File` (streamed, ETag/304), `RangeFile` (206/Content-Range, 416) and `BrowserCached` (JSON, ETag/304) | file, range and cached responses work natively; RemoteAddr/derive/BodyExt remain |
 | 2026-10-20 | `Backend.LeanIn`: request `Scope` with `onExit`, cooperative `checkCancelled`, and `spawn`, dispatched around every handler | request-owned children and exactly-once cleanup exist natively; cancellation is cooperative and shutdown/drain remains outstanding |
 | 2026-10-20 | `Server.BodyReader.readAll` | the stock `body.readAll` call shape exists on the native reader; it accumulates, so bounded bodies only |
 | 2026-10-20 | `Backend.LeanIn`: Std `Method`/`Version`/`Headers` parts extractors and a `Request.line` view | stock-style middleware/handler accessors work without rewriting; only an explicit stock request type remains a source change |
@@ -65,7 +65,8 @@ middleware/handlers reading `req.line.method/uri/headers` need no accessor chang
 
 Response types: native `IntoResponseM` is request-aware; `LeanIO.File` streams with Content-Length and an
 ETag (304 on `If-None-Match`), and `LeanIO.BrowserCached` answers JSON with ETag/cache-control and 304.
-`RangeFile` (206/Content-Range), `RemoteAddr`, the derive-from-* macros and `BodyExt` are not ported.
+`RangeFile` answers 206/Content-Range and 416 natively. `RemoteAddr`, the derive-from-* macros and `BodyExt`
+are not ported.
 
 Request lifecycle: each dispatched request runs under a `Scope` (in `Request.scope`). `AppM.onExit` registers
 exactly-once cleanup, `AppM.spawn` starts a request-owned child, and `AppM.checkCancelled` aborts cooperatively;
