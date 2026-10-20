@@ -1,3 +1,4 @@
+import LeanIO.Request.DeriveFromQuery
 import LeanIO.Router.Macro
 import LeanIO.Backend.LeanIn
 import LeanIO.Backend.LeanIn.Middlewares
@@ -216,6 +217,16 @@ def cachedDemo : LeanIO.Backend.LeanIn.NativeRoute :=
 def rangeFileDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/range-file" => ({ path := "/tmp/leanio-native-file.txt" : LeanIO.RangeFile })
 
+/-- A derived query structure and a struct whose fields derive from path/query. -/
+structure PageParams where
+  page : Nat := 1
+  size : Nat := 10
+deriving FromQuery
+
+def queryDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/query" (q : LeanIO.Query PageParams) =>
+    (Std.Http.Status.ok, s!"page={q.value.page} size={q.value.size}\n")
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -302,6 +313,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add fileDemo
     |>.add rangeFileDemo
     |>.add cachedDemo
+    |>.add queryDemo
     |>.add rangeDemo
     |>.route .get "/cleanup" cleanupDemo
     |>.route .get "/child" childDemo

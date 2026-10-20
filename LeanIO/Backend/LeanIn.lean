@@ -590,10 +590,13 @@ instance : IntoResponseM LeanIO.File where
         (AppM.respond 304 "Not Modified" .empty #[("ETag", toString etag)]) env
       else do
         let handle ← (monadLift (IO.FS.Handle.mk p .read : IO IO.FS.Handle))
+        let cacheHeaders := match f.cacheControl with
+          | some cc => #[("Cache-Control", toString cc)]
+          | none => #[]
         let head : H1.ResponseHead :=
           { status := 200
             reason := "OK"
-            headers := #[("Content-Length", toString size),
+            headers := cacheHeaders ++ #[("Content-Length", toString size),
                          ("Content-Type", toString (LeanIO.MimeType.mimeType p)),
                          ("ETag", toString etag)] }
         env.writer.start head
@@ -647,11 +650,14 @@ instance : IntoResponseM LeanIO.RangeFile where
         let handle ← (monadLift (IO.FS.Handle.mk p .read : IO IO.FS.Handle))
         let ranges := (env.req.header? "range").bind LeanIO.parseRange
         let ctype := toString (LeanIO.MimeType.mimeType p)
+        let cacheHeaders := match f.cacheControl with
+          | some cc => #[("Cache-Control", toString cc)]
+          | none => #[]
         match pickRange ranges size with
         | none =>
           let head : H1.ResponseHead :=
             { status := 200, reason := "OK",
-              headers := #[("Content-Length", toString size), ("Content-Type", ctype),
+              headers := cacheHeaders ++ #[("Content-Length", toString size), ("Content-Type", ctype),
                            ("ETag", toString etag), ("Accept-Ranges", "bytes")] }
           env.writer.start head
           streamFileHandleN handle env.writer size
@@ -659,7 +665,7 @@ instance : IntoResponseM LeanIO.RangeFile where
           if start >= size then
             let head : H1.ResponseHead :=
               { status := 416, reason := "Range Not Satisfiable",
-                headers := #[("Content-Range", s!"bytes */{size}"), ("Content-Length", "0"),
+                headers := cacheHeaders ++ #[("Content-Range", s!"bytes */{size}"), ("Content-Length", "0"),
                              ("ETag", toString etag)] }
             env.writer.start head
             env.writer.finish
@@ -668,7 +674,7 @@ instance : IntoResponseM LeanIO.RangeFile where
             monadLift (LeanIO.skipBytes handle start : IO Unit)
             let head : H1.ResponseHead :=
               { status := 206, reason := "Partial Content",
-                headers := #[("Content-Length", toString len), ("Content-Type", ctype),
+                headers := cacheHeaders ++ #[("Content-Length", toString len), ("Content-Type", ctype),
                              ("Content-Range", s!"bytes {start}-{last}/{size}"),
                              ("ETag", toString etag), ("Accept-Ranges", "bytes")] }
             env.writer.start head
@@ -684,7 +690,7 @@ instance [Lean.ToJson α] : IntoResponseM (LeanIO.BrowserCached α) where
     else
       (AppM.respond 200 "OK" json.toUTF8
         #[("Content-Type", "application/json"), ("ETag", toString etag),
-          ("Cache-Control", "private, no-cache")]) env
+          ("Cache-Control", toString cached.cacheControl)]) env
 
 /-- A route body in the native backend: either a response value or an `AppM` computation. This is what lets
 the unprefixed route syntax keep LeanIO's `=> "text"` and `=> do …` forms. -/
@@ -722,6 +728,16 @@ instance : FromRequestPartsM Std.Http.Headers where
       let value := (H1.Slice.toString? r.head.buf v).getD ""
       acc.insert! name value) Std.Http.Headers.empty
     .ok hs
+
+/-- A structure whose fields are query parameters, parsed by `FromQuery` (so `deriving FromQuery` works). -/
+instance [LeanIO.FromQuery α] : FromRequestPartsM (LeanIO.Query α) where
+  readParts r :=
+    match r.query? with
+    | none => .error (400, "malformed query")
+    | some q =>
+      match LeanIO.FromQuery.fromQuery (α := α) q with
+      | .ok v => .ok { value := v }
+      | .error e => .error (400, e)
 
 /-- The request target as Std's request-target type. -/
 instance : FromRequestPartsM Std.Http.RequestTarget where
