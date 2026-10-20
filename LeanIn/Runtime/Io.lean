@@ -262,31 +262,40 @@ private def withdraw (loop : Std.Mutex Table) (conn : UInt32) (op : Op) : IO Uni
 the operation completes — no `Join` cell, no `Item`, no inject, no carrier hop. The `Raw` paths measure what
 that skip is worth against the `Join`-cell path.
 
-The table parks one completion per `(connection, op)`. It is a `HashMap`, not a list — a list makes every
-park/resume/withdraw **O(parked operations)**, i.e. O(concurrent connections), so the per-request cost grew with
-concurrency; here each is O(1). -/
-private abbrev RawTable := Std.HashMap (UInt32 × Op) (Except IO.Error Result → IO Unit)
+The table parks one completion per `(connection, op)` **in the shim**, as an owned Lean closure pointer. A Lean
+`Std.Mutex` table publishes each closure into a persistent reference, which marks the closure and everything it
+captures multi-threaded and disables exclusive updates; a C slot does not participate in that classification and
+the shim still never calls Lean. The shim's own lock keeps the compound read/modify/write safe. -/
+private def opIdx : Op → UInt32
+  | .accept   => 0
+  | .read     => 1
+  | .write    => 2
+  | .shutdown => 3
 
-private initialize rawRef : Std.Mutex RawTable ← Std.Mutex.new {}
+@[extern "np_raw_register"] opaque npRawRegister (conn : UInt32) (op : UInt32)
+  (k : Except IO.Error Result → IO Unit) : IO Unit
+
+@[extern "np_raw_take"] opaque npRawTake (conn : UInt32) (op : UInt32) :
+  IO (Option (Except IO.Error Result → IO Unit))
+
+@[extern "np_raw_live"] opaque npRawLive : IO Bool
 
 /-- **Park a raw completion** for the loop to run on completion (experiment path). -/
 def registerRaw (conn : UInt32) (op : Op) (resume : Except IO.Error Result → IO Unit) : IO Unit :=
-  rawRef.atomically do modify (·.insert (conn, op) resume)
+  npRawRegister conn (opIdx op) resume
 
 /-- Take and run the raw completion for `conn`/`op`, if one is parked. -/
 private def rawResume (conn : UInt32) (op : Op) (res : Except IO.Error Result) : IO Unit := do
-  let r? ← rawRef.atomically do
-    let m ← get
-    set (m.erase (conn, op))
-    return m.get? (conn, op)
-  match r? with
+  match ← npRawTake conn (opIdx op) with
   | some resume => resume res
   | none        => pure ()
 
 /-- **Drop a raw registration** without completing it — the loser of a `recvTimeout` race, so a fired deadline
 does not leave a read parked that nobody will resume. -/
-def withdrawRaw (conn : UInt32) (op : Op) : IO Unit :=
-  rawRef.atomically do modify (·.erase (conn, op))
+def withdrawRaw (conn : UInt32) (op : Op) : IO Unit := do
+  match ← npRawTake conn (opIdx op) with
+  | some _ => pure ()
+  | none   => pure ()
 
 /-- Hand an accepted connection to the oldest parked accept, or hold it until one registers. -/
 private def arrive (loop : Std.Mutex Table) (idx : UInt32) : IO Unit := do
@@ -451,7 +460,7 @@ private def stallLive : IO Bool :=
 own executor has nothing to run: a raw completion is the loop's to deliver, and parking on the executor's
 condition variable there strands it (the submission's wake reaches the loop, not the executor). -/
 private def rawLive : IO Bool :=
-  rawRef.atomically do pure ((← get).size != 0)
+  npRawLive
 
 /-- Close the expired slots: take them out under the lock, then withdraw their reads and resume them outside it,
 so a late completion is dropped rather than resuming a machine that has moved on. -/

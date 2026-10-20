@@ -128,6 +128,53 @@ static conn_t g_conns[MAX_CONN];
 /* The event queue grows: it holds the events of one loop iteration, and an iteration's worth of events is set by
    how many connections are ready at once, not by anything the shim can bound in advance. A fixed ring would have
    to drop events when it filled, and a dropped event is a completion a parked operation never receives. */
+/* The raw completion registry: one owned Lean closure per (connection, op), held here rather than in a Lean
+   reference. Storing it in a Lean ref (global or reached through one) marks the closure and everything it
+   captures multi-threaded, which disables exclusive updates; a C pointer is invisible to that classification and
+   the shim still never calls Lean. The lock is required for the same reason the Lean registry had one. */
+#define MAX_RAW (4 * MAX_CONN)
+static lean_object *g_raw[MAX_RAW];
+static size_t g_raw_live_count = 0;
+static uv_mutex_t g_raw_lock;
+static int g_raw_up = 0;
+
+LEAN_EXPORT lean_object *np_raw_register(uint32_t idx, uint32_t op, lean_object *k) {
+  size_t i = (size_t)idx * 4 + op;
+  if (i >= MAX_RAW || !g_raw_up) { lean_dec(k); return lean_io_result_mk_ok(lean_box(0)); }
+  uv_mutex_lock(&g_raw_lock);
+  lean_object *old = g_raw[i];
+  if (old == NULL) g_raw_live_count++;
+  g_raw[i] = k;
+  uv_mutex_unlock(&g_raw_lock);
+  if (old) lean_dec(old);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *np_raw_take(uint32_t idx, uint32_t op) {
+  size_t i = (size_t)idx * 4 + op;
+  lean_object *k = NULL;
+  if (i < MAX_RAW && g_raw_up) {
+    uv_mutex_lock(&g_raw_lock);
+    k = g_raw[i];
+    if (k != NULL) { g_raw[i] = NULL; g_raw_live_count--; }
+    uv_mutex_unlock(&g_raw_lock);
+  }
+  lean_object *r;
+  if (k != NULL) { r = lean_alloc_ctor(1, 1, 0); lean_ctor_set(r, 0, k); }
+  else           { r = lean_alloc_ctor(0, 0, 0); }
+  return lean_io_result_mk_ok(r);
+}
+
+LEAN_EXPORT lean_object *np_raw_live(void) {
+  int live = 0;
+  if (g_raw_up) {
+    uv_mutex_lock(&g_raw_lock);
+    live = g_raw_live_count != 0;
+    uv_mutex_unlock(&g_raw_lock);
+  }
+  return lean_io_result_mk_ok(lean_box(live));
+}
+
 static uint64_t (*g_ev)[3] = NULL;
 static size_t g_ev_cap = 0;
 static int g_ev_n = 0;
@@ -279,6 +326,10 @@ static int ensure_loop(void) {
   if (!g_mutex_up) {
     if (uv_mutex_init(&g_sub_lock) != 0) { uv_loop_close(g_loop); free(g_loop); g_loop = NULL; return 0; }
     g_mutex_up = 1;
+  }
+  if (!g_raw_up) {
+    if (uv_mutex_init(&g_raw_lock) != 0) { uv_loop_close(g_loop); free(g_loop); g_loop = NULL; return 0; }
+    g_raw_up = 1;
   }
   uv_async_init(g_loop, &g_async, on_async);
   g_async_up = 1;
