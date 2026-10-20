@@ -251,8 +251,10 @@ structure ResponseWriter where
   start : H1.ResponseHead → VM Unit
   write : ByteArray → VM Unit
   finish : VM Unit
-  /-- Whether the response was started and finished, and whether the handler asked to close. -/
+  /-- Whether the response was started and finished, and whether it is chunked. -/
   status : VM (Bool × Bool × Bool)
+  /-- The status code of the head sent by `start`, if any. -/
+  code : VM (Option Nat)
 
 /-- A streaming request handler: the head, the body reader, and the response writer. -/
 abbrev StreamHandler := H1.Head → BodyReader → ResponseWriter → VM Unit
@@ -393,8 +395,9 @@ def bodyReader (head : H1.Head) (initial : ByteArray) (c : Conn) (clock : Clock)
 
 /-- The writer for one response on `c`. Framing is chosen once, at `start`. -/
 def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO ResponseWriter := do
-  let st ← IO.mkRef ((false, false, (none : Option Bool)) : Bool × Bool × Option Bool)
-  let set (f : Bool × Bool × Option Bool → Bool × Bool × Option Bool) : VM Unit := do
+  let st ← IO.mkRef ((false, false, (none : Option Bool), (none : Option Nat)) :
+    Bool × Bool × Option Bool × Option Nat)
+  let set (f : Bool × Bool × Option Bool × Option Nat → Bool × Bool × Option Bool × Option Nat) : VM Unit := do
     let s ← (liftGet st)
     liftSet st (f s)
   return {
@@ -407,27 +410,30 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
       let rh := if chunked then { rh with headers := rh.headers.push ("Transfer-Encoding", "chunked") } else rh
       let rh := if closeAsked then { rh with headers := rh.headers.push ("Connection", "close") } else rh
       VM.sendAll c #[H1.encodeResponseHead rh]
-      set (fun _ => (true, false, some chunked))
+      set (fun _ => (true, false, some chunked, some rh.status))
     write := fun bs => do
       let s ← (liftGet st)
       match s with
-      | (false, _, _) => throw (.userError "Http: response body written before its head")
-      | (_, true, _) => throw (.userError "Http: response body written after finish")
-      | (_, false, some true) =>
+      | (false, _, _, _) => throw (.userError "Http: response body written before its head")
+      | (_, true, _, _) => throw (.userError "Http: response body written after finish")
+      | (_, false, some true, _) =>
         VM.sendAll c #[s!"{hexOf bs.size}\r\n".toUTF8, bs, "\r\n".toUTF8]
-      | (_, false, _) => VM.send c bs
+      | (_, false, _, _) => VM.send c bs
     finish := do
       let s ← (liftGet st)
       match s with
-      | (false, _, _) => pure ()
-      | (_, true, _) => pure ()
-      | (_, false, some true) =>
+      | (false, _, _, _) => pure ()
+      | (_, true, _, _) => pure ()
+      | (_, false, some true, _) =>
         VM.sendAll c #["0\r\n\r\n".toUTF8]
-        set (fun (a, _, b) => (a, true, b))
-      | (_, false, _) => set (fun (a, _, b) => (a, true, b))
+        set (fun (a, _, b, c) => (a, true, b, c))
+      | (_, false, _, _) => set (fun (a, _, b, c) => (a, true, b, c))
     status := do
       let s ← (liftGet st)
-      return (s.1, s.2.1, s.2.2.getD false)
+      return (s.1, s.2.1, s.2.2.1.getD false)
+    code := do
+      let s ← (liftGet st)
+      return s.2.2.2
   }
 
 /-- One buffered response through the writer, for handlers that already hold the whole body. -/
@@ -459,7 +465,8 @@ private partial def pumpStreamGo (m : H1.Machine) (acc : Array ByteArray) : Pump
       if m'.head?.isSome then
         let head := m'.head?.getD default
         let initial := m'.buf.extract m'.pos m'.buf.size
-        let m'' := { m' with head? := none, pos := m'.buf.size, bodyRemaining := 0,
+        let acc := acc ++ m'.out                 -- an interim `100 Continue` queued at the head
+        let m'' := { m' with head? := none, pos := m'.buf.size, bodyRemaining := 0, out := #[],
                              chunkState := none, bodyDone := true, reqBody := .empty }
         { stop := .needHandler, machine := m'', out := acc, req? := some (head, initial) }
       else if m'.halted then { stop := .done, machine := m', out := acc }

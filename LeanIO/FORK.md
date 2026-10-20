@@ -11,6 +11,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | `Data/Headers/HeaderName.lean`: removed `contentEncoding`, `ifNoneMatch`, `lastModified`, `ifModifiedSince` | `Std.Http.Header.Name` provides them in Lean 4.35.0 |
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
+| 2026-10-20 | `Router.Macro`: `native`/`nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter` | explicit backend selection, and streaming request and response bodies on the native backend |
 
 ## Port status
 
@@ -31,27 +32,23 @@ Not yet ported: the route macros and `FromRequestBody`/`FromRequestParts` classe
 `ContextAsync`/`Request Body.Stream`; streaming bodies/backpressure, multipart and the request-cancellation
 scope are later stages. The fork builds and its own tests run under `lake build LeanIO`.
 
-### The authoring seam
+### The native backend's boundary
 
-Route declaration for the native backend is syntax, not only the programmatic API:
+Handlers now use the streaming session: `Request.body` is a `BodyReader`, the handler writes through a
+`ResponseWriter`, and neither direction is accumulated. `readAll` is what a buffered extractor (`jsonBody`,
+`formBody`, multipart) calls; a route that streams calls `recv`/`write` itself. The response is framed as a
+declared `Content-Length`, chunked on HTTP/1.1, or close-delimited. The buffered `maxBody` limit applies only
+to the buffered driver; a streaming body has no accumulated body to bound.
 
-```lean4
-|>.add (nativeRoute GET "/ping" ping)
-```
+Route selection is explicit: `native GET "/ping" ping` (also `nativeRoute`) declares a route whose handler is
+the backend's `Request → ResponseWriter → VM Unit`. The upstream `GET … => …` syntax remains stock-LeanIO and
+does not select a backend; its extractor classes are still typed at `ContextAsync`.
 
-`nativeRoute` is declared in `LeanIO/Router/Macro.lean`, beside the method keywords and pattern validation it
-reuses, and expands to a `NativeRoute` with the backend's `Request → VM (ResponseHead × ByteArray)` handler.
-`NativeRouter.add` consumes it.
+Multipart is parsed from the reader's bytes (`withMultipart`) and returns whole parts, so a part body is
+buffered per request. A per-part streaming reader, and the upstream multipart API over it, are not ported.
 
-This needed the module-system conversion of LeanIn, `LeanIn/Examples/Http` and the backend: `module` files
-cannot import non-module ones, so the backend could not be named from the macro before. With those converted,
-the macro names the backend's types directly. The backend's public signatures (`Handler`, `Request.head`) are
-what force its `public import` of the HTTP modules, and the compiler reports any import that is too private.
-
-Still programmatic or stock-only: the upstream `GET … => …` syntax keeps its `ContextAsync` handler and does not
-select a backend; `FromRequestBody`/`FromRequestParts` remain typed at `Request Body.Stream`. Streaming bodies
-and backpressure, multipart, request cancellation, and chunked / `Expect` framing are later stages of the
-porting handoff.
+Cancellation is the transport's: a body or response operation that fails raises through the handler, and
+`catchErrors` re-raises transport failures rather than turning them into a 500 the peer can no longer receive.
 
 ## Working rules
 

@@ -33,18 +33,26 @@ open LeanIn.Examples.Http
 open LeanIO.Router
 open Std.Http
 
-/-- The driver's handler: the shape `serveConn` runs. -/
-abbrev CoreHandler := LeanIn.Examples.Http.Server.Handler
+/-- The driver's handler: the streaming session shape. -/
+abbrev CoreHandler := LeanIn.Examples.Http.Server.StreamHandler
 
-/-- A request as the native backend sees it. `params` are the trie's captures for a parameterised route, in
-the order the pattern names them. -/
+/-- A request as the native backend sees it. `body` is the streaming reader; an extractor that needs the
+whole body reads it, and a route that streams consumes it incrementally. `params` are the trie's captures for
+a parameterised route, in the order the pattern names them. -/
 structure Request where
   head : H1.Head
-  body : ByteArray := .empty
+  body : LeanIn.Examples.Http.Server.BodyReader
   params : List (String × String) := []
 
-/-- A native handler: request in, buffered response out. -/
-abbrev Handler := Request → LeanIn.Runtime.VM (H1.ResponseHead × ByteArray)
+/-- A native handler: the request and the response writer, so a response need not be accumulated. -/
+abbrev Handler := Request → LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+
+/-- Read a whole body through the reader. This is what a buffered extractor (`jsonBody`, `formBody`) does; a
+streaming route calls `recv` itself and never accumulates. -/
+partial def readAll (r : LeanIn.Examples.Http.Server.BodyReader) (acc : ByteArray) : LeanIn.Runtime.VM ByteArray := do
+  match ← r.recv 65536 with
+  | some chunk => readAll r (acc ++ chunk)
+  | none => return acc
 
 /-- Middleware transforms a handler; composition order is nesting order (the leftmost/outermost runs first). -/
 abbrev Middleware := Handler → Handler
@@ -205,11 +213,12 @@ def Request.mimeOk (r : Request) (t : Type) [LeanIO.MimeType.HasMimeTypes t] : B
 /-- Decode a JSON body. The failures are distinguishable: 415 for the wrong media type, 400 for malformed
 JSON, 422 when it parses but does not fit `α`. -/
 def jsonBody (α : Type) [Lean.FromJson α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Json α)] (r : Request) :
-    Except (Nat × String) α :=
+    LeanIn.Runtime.VM (Except (Nat × String) α) := do
   if !r.mimeOk (LeanIO.Json α) then
-    .error (415, "unsupported media type")
+    return .error (415, "unsupported media type")
   else
-    match String.fromUTF8? r.body with
+    let b ← readAll r.body .empty
+    return (match String.fromUTF8? b with
     | none => .error (400, "body is not valid UTF-8")
     | some text =>
       match Lean.Json.parse text with
@@ -217,35 +226,32 @@ def jsonBody (α : Type) [Lean.FromJson α] [LeanIO.MimeType.HasMimeTypes (LeanI
       | .ok j =>
         match Lean.FromJson.fromJson? (α := α) j with
         | .ok a => .ok a
-        | .error e => .error (422, s!"body does not fit: {e}")
+        | .error e => .error (422, s!"body does not fit: {e}"))
 
 /-- A plain-text body, with the same media-type check. -/
-def textBody (r : Request) : Except (Nat × String) String :=
+def textBody (r : Request) : LeanIn.Runtime.VM (Except (Nat × String) String) := do
   if !r.mimeOk LeanIO.PlainText then
-    .error (415, "unsupported media type")
+    return .error (415, "unsupported media type")
   else
-    match String.fromUTF8? r.body with
+    let b ← readAll r.body .empty
+    return (match String.fromUTF8? b with
     | none => .error (400, "body is not valid UTF-8")
-    | some text => .ok text
+    | some text => .ok text)
 
 /-- Decode an `application/x-www-form-urlencoded` body. The query parser and `FromForm` are LeanIO's; only the
 transport (buffered bytes instead of a stock body stream) is the backend's. -/
 def formBody (α : Type) [LeanIO.FromForm α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Form α)] (r : Request) :
-    Except (Nat × String) α :=
+    LeanIn.Runtime.VM (Except (Nat × String) α) := do
   if !r.mimeOk (LeanIO.Form α) then
-    .error (415, "unsupported media type")
+    return .error (415, "unsupported media type")
   else
-    match LeanIO.parseQuery {} r.body.iter with
+    let b ← readAll r.body .empty
+    return (match LeanIO.parseQuery {} b.iter with
     | .success _ query =>
       match LeanIO.FromForm.fromForm (α := α) query with
       | .ok v => .ok v
       | .error e => .error (422, s!"body does not fit: {e}")
-    | .error _ _ => .error (400, "malformed form body")
-
-/-- A response with one buffered body and a `Content-Length`. -/
-def response (status : Nat) (reason : String) (body : ByteArray)
-    (headers : Array (String × String) := #[]) : H1.ResponseHead × ByteArray :=
-  ({ status, reason, headers := headers.push ("Content-Length", toString body.size) }, body)
+    | .error _ _ => .error (400, "malformed form body"))
 
 /-- The reason phrase the backend uses for its own statuses. -/
 def reasonFor : Nat → String
@@ -261,61 +267,164 @@ def reasonFor : Nat → String
   | 501 => "Not Implemented"
   | _   => "Internal Server Error"
 
+/-- One part of a multipart form: its disposition, content type, headers and body. -/
+structure Part where
+  name : String
+  filename : Option String := none
+  contentType : String := "text/plain"
+  headers : Array (String × String) := #[]
+  body : ByteArray := .empty
+
+/-- Strip one pair of surrounding double quotes, as disposition parameters may carry them. -/
+def unquote (s : String) : String :=
+  if s.length ≥ 2 && s.startsWith "\"" && s.endsWith "\"" then
+    (s.drop 1).dropEnd 1 |>.toString
+  else s
+
+/-- The `boundary` parameter of a `multipart/form-data` content type. -/
+def boundary? (r : Request) : Option String :=
+  (r.header? "content-type").bind fun v =>
+    (v.splitOn ";").findSome? fun p =>
+      match p.trimAscii.toString.splitOn "=" with
+      | ["boundary", b] => some (unquote (b.trimAscii.toString))
+      | _ => none
+
+/-- Split a multipart body into parts. The delimiters are `--boundary`; a part ends at the next delimiter,
+and the closing delimiter is followed by `--`. Part headers are separated from the part body by a blank line.
+The body is the reader's bytes, so this is the buffered form; a streaming part reader is a later step. -/
+def parseParts (boundary : String) (body : ByteArray) : Except String (Array Part) := Id.run do
+  let text := String.fromUTF8? body |>.getD (String.fromUTF8! body)
+  let segs := (text.splitOn ("--" ++ boundary))
+  if segs.length < 2 then return .error "no boundary delimiter in body"
+  let mut parts : Array Part := #[]
+  for seg in segs.drop 1 do
+    if seg.startsWith "--" then break
+    let seg := if seg.startsWith "\r\n" then (seg.drop 2).toString else seg
+    match seg.splitOn "\r\n\r\n" with
+    | head :: rest =>
+      let content := String.intercalate "\r\n\r\n" rest
+      let content := if content.endsWith "\r\n" then (content.dropEnd 2).toString else content
+      let lines := head.splitOn "\r\n"
+      let hs : Array (String × String) := lines.filterMap (fun line =>
+        match line.splitOn ":" with
+        | n :: vs => some (n.trimAscii.toString.toLower, String.intercalate ":" vs |>.trimAscii.toString)
+        | _ => none) |>.toArray
+      let disp := hs.findSome? fun (n, v) => if n == "content-disposition" then some v else none
+      let param (key : String) : Option String :=
+        disp.bind fun v =>
+          (v.splitOn ";").findSome? fun p =>
+            match p.trimAscii.toString.splitOn "=" with
+            | [k, x] => if k == key then some (unquote (x.trimAscii.toString)) else none
+            | _ => none
+      let ctype := (hs.findSome? fun (n, v) => if n == "content-type" then some v else none).getD "text/plain"
+      parts := parts.push { name := (param "name").getD "", filename := param "filename",
+                            contentType := ctype, headers := hs, body := content.toUTF8 }
+    | [] => pure ()
+  if parts.isEmpty then .error "no parts" else .ok parts
+
+/-- A multipart request's parts, or the response status to answer with. -/
+def multipartBody (r : Request) : LeanIn.Runtime.VM (Except (Nat × String) (Array Part)) := do
+  if r.mediaType? != some "multipart/form-data" then
+    return .error (415, "unsupported media type")
+  else
+    match boundary? r with
+    | none => return .error (400, "missing multipart boundary")
+    | some b =>
+      let body ← readAll r.body .empty
+      return (match parseParts b body with
+        | .ok parts => .ok parts
+        | .error e => .error (400, e))
+
+/-- Compose a multipart parser with a handler, like `withExtract`. -/
+def withMultipart (f : Array Part → Handler) : Handler :=
+  fun req w => do
+    match ← multipartBody req with
+    | .ok parts => f parts req w
+    | .error (status, msg) =>
+      w.start { status, reason := reasonFor status,
+                headers := #[("Content-Length", toString msg.toUTF8.size)] }
+      w.write msg.toUTF8
+      w.finish
+
+/-- A response with one buffered body and a `Content-Length`. -/
+def response (status : Nat) (reason : String) (body : ByteArray)
+    (headers : Array (String × String) := #[]) : H1.ResponseHead × ByteArray :=
+  ({ status, reason, headers := headers.push ("Content-Length", toString body.size) }, body)
+
+/-- A buffered response through the streaming writer: `Content-Length` and one write. -/
+def respond (w : LeanIn.Examples.Http.Server.ResponseWriter) (status : Nat) (reason : String)
+    (body : ByteArray) (headers : Array (String × String) := #[]) : LeanIn.Runtime.VM Unit := do
+  w.start { status, reason, headers := headers.push ("Content-Length", toString body.size) }
+  w.write body
+  w.finish
+
 /-- Error scope as a handler: `VM.attempt` carries the catch through every suspension, so a handler that
 parks and then raises is caught here exactly as one that raises at once. The failure becomes a 500 rather than
 escaping the connection. -/
 def catchErrors : Middleware :=
-  fun handler req => do
-    match ← LeanIn.Runtime.VM.attempt (handler req) with
-    | .ok resp => pure resp
-    | .error e => pure (response 500 "Internal Server Error" (toString e).toUTF8)
+  fun handler req w => do
+    match ← LeanIn.Runtime.VM.attempt (handler req w) with
+    | .ok _ => pure ()
+    | .error e =>
+      -- A transport failure is the request's cancellation, not an application error: it must not be turned
+      -- into a response the peer can no longer receive.
+      if (toString e).startsWith "Http:" then throw e
+      else respond w 500 "Internal Server Error" (toString e).toUTF8
 
 /-- Observing middleware: logs method, path and status through `IO` lifted into the machine, then returns the
 response unchanged. -/
 def requestLogger (label : String) : Middleware :=
-  fun handler req => do
-    let resp ← handler req
-    let status : Nat := resp.1.status
-    let line := label ++ " " ++ req.head.methodTokenString ++ " " ++ req.path ++ " -> " ++ toString status
+  fun handler req w => do
+    handler req w
+    let code ← w.code
+    let line := label ++ " " ++ req.head.methodTokenString ++ " " ++ req.path ++ " -> " ++ toString (code.getD 0)
     monadLift (do IO.println line; IO.getStdout >>= fun s => s.flush)
-    pure resp
 
 /-- Compose an extractor with a handler: an extraction failure becomes the response, so applications compose
 `withExtract (jsonBody T) fun t => …` the way the stock extractor classes compose. -/
-def withExtract (extract : Request → Except (Nat × String) α) (f : α → Handler) : Handler :=
-  fun req =>
-    match extract req with
-    | .ok a => f a req
-    | .error (status, msg) => pure (response status (reasonFor status) msg.toUTF8)
+def withExtract (extract : Request → LeanIn.Runtime.VM (Except (Nat × String) α)) (f : α → Handler) :
+    Handler :=
+  fun req w => do
+    match ← extract req with
+    | .ok a => f a req w
+    | .error (status, msg) => respond w status (reasonFor status) msg.toUTF8
 
-/-- Dispatch a parsed head through the trie.
+/-- A writer that runs the handler but drops the body, for HEAD from a GET route. -/
+def discardBody (w : LeanIn.Examples.Http.Server.ResponseWriter) :
+    LeanIn.Examples.Http.Server.ResponseWriter := {
+  start := fun rh =>
+    let hs := (rh.headers.filter (fun (n, _) => n.toLower != "content-length")).push ("Content-Length", "0")
+    w.start { rh with headers := hs }
+  write := fun _ => pure ()
+  finish := w.finish
+  status := w.status
+  code := w.code }
+
+/-- Dispatch a parsed head and streaming body through the trie.
 
 An unknown method token is refused with 501 rather than dispatched. A path known under other methods answers 405
 with `Allow`; a miss goes to the trie's `notFound` handler or a 404. The trie's captured parameters become the
 request's `params`. -/
-def dispatch (trie : RouteTrie Handler) : CoreHandler := fun head body =>
+def dispatch (trie : RouteTrie Handler) : CoreHandler := fun head body w =>
   match method? head with
-  | none => pure (response 501 "Not Implemented" "method not supported\n".toUTF8)
+  | none => respond w 501 "Not Implemented" "method not supported\n".toUTF8
   | some m =>
     match trie.lookup m (pathSegments head) with
-    | .found params handler => handler { head, body, params }
+    | .found params handler => handler { head, body, params } w
     | .methodMismatch allowed =>
       -- LeanIO serves HEAD from the GET handler and drops the body; the response declares
       -- `Content-Length: 0` rather than the length the body would have had, because declaring a length it
       -- will not send would strand the client. This matches the upstream trie's documented behaviour.
       if m == .head && allowed.contains .get then
         match trie.lookup .get (pathSegments head) with
-        | .found params handler => do
-          let (respHead, _body) ← handler { head, body, params }
-          let headers := respHead.headers.filter (fun (n, _) => n.toLower != "content-length")
-          pure ({ respHead with headers := headers.push ("Content-Length", "0") }, .empty)
-        | _ => pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
+        | .found params handler => handler { head, body, params } (discardBody w)
+        | _ => respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
       else
-        pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
+        respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
     | .noMatch =>
       match trie.notFound with
-      | some handler => handler { head, body }
-      | none => pure (response 404 "Not Found" "not found\n".toUTF8)
+      | some handler => handler { head, body } w
+      | none => respond w 404 "Not Found" "not found\n".toUTF8
 
 /-- Serve `handler` on `port` with the given hooks (so an application can build handlers against the same live
 clock, e.g. to suspend on a timer). Blocks until the accept loop ends. -/
@@ -324,7 +433,7 @@ def serveWith (hooks : LeanIn.Runtime.Hooks) (handler : CoreHandler) (port : UIn
   let e ← LeanIn.Sched.Executor.new LeanIn.Task.Item 256 1
   let cfg : LeanIn.Examples.Http.Server.Config := { clock := LeanIn.Runtime.Clock.live hooks }
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    LeanIn.Runtime.serveForever hooks l (LeanIn.Examples.Http.Server.serveConn cfg · handler)
+    LeanIn.Runtime.serveForever hooks l (LeanIn.Examples.Http.Server.serveConnStream cfg · handler)
   let outcome : Except IO.Error Unit ← LeanIn.Runtime.run e prog
   LeanIn.Runtime.Io.stop
   match outcome with

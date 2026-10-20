@@ -209,16 +209,21 @@ macro_rules
 keywords and compile-time pattern validation above, and expands to the LeanIn backend's `NativeRoute` rather
 than the stock `Route`. -/
 syntax "nativeRoute" method str term : term
+syntax "native " method str term : term
+
+meta def expandNativeRoute (m : TSyntax `method) (pat : TSyntax `str) (body : TSyntax `term) :
+    MacroM Term := do
+  let some source := m.raw.reprint | Macro.throwErrorAt m "failed to read method keyword"
+  let methodName := source.trimAscii |>.toString |> Name.mkSimple
+  let methodTerm : Term := mkIdent (resolveMethodCon methodName)
+  let patStr := pat.getString
+  match validateRoutePattern patStr with
+  | .error e => Macro.throwErrorAt pat e
+  | .ok () => pure ()
+  `({ method := $methodTerm, pattern := RoutePattern.ofString $pat, handler := $body : LeanIO.Backend.LeanIn.NativeRoute })
 
 macro_rules
-  | `(nativeRoute $m:method $pat:str $body:term) => do
-    let some source := m.raw.reprint | Macro.throwErrorAt m "failed to read method keyword"
-    let methodName := source.trimAscii |>.toString |> Name.mkSimple
-    let methodTerm : Term := mkIdent (resolveMethodCon methodName)
-    let patStr := pat.getString
-    match validateRoutePattern patStr with
-    | .error e => Macro.throwErrorAt pat e
-    | .ok () => pure ()
-    `({ method := $methodTerm, pattern := RoutePattern.ofString $pat, handler := $body : LeanIO.Backend.LeanIn.NativeRoute })
+  | `(nativeRoute $m:method $pat:str $body:term) => expandNativeRoute m pat body
+  | `(native $m:method $pat:str $body:term) => expandNativeRoute m pat body
 
 end LeanIO.Router

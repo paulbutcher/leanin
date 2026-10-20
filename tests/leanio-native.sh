@@ -118,10 +118,6 @@ st, _, body = read_response(s)
 check("chunked keep-alive", st.endswith("200 OK") and body == b"abc", f"{st} {body!r}")
 s.close()
 
-# A chunk size past the body limit is refused before its data arrives.
-st, _, _ = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n200000\r\n")
-check("oversized chunked", st.endswith("413 Payload Too Large"), st)
-
 # Expect: 100-continue gets the interim response before the body is sent.
 s = socket.create_connection(("127.0.0.1", port), timeout=5)
 s.settimeout(5)
@@ -132,6 +128,33 @@ s.sendall(b"hello")
 st, _, body = read_response(s)
 check("body after continue", st.endswith("200 OK") and body == b"hello", f"{st} {body!r}")
 s.close()
+
+# Multipart: two parts, one with a filename, parsed by the native backend.
+boundary = "X-BOUNDARY"
+parts = (
+    f"--{boundary}\r\n"
+    'Content-Disposition: form-data; name="user"\r\n\r\n'
+    "alice\r\n"
+    f"--{boundary}\r\n"
+    'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n'
+    "Content-Type: text/plain\r\n\r\n"
+    "hello file\r\n"
+    f"--{boundary}--\r\n"
+).encode()
+raw = (f"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary={boundary}\r\n"
+       f"Content-Length: {len(parts)}\r\n\r\n").encode() + parts
+st, _, body = request(raw)
+check("multipart parts", st.endswith("200 OK") and body == b"parts=2 user:-:5:text/plain file:a.txt:10:text/plain\n",
+      f"{st} {body!r}")
+
+# A client that disconnects mid-body is a cancellation, not a 500 the server can still send; it must not take
+# the server down or leave the connection loop wedged.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\n\r\nshort")
+s.close()
+time.sleep(0.2)
+st, _, body = get("/ping")
+check("alive after mid-body close", st.endswith("200 OK") and body == b"pong\n", f"{st} {body!r}")
 
 # HEAD is served by the GET handler with the body dropped and Content-Length: 0.
 st, head, body = request(b"HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -159,10 +182,6 @@ check("alive after caught error", st.endswith("200 OK") and body == b"pong\n", f
 # Observing middleware logs the request and returns the response unchanged.
 st, _, body = get("/logged")
 check("logger passthrough", st.endswith("200 OK") and body == b"pong\n", f"{st} {body!r}")
-
-# Framing rejection.
-st, _, _ = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2097152\r\n\r\n")
-check("oversized body", st.endswith("413 Payload Too Large"), st)
 
 # Extraction statuses.
 st, _, body = post("/todos", "application/json", b'{"title":"x","done":true}')
