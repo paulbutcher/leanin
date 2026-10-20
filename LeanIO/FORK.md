@@ -11,7 +11,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | `Data/Headers/HeaderName.lean`: removed `contentEncoding`, `ifNoneMatch`, `lastModified`, `ifModifiedSince` | `Std.Http.Header.Name` provides them in Lean 4.35.0 |
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
-| 2026-10-20 | `Router.Macro`: `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | explicit backend selection sharing the route-declaration form, and streaming request and response bodies |
+| 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
 | 2026-10-20 | `Backend.LeanIn`: `withMultipartStream`, `MReader`/`PartReader` with `stream`/`bytes`/`discard`/`save` | per-part streaming multipart on the native reader; the buffered `withMultipart` remains for whole-part consumers |
 
 ## Port status
@@ -41,10 +41,11 @@ Handlers use the streaming session: `Request.body` is a `BodyReader`, the handle
 `Content-Length`, chunked on HTTP/1.1, or close-delimited. The buffered `maxBody` limit applies only to the
 buffered driver; a streaming body has no accumulated body to bound.
 
-Route selection is explicit and shares the route-declaration form: `native GET "/todos" (body : Json T) => …`
-expands to a `NativeRoute`, with the body in `AppM` (request and writer in the environment) and binders read
-through the native `FromRequestBodyM`/`NativeExtractor` classes. `nativeRoute GET "/ping" ping` takes an
-already-built handler. The unprefixed `GET … => …` remains stock-LeanIO and does not select a backend.
+Route selection shares the route-declaration form. The unprefixed `GET … => …` selects the stock backend by
+default and the native backend under `set_option leanio.backend.native true`; `native GET … => …` selects the
+native backend regardless of the option. A native body is an `AppM` computation (request and writer in the
+environment) and binders read through the native `FromRequestBodyM`/`NativeExtractor` classes;
+`nativeRoute GET "/ping" ping` takes an already-built handler.
 
 Multipart has both shapes: `withMultipart` reads whole parts, and `withMultipartStream` yields a `PartReader`
 per part with an incremental `recv`; `PartReader` also provides `stream`, `bytes`, `discard` and `save`.

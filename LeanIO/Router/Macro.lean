@@ -13,6 +13,13 @@ open Std.Async
 open Lean
 open Lean.Macro
 
+/-- Selects the native backend for the unprefixed `GET … => …` route syntax in the current scope. The
+default keeps the stock `ContextAsync` backend; `set_option leanio.backend.native true` switches it. -/
+register_option leanio.backend.native : Bool := {
+  defValue := false
+  descr := "expand `GET … => …` and the other route keywords to the native LeanIn backend"
+}
+
 public meta def isValidParamName (s : String) : Bool :=
   if s.isEmpty then false
   else
@@ -243,11 +250,17 @@ meta def expandNativeArrow (methodName : Name) (pat : TSyntax `str) (bs : Array 
 The unprefixed `GET … => …` remains the stock backend. -/
 syntax "native " method str extractorBinder* "=>" term : term
 
-macro_rules
+elab_rules : term
   | `($method:method $pat:str $bs:extractorBinder* => $body:term) => do
-    let some source := method.raw.reprint | Macro.throwErrorAt method "failed to read method keyword"
+    let some source := method.raw.reprint | throwErrorAt method "failed to read method keyword"
     let methodName := source.trimAscii |>.toString |> Name.mkSimple
-    expandRouteTerm (resolveMethodCon methodName) pat bs body
+    let useNative ← getBoolOption `leanio.backend.native
+    let stx ← Lean.Elab.liftMacroM <|
+      if useNative then expandNativeArrow methodName pat bs body
+      else expandRouteTerm (resolveMethodCon methodName) pat bs body
+    Lean.Elab.Term.elabTerm stx none
+
+macro_rules
   | `(native $method:method $pat:str $bs:extractorBinder* => $body:term) => do
     let some source := method.raw.reprint | Macro.throwErrorAt method "failed to read method keyword"
     let methodName := source.trimAscii |>.toString |> Name.mkSimple

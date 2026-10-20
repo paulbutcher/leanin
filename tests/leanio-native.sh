@@ -134,6 +134,8 @@ st, _, body = get("/nping")
 check("native syntax", st.endswith("200 OK") and body == b"native-syntax\n", f"{st} {body!r}")
 st, _, body = post("/ntodos", "application/json", b'{"title":"native","done":false}')
 check("native syntax body extractor", st.endswith("200 OK") and b'"title":"native"' in body, f"{st} {body!r}")
+st, _, body = get("/nping-option")
+check("option-selected syntax", st.endswith("200 OK") and body == b"option-native\n", f"{st} {body!r}")
 
 # Multipart: two parts, one with a filename, parsed by the native backend.
 boundary = "X-BOUNDARY"

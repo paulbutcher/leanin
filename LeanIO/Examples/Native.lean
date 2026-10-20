@@ -101,6 +101,17 @@ def ntodo : LeanIO.Backend.LeanIn.NativeRoute :=
   native POST "/ntodos" (t : LeanIO.Json Todo) => do
     LeanIO.Backend.LeanIn.AppM.respond 200 "OK" (Lean.toJson t.body).compress.toUTF8
 
+section
+set_option leanio.backend.native true
+
+/-- The same route syntax with no backend prefix: `set_option leanio.backend.native true` selects the native
+backend for this scope. -/
+def npingOption : LeanIO.Backend.LeanIn.NativeRoute :=
+  GET "/nping-option" => do
+    LeanIO.Backend.LeanIn.AppM.respond 200 "OK" "option-native\n".toUTF8
+
+end
+
 /-- A multipart upload: each part's name, filename and body length. -/
 def upload : Handler :=
   LeanIO.Backend.LeanIn.withMultipart fun parts _req w => do
@@ -163,6 +174,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.route .post "/upload-stream" uploadStream
     |>.route .post "/upload-save" uploadSave
     |>.add nping
+    |>.add npingOption
     |>.add ntodo
     |>.route .get "/boom" (boom clock)
     |>.route .get "/logged" (LeanIO.Backend.LeanIn.requestLogger "req" ping)
