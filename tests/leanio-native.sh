@@ -69,8 +69,10 @@ def get(path):
 
 # Routing, middleware, path parameters.
 st, head, body = get("/user/42")
-check("path param", st.endswith("200 OK") and body == b"id=42\n", f"{st} {body!r}")
+check("path param", st.endswith("200 OK") and body == b"id=42 name=\n", f"{st} {body!r}")
 check("middleware", b"X-Tag: users" in head, head.decode(errors="replace"))
+st, _, body = get("/user/7?name=bob")
+check("query param", st.endswith("200 OK") and body == b"id=7 name=bob\n", f"{st} {body!r}")
 
 # A suspended handler must not block a sibling.
 t0 = time.time()

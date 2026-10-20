@@ -98,6 +98,16 @@ def Request.query? (r : Request) : Option Std.Http.URI.Query :=
     | .success _ query => some query
     | .error _ _ => none
 
+/-- A query parameter by name, decoded; `none` when absent, undecodable, or the query is malformed. -/
+def Request.queryParam? (r : Request) (name : String) : Option String :=
+  match r.query? with
+  | none => none
+  | some q =>
+    let pairs : Array (Std.Http.URI.EncodedQueryParam × Option Std.Http.URI.EncodedQueryParam) := q
+    let found : Option (Std.Http.URI.EncodedQueryParam × Option Std.Http.URI.EncodedQueryParam) :=
+      pairs.find? (fun p => p.1.decode == some name)
+    found.bind (fun p => p.2.bind (fun v => v.decode))
+
 /-- A captured path parameter by name. -/
 def Request.pathParam? (r : Request) (name : String) : Option String :=
   r.params.find? (·.1 == name) |>.map (·.2)
@@ -166,6 +176,28 @@ def formBody (α : Type) [LeanIO.FromForm α] [LeanIO.MimeType.HasMimeTypes (Lea
 def response (status : Nat) (reason : String) (body : ByteArray)
     (headers : Array (String × String) := #[]) : H1.ResponseHead × ByteArray :=
   ({ status, reason, headers := headers.push ("Content-Length", toString body.size) }, body)
+
+/-- The reason phrase the backend uses for its own statuses. -/
+def reasonFor : Nat → String
+  | 400 => "Bad Request"
+  | 401 => "Unauthorized"
+  | 403 => "Forbidden"
+  | 404 => "Not Found"
+  | 405 => "Method Not Allowed"
+  | 413 => "Payload Too Large"
+  | 415 => "Unsupported Media Type"
+  | 422 => "Unprocessable Entity"
+  | 431 => "Request Header Fields Too Large"
+  | 501 => "Not Implemented"
+  | _   => "Internal Server Error"
+
+/-- Compose an extractor with a handler: an extraction failure becomes the response, so applications compose
+`withExtract (jsonBody T) fun t => …` the way the stock extractor classes compose. -/
+def withExtract (extract : Request → Except (Nat × String) α) (f : α → Handler) : Handler :=
+  fun req =>
+    match extract req with
+    | .ok a => f a req
+    | .error (status, msg) => pure (response status (reasonFor status) msg.toUTF8)
 
 /-- Dispatch a parsed head through the trie.
 

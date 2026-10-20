@@ -47,23 +47,20 @@ def reasonFor : Nat → String
 
 /-- JSON extraction: 415 for the wrong media type, 400 for malformed JSON, 422 when it does not fit. -/
 def postTodo : Handler :=
-  fun req =>
-    match (LeanIO.Backend.LeanIn.jsonBody Todo req : Except (Nat × String) Todo) with
-    | .ok todo => pure (LeanIO.Backend.LeanIn.response 200 "OK" (Lean.toJson todo).compress.toUTF8)
-    | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
+  LeanIO.Backend.LeanIn.withExtract (LeanIO.Backend.LeanIn.jsonBody Todo) fun todo _req =>
+    pure (LeanIO.Backend.LeanIn.response 200 "OK" (Lean.toJson todo).compress.toUTF8)
 
 /-- Plain-text extraction with the same media-type contract. -/
 def postText : Handler :=
-  fun req =>
-    match LeanIO.Backend.LeanIn.textBody req with
-    | .ok text => pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"text: {text}\n".toUTF8)
-    | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
+  LeanIO.Backend.LeanIn.withExtract LeanIO.Backend.LeanIn.textBody fun text _req =>
+    pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"text: {text}\n".toUTF8)
 
 /-- Path parameters captured by the trie (`/user/{id}`), plus a query parameter. -/
 def userById : Handler :=
   fun req =>
     let id := (req.pathParam? "id").getD ""
-    pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"id={id}\n".toUTF8)
+    let name := (req.queryParam? "name").getD ""
+    pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"id={id} name={name}\n".toUTF8)
 
 /-- Middleware demonstration: adds a header to every response it wraps. -/
 def tag (value : String) : LeanIO.Backend.LeanIn.Middleware :=
