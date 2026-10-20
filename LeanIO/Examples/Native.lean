@@ -204,6 +204,14 @@ def rangeDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/range" (hr : LeanIO.HeaderRange) =>
     (Std.Http.Status.ok, s!"ranges={hr.ranges.isSome}\n")
 
+/-- A file response, streamed with an ETag. -/
+def fileDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/file" => ({ path := "/tmp/leanio-native-file.txt" : LeanIO.File })
+
+/-- A browser-cached JSON response. -/
+def cachedDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/cached" => LeanIO.BrowserCached.new ({ title := "cached" : Todo })
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -287,6 +295,8 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinJson
     |>.add methodDemo
     |>.route .get "/line" lineDemo
+    |>.add fileDemo
+    |>.add cachedDemo
     |>.add rangeDemo
     |>.route .get "/cleanup" cleanupDemo
     |>.route .get "/child" childDemo

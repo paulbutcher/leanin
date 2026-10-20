@@ -176,6 +176,27 @@ check("child ran", child_seen, f"{st} {body!r}")
 st, _, body = request(b"GET /range HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n")
 check("range extractor", st.endswith("200 OK") and body == b"ranges=true\n", f"{st} {body!r}")
 
+# File response with ETag/304.
+open("/tmp/leanio-native-file.txt", "wb").write(b"file-body\n")
+st, head, body = get("/file")
+etag = b""
+for line in head.split(b"\r\n"):
+    if line.lower().startswith(b"etag:"):
+        etag = line.split(b":",1)[1].strip()
+check("file response", st.endswith("200 OK") and body == b"file-body\n" and etag != b"", f"{st} {body!r} {head!r}")
+st, _, body = request(b"GET /file HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + etag + b"\r\n\r\n")
+check("file not modified", st.endswith("304 Not Modified") and body == b"", f"{st} {body!r}")
+
+# Browser-cached response: ETag then 304.
+st, head, body = get("/cached")
+etag = b""
+for line in head.split(b"\r\n"):
+    if line.lower().startswith(b"etag:"):
+        etag = line.split(b":",1)[1].strip()
+check("cached response", st.endswith("200 OK") and b'"title":"cached"' in body and etag != b"", f"{st} {body!r} {head!r}")
+st, _, body = request(b"GET /cached HTTP/1.1\r\nHost: x\r\nIf-None-Match: " + etag + b"\r\n\r\n")
+check("cached not modified", st.endswith("304 Not Modified") and body == b"", f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

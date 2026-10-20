@@ -7,9 +7,14 @@ public import LeanIO.Router.RouteTrie
 public import Std.Http.Data.Method
 public import Lean
 public import LeanIO.Data.Headers.MimeType
+public import LeanIO.Response.BrowserCached
 public import LeanIO.Request.FromRequestBody
 public import LeanIO.Request.FromRequestParts
 public import LeanIO.Request.HeaderRange
+public import LeanIO.Response.File.File
+public import LeanIO.Response.File.Utils
+public import LeanIO.Data.Headers.MimeType
+public import LeanIO.Response.BrowserCached
 public import LeanIO.Request.MultiPartForm.Api
 public import LeanIO.Request.Form
 
@@ -510,53 +515,99 @@ instance : FromRequestPartsM Std.Http.URI.Query where
 /-- A response value in the native backend, mirroring `LeanIO.IntoResponse`: the value a route body returns
 rather than writing the writer by hand. -/
 class IntoResponseM (α : Type) where
-  write : α → AppM Unit
+  write : Env → α → AppM Unit
 
 /-- Run a route body and write whatever response value it returned. -/
-def runResponse {α : Type} [IntoResponseM α] (m : AppM α) : AppM Unit := do
-  IntoResponseM.write (← m)
+def runResponse {α : Type} [IntoResponseM α] (m : AppM α) : AppM Unit := fun env => do
+  (IntoResponseM.write env (← m env)) env
 
 instance : IntoResponseM Unit where
-  write _ := pure ()
+  write _ _ := pure ()
 
 instance : IntoResponseM String where
-  write text :=
+  write _ text :=
     AppM.respond 200 "OK" text.toUTF8 #[("Content-Type", "text/plain; charset=utf-8")]
 
 instance : IntoResponseM ByteArray where
-  write bytes :=
+  write _ bytes :=
     AppM.respond 200 "OK" bytes #[("Content-Type", "application/octet-stream")]
 
 instance : IntoResponseM IO.Error where
-  write e := AppM.respond 500 "Internal Server Error" (toString e).toUTF8
+  write _ e := AppM.respond 500 "Internal Server Error" (toString e).toUTF8
 
 instance : IntoResponseM Std.Http.Status where
-  write status :=
+  write _ status :=
     AppM.respond status.toCode.toNat (status.reasonPhrase) .empty
 
 instance : IntoResponseM (Std.Http.Status × String) where
-  write p :=
+  write _ p :=
     let (status, text) := p
     AppM.respond status.toCode.toNat status.reasonPhrase text.toUTF8
       #[("Content-Type", "text/plain; charset=utf-8")]
 
 instance [Lean.ToJson α] : IntoResponseM (Std.Http.Status × α) where
-  write p :=
+  write _ p :=
     let (status, value) := p
     AppM.respond status.toCode.toNat status.reasonPhrase
       (Lean.toJson value).compress.toUTF8 #[("Content-Type", "application/json")]
 
 instance [IntoResponseM ε] [IntoResponseM α] : IntoResponseM (Except ε α) where
-  write
-    | .ok a => IntoResponseM.write a
-    | .error e => IntoResponseM.write e
+  write env
+    | .ok a => IntoResponseM.write env a
+    | .error e => IntoResponseM.write env e
 
 instance : IntoResponseM (H1.ResponseHead × ByteArray) where
-  write p := fun env => do
+  write env p := do
     let (head, body) := p
     env.writer.start head
     env.writer.write body
     env.writer.finish
+
+/-- Stream a file handle to the response writer. -/
+partial def streamFileHandle (h : IO.FS.Handle)
+    (w : LeanIn.Examples.Http.Server.ResponseWriter) : LeanIn.Runtime.VM Unit := do
+  let bytes ← (monadLift (h.read (USize.ofNat 65536) : IO ByteArray))
+  if bytes.isEmpty then w.finish
+  else
+    w.write bytes
+    streamFileHandle h w
+
+/-- A file on disk, streamed with `Content-Length` and an ETag; an `If-None-Match` hit answers 304. -/
+instance : IntoResponseM LeanIO.File where
+  write env f := do
+    let p := f.path
+    let fileExists ← (monadLift (p.pathExists : IO Bool))
+    let directory ← (monadLift (p.isDir : IO Bool))
+    if !fileExists || directory then
+      (AppM.respond 404 "Not Found" .empty) env
+    else
+      let md ← (monadLift (p.metadata : IO IO.FS.Metadata))
+      let size := md.byteSize.toNat
+      let etag := LeanIO.computeETag md
+      if env.req.header? "if-none-match" == some (toString etag) then
+        (AppM.respond 304 "Not Modified" .empty #[("ETag", toString etag)]) env
+      else do
+        let handle ← (monadLift (IO.FS.Handle.mk p .read : IO IO.FS.Handle))
+        let head : H1.ResponseHead :=
+          { status := 200
+            reason := "OK"
+            headers := #[("Content-Length", toString size),
+                         ("Content-Type", toString (LeanIO.MimeType.mimeType p)),
+                         ("ETag", toString etag)] }
+        env.writer.start head
+        streamFileHandle handle env.writer
+
+/-- A JSON response with an ETag and cache-control, answering 304 on `If-None-Match`. -/
+instance [Lean.ToJson α] : IntoResponseM (LeanIO.BrowserCached α) where
+  write env cached := do
+    let json := (Lean.toJson cached.value).compress
+    let etag := Std.Http.Header.Value.ofString! s!"\"{json.hash}\""
+    if env.req.header? "if-none-match" == some (toString etag) then
+      (AppM.respond 304 "Not Modified" .empty #[("ETag", toString etag)]) env
+    else
+      (AppM.respond 200 "OK" json.toUTF8
+        #[("Content-Type", "application/json"), ("ETag", toString etag),
+          ("Cache-Control", "private, no-cache")]) env
 
 /-- A route body in the native backend: either a response value or an `AppM` computation. This is what lets
 the unprefixed route syntax keep LeanIO's `=> "text"` and `=> do …` forms. -/
@@ -564,7 +615,7 @@ class RunBody (F : Type) where
   runBody : F → AppM Unit
 
 instance [IntoResponseM R] : RunBody R where
-  runBody r := IntoResponseM.write r
+  runBody r := fun env => (IntoResponseM.write env r) env
 
 instance [IntoResponseM R] : RunBody (AppM R) where
   runBody m := runResponse m
