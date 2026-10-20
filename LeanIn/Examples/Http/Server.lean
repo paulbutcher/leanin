@@ -1,11 +1,15 @@
-import Std.Http.Data
-import LeanIn.Examples.Http.H1
-import LeanIn.Runtime.Net
-import LeanIn.Runtime.Clock
-import LeanIn.Runtime.Time
-import LeanIn.Runtime.VM
-import LeanIn.Async
-import LeanIn.Task.Error
+module
+
+public import Std.Http.Data
+public import LeanIn.Examples.Http.H1
+public import LeanIn.Runtime.Net
+public import LeanIn.Runtime.Clock
+public import LeanIn.Runtime.Time
+public import LeanIn.Runtime.VM
+public import LeanIn.Async
+public import LeanIn.Task.Error
+
+public section
 
 /-!
 # The HTTP/1.1 service driver, compiled
@@ -218,3 +222,4 @@ def serveConn (cfg : Config) (c : Conn) (handler : Handler) : Task.EAsync IO.Err
       (fun r ctx' => k r ctx') ctx⟩
 
 end LeanIn.Examples.Http.Server
+end

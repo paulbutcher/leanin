@@ -1,12 +1,16 @@
-import LeanIn
-import LeanIn.Examples.Http.H1
-import LeanIn.Examples.Http.Server
-import LeanIO.Router.RouteTrie
-import Std.Http.Data.Method
-import Lean
-import LeanIO.Data.Headers.MimeType
-import LeanIO.Request.FromRequestBody
-import LeanIO.Request.Form
+module
+
+public import LeanIn
+public import LeanIn.Examples.Http.H1
+public import LeanIn.Examples.Http.Server
+public import LeanIO.Router.RouteTrie
+public import Std.Http.Data.Method
+public import Lean
+public import LeanIO.Data.Headers.MimeType
+public import LeanIO.Request.FromRequestBody
+public import LeanIO.Request.Form
+
+public section
 
 /-!
 # The LeanIn backend
@@ -68,6 +72,10 @@ structure NativeRouter where
 namespace NativeRouter
 
 def empty : NativeRouter := {}
+
+/-- Add a route value, as built by `nativeRoute`. -/
+def add (self : NativeRouter) (r : NativeRoute) : NativeRouter :=
+  { self with routes := self.routes.push r }
 
 /-- Add a route from a pattern string such as `/user/{id}`. -/
 def route (self : NativeRouter) (method : Std.Http.Method) (pattern : String) (handler : Handler) :
@@ -329,3 +337,4 @@ def serve (handler : CoreHandler) (port : UInt16) : IO UInt32 := do
   serveWith hooks handler port
 
 end LeanIO.Backend.LeanIn
+end

@@ -1,3 +1,4 @@
+import LeanIO.Router.Macro
 import LeanIO.Backend.LeanIn
 
 /-!
@@ -90,7 +91,7 @@ def echo : Handler :=
 
 def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :=
   LeanIO.Backend.LeanIn.NativeRouter.empty
-    |>.route .get "/ping" ping
+    |>.add (nativeRoute GET "/ping" ping)
     |>.route .get "/slow" (slow clock)
     |>.route .get "/user/{id}" (tag "users" userById)
     |>.route .post "/echo" echo

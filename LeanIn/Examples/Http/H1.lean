@@ -1,4 +1,8 @@
-import Std
+module
+
+public import Std
+
+public section
 
 /-!
 # `LeanIn.Examples.Http.H1` — a byte-oriented HTTP/1.1 head parser and connection machine
@@ -406,4 +410,8 @@ def noMoreInput (m : Machine) : Machine :=
 
 end Machine
 
-end LeanIn.Examples.Http.H1
+end H1
+end Http
+end Examples
+end LeanIn
+end

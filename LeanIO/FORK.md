@@ -31,22 +31,27 @@ Not yet ported: the route macros and `FromRequestBody`/`FromRequestParts` classe
 `ContextAsync`/`Request Body.Stream`; streaming bodies/backpressure, multipart and the request-cancellation
 scope are later stages. The fork builds and its own tests run under `lake build LeanIO`.
 
-### The authoring seam is blocked by the module-system boundary
+### The authoring seam
 
-`LeanIO/Router/Macro.lean` is a `module` file, and a `module` file cannot import a non-`module` one. LeanIn is
-not written in the module system, and neither is `LeanIO/Backend/LeanIn.lean` (it imports LeanIn). A
-backend-parameterised route macro therefore cannot refer to the native backend's types as things stand.
+Route declaration for the native backend is syntax, not only the programmatic API:
 
-Two ways out, to choose deliberately:
+```lean4
+|>.add (nativeRoute GET "/ping" ping)
+```
 
-1. **Convert to the module system** — LeanIn (its whole dependency closure) and the backend, so a `module`
-   macro can import them. Mechanical per file (`module` plus `public import` at re-export points) but it changes
-   re-export behaviour: code that relied on transitive names from a module's imports may need explicit imports.
-2. **An explicit native declaration syntax** in a non-module file (e.g. `LeanIO/NativeSyntax.lean`) with its own
-   keyword, leaving upstream's macros stock-only. Narrow and safe, but the route declaration syntax is not shared.
+`nativeRoute` is declared in `LeanIO/Router/Macro.lean`, beside the method keywords and pattern validation it
+reuses, and expands to a `NativeRoute` with the backend's `Request → VM (ResponseHead × ByteArray)` handler.
+`NativeRouter.add` consumes it.
 
-Until that decision is taken, native route declaration is programmatic (`NativeRouter.route`) and
-`NativeRouter.routeWith` with the helpers in `LeanIO.Backend.LeanIn`.
+This needed the module-system conversion of LeanIn, `LeanIn/Examples/Http` and the backend: `module` files
+cannot import non-module ones, so the backend could not be named from the macro before. With those converted,
+the macro names the backend's types directly. The backend's public signatures (`Handler`, `Request.head`) are
+what force its `public import` of the HTTP modules, and the compiler reports any import that is too private.
+
+Still programmatic or stock-only: the upstream `GET … => …` syntax keeps its `ContextAsync` handler and does not
+select a backend; `FromRequestBody`/`FromRequestParts` remain typed at `Request Body.Stream`. Streaming bodies
+and backpressure, multipart, request cancellation, and chunked / `Expect` framing are later stages of the
+porting handoff.
 
 ## Working rules
 
