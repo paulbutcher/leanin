@@ -18,14 +18,20 @@ public section
 # The LeanIn backend
 
 Routes stored over a LeanIn handler value (`RouteTrie Handler`) and dispatched on a LeanIn connection. A
-handler sees a `Request`: the parsed head, the buffered body, and the path parameters the trie captured when
-the route has parameters. Middleware is a handler transformer, composed before insertion, as in the upstream
-trie.
+handler sees a `Request`: the parsed head, the streaming body reader, and the path parameters the trie captured
+when the route has parameters. Middleware is a handler transformer, composed before insertion, as in the
+upstream trie.
 
 The application-facing effect signature and the reasoning obligations are
-`docs/notes/LeanIO_to_LeanIn_Effect_Signature.md`. Bodies are buffered (bounded by `H1.Limits.maxBody`);
-streaming, multipart and the request scope are later stages of
-`docs/notes/LeanIO_to_LeanIn_Porting_Handoff.md`.
+`docs/notes/LeanIO_to_LeanIn_Effect_Signature.md`. The streaming body reader and response writer are
+implemented. A buffered extractor accumulates the whole body through `readAll`, and on this streaming path that
+accumulation is **not bounded by `H1.Limits.maxBody`**: `readAll` keeps appending as bytes arrive, so it may grow
+with the input. The `maxBody` bound belongs to the separate buffered driver, which rejects an oversize
+`Content-Length` body with 413 before dispatch. A request's own transport failure is the **peer-I/O request
+scope**: a failed read, a stall, a peer close mid-body or a failed response send is a typed VM abort that the
+streaming driver's scope turns into a closed connection, never a catchable error (`docs/decisions.md` D23).
+Still later stages of `docs/notes/LeanIO_to_LeanIn_Porting_Handoff.md`: child/task cancellation, shutdown/drain
+and scope-exit cleanup.
 -/
 
 namespace LeanIO.Backend.LeanIn
@@ -455,19 +461,22 @@ instance : NativeExtractor (AppM Unit) where
   extract f req w := f { req, writer := w }
 
 /-- Error scope as a handler: `VM.attempt` carries the catch through every suspension, so a handler that
-parks and then raises is caught here exactly as one that raises at once. The failure becomes a 500 rather than
-escaping the connection. -/
+parks and then raises is caught here exactly as one that raises at once. The failure becomes a 500 carrying the
+error's `toString`, rather than escaping the connection.
+
+A transport failure never arrives here: inside the streaming request scope the body reader and the response
+writer classify it on the VM's separate abort channel, which `attempt` does not catch, so no further response is
+attempted for a cancelled request instead of a 500. The driver's own raw operations outside that scope are not VM
+effects at all: a failed send or read prompts a close attempt and reports the transport error, while a refused
+close is reported as its own error and does not establish that the connection closed. Only an
+ordinary raise — including one whose message happens to begin `Http:` — is this middleware's. -/
 def catchErrors : Middleware :=
   fun handler req w => do
     match ← LeanIn.Runtime.VM.attempt (handler req w) with
     | .ok _ => pure ()
     | .error e =>
-      -- A transport failure is the request's cancellation, not an application error: it must not be turned
-      -- into a response the peer can no longer receive.
-      if (toString e).startsWith "Http:" then throw e
-      else
-        monadLift (IO.eprintln s!"leanio: 500: {e}")
-        respond w 500 "Internal Server Error" (toString e).toUTF8
+      monadLift (IO.eprintln s!"leanio: 500: {e}")
+      respond w 500 "Internal Server Error" (toString e).toUTF8
 
 /-- Observing middleware: logs method, path and status through `IO` lifted into the machine, then returns the
 response unchanged. -/

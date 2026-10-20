@@ -85,3 +85,11 @@ lean_exe streamEcho where
 lean_exe leanioNative where
   root := `LeanIO.Examples.Native
   moreLinkArgs := netuvLinkArgs
+
+/-- The cancellation contract's service: seven test-only routes over the production native router with its
+`catchErrors` middleware — `/ping`, `/boom`, `POST /cancel-probe`, `/prefixed-error`, `/error-text`, `/ready`
+and `/release` — so a client can observe at a local loopback socket what a half-closed request body produces
+and what a parked handler's ordinary error returns. -/
+lean_exe leanioCancelContract where
+  root := `LeanIn.Test.HttpCancelContract
+  moreLinkArgs := netuvLinkArgs

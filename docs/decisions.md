@@ -4,7 +4,7 @@ Settled decisions and the evidence each rests on. Evidence anchors are in
 [`lean-scheduler.md`](lean-scheduler.md) (the current runtime), [`tokio-map.md`](tokio-map.md) (what
 we are taking), [`evidence.md`](evidence.md) (the claim-to-source register) and
 [`PERFORMANCE.md`](PERFORMANCE.md) (the measured rows the cost records cite). No decision is open: each
-entry states its own limits, and the ones D20, D21 and D22 leave are named in them.
+entry states its own limits, and the ones D20, D21, D22 and D23 leave are named in them.
 
 ______________________________________________________________________
 
@@ -465,6 +465,10 @@ asymmetry is a pre-existing fact of `Task.Cancel` (`LeanIn/Task/Basic.lean:42-`)
 second carrier is where it becomes a race — so the new code inherits that comment rather than adding a new
 instance. Until W8, no sync primitive may be read as cross-carrier-safe.
 
+The request cancellation the HTTP driver now has (D23) is **not** `Task.Cancel`: it is a typed abort raised by
+the operation that observed the peer's failure, in the step that observed it, and it neither reads nor writes
+this token, so nothing here changes and the register stays as it is.
+
 ______________________________________________________________________
 
 ### D15 — The service's obligations are proved over the model; their refinement to the executor is argued, with an executable correspondence test.
@@ -522,7 +526,8 @@ and each model operation with its executor counterpart: `Service.accept` with th
    *reduces* admissions — a leaked permit can never push `live` past the bound, so `Service.Bounded` still holds
    and obligation 2 is **not weakened**; what is lost is the **liveness** of admission, since a service that
    cancels many bodies can slowly stop admitting. It follows from the cancellation gate, not from a defect in
-   `serveBounded`. SC14 exercises no cancellation.
+   `serveBounded`. SC14 exercises no cancellation. D23's request abort is a different mechanism — a machine
+   value raised in the step that observed the peer's failure — and it does not reach this gate.
 
 **What it does not claim.** Not that the executor is a refinement of the model (argued, not proved); not the
 liveness half of "within its deadline" — that a pending request *eventually* reaches its deadline is P9-class and
@@ -1014,10 +1019,18 @@ reason or narrowed the same way.
 `let _ ← Async.await h`), and the shipped `onFailure` notification has no carrier in a plain-function handler, so
 re-raising would cost the loop a failure channel nothing reads; the response the peer gets is the observable.
 
+**A transport failure is not a handler failure.** The streaming body reader and response writer classify a
+failed read, a stall, a truncated or closed body, and a send that cannot reach the peer on a separate VM abort
+channel (D23): it passes `VM.attempt` and every middleware, so no further response is attempted — the driver
+closes the connection and reports it as a transport error, and bytes already sent are not retracted.
+`catchErrors` classifies no error by its message text; an ordinary error whose text begins `Http:` is answered
+with the usual 500 and its `toString` body.
+
 **What remains open, and its limits.** (i) A peer that sends one byte before each deadline keeps a connection
 alive indefinitely: the total time to a complete head is unbounded. (ii) The bound is on reads, not on a handler
 or on `accept`: a handler that never returns is unbounded — cancellation is W5's and W7's item — and the accept
-leaf belongs to the accept loop. (iii) `withTimeout` does not cancel its loser, and it leaves a relic on
+leaf belongs to the accept loop. D23's abort covers only the peer's own I/O failure, not an arbitrary parked
+handler. (iii) `withTimeout` does not cancel its loser, and it leaves a relic on
 **either** side. When the read wins, the timer stays pending until it fires with nobody waiting: one timer
 registration per read that won, which the SC20 records read as `pendingHooks` 3 in the keep-alive clause (its two
 request reads and the end-of-stream read), 1 in the failure clause (its single request read), and 0 in the
@@ -1032,7 +1045,10 @@ arm; and `pendingAfter == 0` is asserted only where the timer itself resolved th
 W5's and W7's subject and is not done here: it would change the timer machinery rather than the driver.
 (iv) A failed *socket* operation still ends the connection past
 `Conn.shutdown`; the handler-failure path no longer reaches that short-circuit, because the failure is answered
-inside the loop.
+inside the loop. On the streaming path a failed send is now an abort (D23) too, and it closes the connection the
+same way — the difference is that no 500 is attempted first, because the transport cannot be relied on to carry
+it — while bytes already written (a started head, earlier chunks, or the prefix the failed send delivered) stand
+and are not retracted.
 
 **Evidence.** SC20 (`nix develop -c bash tests/executor-contract.sh SC20`): the stalled peer's clause asserts the
 harness clock's own stated instant (`at == stall` with `stall = 30`, `clientGot` empty and `bounded == no`), and
@@ -1183,9 +1199,52 @@ parking/non-parking split is untouched) and their callers state the route.
 
 ______________________________________________________________________
 
+### D23 — A request's transport cancellation is a typed VM abort, not a catchable error and not `Task.Cancel`.
+
+**What it is.** The streaming HTTP driver gives a request its own cancellation channel in
+[`LeanIn/Runtime/VM.lean`](../LeanIn/Runtime/VM.lean). `abortE` raises an abort, `tryAbortE` is the only thing
+that catches one, `Outcome` tags how a scoped machine ended, and `VM.requestScope` runs a handler machine to
+exactly one of value, ordinary error or transport abort. `VM.abortOnFailure` wraps **one** raw completion so that
+that completion's own failure — a read error, a stalled or truncated read, a send that cannot reach the peer —
+is delivered to the abort channel. Because the classification lives in the leaf, a `do` block's later steps keep
+the ordinary error channel: an application `throw` after a successful send is an application error, never an
+abort. That property was the reason for the shape: an earlier encoding, a node whose interpreter converted the
+error channel of an enclosed subtree, also converted every later step of a `bind` and was rejected for it.
+
+**Where the driver puts the scopes.** [`LeanIn/Examples/Http/Server.lean`](../LeanIn/Examples/Http/Server.lean)'s
+`driveStream` wraps the handler in `VM.requestScope` and puts the body reader's five read sites (raw read
+failure, stall, peer close, in fixed-length and chunked framing alike) and the response writer's head, body-chunk
+and terminating-chunk sends on the abort channel. On `.aborted` the driver closes the connection and reports
+`onClose (.error reason)`, attempting no further response — no 500, no keep-alive. It does not claim zero bytes: a
+response head or body written before the failure, or the prefix a failed send delivered, cannot be retracted.
+HC1's zero **post-close** bytes are the pre-response body-read case, where no response byte had been written yet.
+`catchErrors` no longer classifies by message text; it answers ordinary errors, including one whose `toString`
+begins `Http:`, with a 500 whose body is that `toString`.
+
+**Why not `Task.Cancel`.** Its gate is `Item.fire`, which skips a cancelled computation's step (D14, W5), and
+its token is `IO.Ref`-backed with an explicit cross-carrier caveat (D14). Request cancellation here is raised by
+the operation that observed the failure, in the step that observed it, and travels as a machine value: no token,
+no second carrier, no cross-thread flag.
+
+**What it does not claim.** (i) Only the **peer's own I/O** cancels a request. There is no user-triggered
+cancellation of an arbitrary parked handler, no child-request or blocking-job cancellation, and no
+shutdown/drain; P7 stays open in its own right and D20's unbounded-handler limit is unchanged. (ii) The
+**buffered** entrypoint `drive`/`serveConn` gets no scope: it exposes no streaming reader or writer, and an
+explicit `VM.abort` in one of its handlers has no catch — `run`/`runToCell` route an uncaught abort to `throw`,
+loudly, where the machine resumes. (iii) The primitive register and the bridge axioms are unchanged: no new
+extern, `IO.Promise`, atomic, syscall, axiom or theorem, and no new import edge into `Std` (audited by direct
+calls and import edges, not by text search); `docs/primitive-theory.md` §6 records it. (iv) The correspondence
+between "the abort reached the operation" and "the compiled driver's await completed, closed the connection and
+reported a transport error" is **tested, not proved**: HC1 at the public socket
+(`tests/http-cancel-contract.md`), the focused VM controls in `LeanIn/Test/Control.lean`, and the callsite audit
+of `Stream.responseWriter`. It is not a discharge of P7 or P8 ([`proof-strategy.md`](proof-strategy.md) §2, §5).
+
+______________________________________________________________________
+
 ## Open
 
-No decision is open: D19's residual is closed by D22, and D22 is this register's last entry. The limits those
+No decision is open: D19's residual is closed by D22, and D23 is this register's last entry. The limits those
 records leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s uncancelled
-loser on either side, the second measurement condition as D21 reads it, and the harness clock's
-single-advancer convention as D22 reads it — are stated in their own entries rather than here.
+loser on either side, the second measurement condition as D21 reads it, the harness clock's single-advancer
+convention as D22 reads it, and D23's request scope limited to peer I/O on the streaming path — are stated in
+their own entries rather than here.

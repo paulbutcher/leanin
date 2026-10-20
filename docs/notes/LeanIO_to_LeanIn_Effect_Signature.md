@@ -14,9 +14,10 @@ does not implement here.
    | --- | --- | --- |
    | `recv` | receive up to n bytes, EOF, failure | body framing, limits, unread-body drain |
    | `send` | write chunks, flush, close | response framing, backpressure, half-close |
-   | `sleep` | wait until an instant or a deadline | cancellation on disconnect/shutdown |
+   | `sleep` | wait until an instant or a deadline | cancellation on shutdown; today a peer's disconnect cancels a body read or response write, not an unrelated sleep or a child |
    | `spawn` | child computation, scoped | ownership of child failure and of its completion |
    | `throw` | raise, catch | middleware error scope, including across suspensions |
+   | `abort` | transport failure observed by the driver; not catchable by `throw`'s handlers | nothing — a cancelled request is closed, never answered |
    | `io` | blocking filesystem work | which pool carries it |
 
 2. **Handlers are typed transformers of a signature.** Middleware is a handler for a sub-signature:
@@ -47,6 +48,14 @@ does not implement here.
   (`Io.recvRaw`/`recvStallRaw`, `sendRaw`/`sendAllRaw`, `sleepRaw`, spawn, `closeRaw`).
 - The request scope (cancellation, cleanup) is a handler *around* the route computation, so a middleware that
   catches errors cannot accidentally catch a cancellation meant for the scope: they are different abilities.
+  The **native streaming backend now implements the abort half of that**, and only it: `LeanIn.Runtime.VM`'s
+  `abortE`/`tryAbortE`/`Outcome` and the driver's `requestScope` turn a peer's own I/O failure into a tagged
+  outcome; the driver then closes the connection and attempts no further response — bytes already sent stand and
+  are not retracted — while `catchErrors` answers ordinary raises only
+  (D23; HC1 and HC2 in `tests/http-cancel-contract.md`). Still outstanding from this list: user-triggered
+  cancellation of an arbitrary parked handler, child-request and blocking-job cancellation, shutdown/drain, and
+  the cleanup actions a scope would run on exit — none is delivered by that scope, and the buffered entrypoint
+  has no scope at all.
 - Each ability gets a contract test at the boundary: body framing and unread-body drain for `recv`, ordering and
   half-close for `send`, cancellation for `sleep`/spawn, exactly-once cleanup for `throw`/scope exit.
 - The method token is preserved (or refused explicitly) at the `recv`/parse boundary rather than collapsed:

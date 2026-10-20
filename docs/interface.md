@@ -519,6 +519,13 @@ The operation correspondence is argued per operation, the shape of `Impl.push �
 | `Service.complete` | the body's EOF return `.ok` | a connection that returns normally is `completed` |
 | `Service.close` | the body's `.error` (socket failure, a staged failure, EOF before a request) | a connection that terminates without completing is `closed`, and any request it owed is `errored` — `Service.close`'s `pending → errored` |
 
+A streaming connection's transport failure reaches this row by the driver's request scope: a failed body read, a
+stall, a peer close mid-body or a failed response send is a VM abort, the driver's `requestScope` turns it into
+an `aborted` outcome, and the connection closes as `.error` with no further response attempted — bytes already
+sent stand and are not retracted (D23). The model needs no new
+transition — the connection is `closed` and its request, if any, `errored` — and no correspondence claim is added
+for it beyond this row: the scope's effect on the compiled machine is tested (HC1) rather than refined.
+
 This correspondence is **argued, not proved**: the refinement theorem `Impl.op ⊑ Model.op` for the
 service's operations is P8's open gap ([`proof-strategy.md`](proof-strategy.md) §3), and the link
 between the two columns is the serializability argument of

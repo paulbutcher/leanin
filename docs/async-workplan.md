@@ -11,8 +11,9 @@ Three models are visible in the tree, and a user can see the seams:
 - **`EAsync`/`Task`** — the general task runtime (spawn, await, registry, select, sync), on `Join`-cell
   delivery. This is the *semantic reference* and the measured CPS baseline, and what the controls are written
   against. It is not the advertised authoring surface.
-- **`VM`** — the interpreted free machine (`runK`, two-continuation). General — any `IO` via `ioE`, raise/catch
-  that spans suspensions — but interpreted: `bind` rebuilds the tree and the interpreter walks it. This is the
+- **`VM`** — the interpreted free machine (`runK`, three continuations: value, ordinary error, transport abort).
+  General — any `IO` via `ioE`, raise/catch and abort that span suspensions — but interpreted: `bind` rebuilds
+  the tree and the interpreter walks it. This is the
   *escape hatch* for code the compiler cannot express, not the fast path.
 - **`async`** — the compiler: a do-body becomes a per-function state machine resumed by raw delivery.
   Proven on the production HTTP driver (`×1.42–1.57` over the CPS driver, SC19/SC20 byte-identical), but a
@@ -204,4 +205,7 @@ rather than multiplying the silent-wrongness surface.
 
 No green threads, no fairness or priority guarantees beyond the LIFO allowance bound, no indexed
 heterogeneous `VM` (the predicativity wall stands — the compiler sidesteps it by emitting code rather than
-data), no cancellation of a running handler (W5/W7's item, unchanged).
+data), no general cancellation of a running handler (W5/W7's item, unchanged). What the streaming driver does
+have is a request scope over **peer-I/O failure** only: a failed body read, a stall, a peer close mid-body or a
+failed response send aborts the request and closes its connection (D23); a handler parked on anything else is
+still not cancelled.

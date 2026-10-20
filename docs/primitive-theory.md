@@ -183,6 +183,14 @@ ______________________________________________________________________
 - **`IO.Ref`.** Open as O1 in [`decisions.md`](decisions.md); the leaning is to keep it invisible
   behind `Mutex α` so that reasoning outside a lock is unrepresentable.
 - **Fairness and real time.** Not provable from A1–A7 and not claimed. See §3 absences.
+- **The VM's abort channel.** Not a primitive and not a proof obligation. `abortE`/`tryAbortE`/`Outcome` are
+  Lean constructors, and the transport wrapper reaches only socket effects the driver already had
+  (`recvTimeoutRaw`, `sendRaw`, `sendAllRaw`), so nothing is added to the register. What it does add is a
+  **semantic trust**: that
+  an abort raised at a transport operation is preserved through the interpreter's continuations, through `bind`,
+  `tryE`/`attempt` and the compiled driver's await, so the connection closes as a transport error rather than
+  being answered. That uniformity is a tested correspondence — HC1 at the public socket and the focused
+  `vmabort` controls — argued in [`proof-strategy.md`](proof-strategy.md) §2 (D23), not proved.
 - **The compiler and FFI.** Lean's code generator, the C++ compiler, and the ABI are trusted and
   unmodelled. They are part of the TCB and belong in the same table as the axioms, not in a footnote.
 

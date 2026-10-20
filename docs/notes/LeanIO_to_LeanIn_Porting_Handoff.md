@@ -156,15 +156,29 @@ Track unsupported features explicitly. Unknown-length response streams need suit
 
 `ContextAsync` provides a cancellation context over stock `Async`. Map its required semantics to an explicit LeanIn request scope rather than dropping the context parameter.
 
+**What the native streaming path now does, and what it does not.** A request's *peer-I/O* cancellation is
+implemented: `LeanIn.Runtime.VM` raises a typed abort (`abortE`, with `tryAbortE`/`Outcome`/`requestScope` as its
+only handler), and the streaming driver puts a failed body read, a stall, a peer close mid-body and a failed
+response send on that channel; the driver closes the connection and reports the transport error, attempting no
+further response — bytes already sent stand and are not retracted, since a failed send does not establish that
+none arrived (`tests/http-cancel-contract.md` HC1, whose zero **post-close** bytes are the pre-response
+body-read case; `docs/decisions.md` D23). It is *not* a context parameter and not
+`Task.Cancel`. **Outstanding:** cancellation of an arbitrary parked handler by its own request scope, child
+authentication/backend requests, blocking-job cancellation, shutdown/drain, and scope-exit cleanup — and the
+buffered entrypoint (`drive`/`serveConn`) has no scope, so an explicit `VM.abort` in one of its handlers fails
+loudly rather than closing.
+
 On client disconnect, cancellation, or shutdown, specify what happens to:
 
-- A handler parked on a body read.
-- A producer parked on a full/unconsumed response stream.
-- Multipart parser state and file handles.
-- Child authentication/backend requests.
-- Queued writes and late completions.
+- A handler parked on a body read. *(A peer close, stall or read failure aborts it: the handler cannot catch the
+  abort, the connection closes, and a later connection is served normally — HC1.)*
+- A producer parked on a full/unconsumed response stream. *(Not implemented: a failed send aborts, but
+  backpressure and a producer parked behind a slow peer are still outstanding.)*
+- Multipart parser state and file handles. *(Outstanding.)*
+- Child authentication/backend requests. *(Outstanding: no child cancellation.)*
+- Queued writes and late completions. *(Outstanding; `withTimeout` still does not cancel its loser.)*
 
-Every terminating handler/producer must have an observable outcome. Do not inherit the current compiled-machine possibility of ending a path without resolving its completion handle.
+Every terminating handler/producer must have an observable outcome. Do not inherit the current compiled-machine possibility of ending a path without resolving its completion handle. *(For a cancelled streaming request that is now the case: the request scope resolves the driver's await with an `aborted` outcome, the driver closes the connection and reports the transport error, so nothing stays parked — HC1 observes the connection complete and the service answering again. Buffered handlers and producers are unchanged.)*
 
 Verify middleware error scopes and cleanup across suspension. Test failure before and after a genuine park, exceptions from lifted IO, response-conversion failure, and downstream failure outside a catch scope. A similarly named `MonadExcept` or `MonadFinally` instance is not evidence of equivalent behaviour.
 

@@ -57,6 +57,22 @@
   substituting a documented scenario ID as needed. The shell
   invokes the public `controls` executable; `tests/ModelOracle.lean`
   independently computes the pure-model side. No new framework.
+- The HTTP cancellation contract is `tests/http-cancel-contract.md`
+  with `tests/http-cancel-contract.sh`, driven at the public loopback
+  socket of the `leanioCancelContract` service: run
+  `nix develop -c bash tests/http-cancel-contract.sh HC1` (also `HC2`).
+  The service is the fixture's own executable and the host is
+  `127.0.0.1` (`CANCEL_CONTRACT_PORT`, default 8791) — no external
+  service is reached, no `Conn` is forged, and no clock is asserted:
+  HC2's `/ready`/`/release` handshake is a synchronized fake completion
+  and bounded waits only bound a wait. HC1's `/boom` and its following
+  `/ping` are the status-line detector's affirmative control and the
+  recovery control in the same invocation; HC2 binds its expected body to
+  an independently served `/error-text` value. Exit 2 is a setup failure
+  (build, startup, readiness, the interim `100`, a control, or a truncated
+  read); exit 1 is the scenario's own assertion. Both come out green on the
+  tree that carries the abort channel, and `nix develop -c bash tests/http-stream.sh`
+  plus `nix develop -c bash tests/leanio-native.sh` stay the HTTP regressions.
 - In each scenario name the actor, an external boundary and the
   observable outcome. Stage data and record actual actions where
   they happen; bind compared values to their record's named fields,

@@ -1,6 +1,7 @@
 import Std
 import Std.Http
 import LeanIn.Sched.Basic
+import LeanIO.Backend.LeanIn
 import LeanIn.Sched.Executor
 import LeanIn.Runtime.Basic
 import LeanIn.Examples.Http.Server
@@ -5090,6 +5091,169 @@ def runtimeCarriers (p bound : Nat) : IO UInt32 := do
   (← IO.getStdout).flush
   return 0
 
+/-- Run `m` under the request scope and report how it ended. The machine's effects are its own leaves, so this
+touches no socket, clock or external service. -/
+def settleOutcome (m : LeanIn.Runtime.VM α) : IO (LeanIn.Runtime.Outcome α) := do
+  let cell ← IO.mkRef (none : Option (LeanIn.Runtime.Outcome α))
+  LeanIn.Runtime.VM.runAsync (LeanIn.Runtime.VM.requestScope m) (fun o => cell.set (some o))
+  match ← cell.get with
+  | some o => return o
+  | none => throw (IO.userError "vm abort control: the scoped machine never resolved its raw cell")
+
+/-- An outcome's tag and reason, for a control's assertion to name what it saw. -/
+def outcomeText {α : Type} : LeanIn.Runtime.Outcome α → String
+  | .ok _ => "ok"
+  | .error e => "error " ++ toString e
+  | .aborted r => "aborted " ++ toString r
+
+/-- **The VM abort controls.** An abort is not a raise: it passes `tryE` and `attempt` wherever it happens, only
+`tryAbort` handles it, and the transport wrapper classifies only the operation it wraps — a client's later
+`throwE` stays ordinary. These fail this executable if any clause does not hold.
+
+The last clause is the response writer's relation (`C3`): the writer's own transport wrapper, applied to a
+scripted leaf in place of a socket send, must reach the request scope as an abort with the middleware's 500 path
+never running — while the same detector, given an ordinary `Http:`-prefixed route error, must see that 500. The
+fake alone does not prove the production relation; the callsite audit of `Stream.responseWriter` accompanies it. -/
+def controlVMAbort : IO Unit := do
+  let sentinel := IO.userError "vm abort control: transport sentinel"
+  let abortedWant := "aborted " ++ toString sentinel
+  let errorWant := "error " ++ toString sentinel
+  let expect {α : Type} (label : String) (want : String) (m : LeanIn.Runtime.VM α) : IO Unit := do
+    let got := outcomeText (← settleOutcome m)
+    unless got == want do
+      throw (IO.userError s!"vm abort control: {label}: expected {want}, got {got}")
+  -- Where the abort is raised, and what catches it.
+  expect "a direct abort under the request scope" abortedWant (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit)
+  expect "an abort behind VM.attempt" abortedWant
+    (LeanIn.Runtime.VM.attempt (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit))
+  expect "an abort behind tryE" abortedWant
+    (LeanIn.Runtime.VM.tryE (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit) fun _ => return ())
+  -- The transport wrapper: its own failure aborts, and the classification stops at the operation.
+  expect "a transport failure under the request scope" abortedWant
+    (LeanIn.Runtime.VM.abortOnFailure (fun (_ : Unit → IO Unit) (fail : IO.Error → IO Unit) => fail sentinel))
+  expect "a transport failure behind VM.attempt" abortedWant
+    (LeanIn.Runtime.VM.attempt (LeanIn.Runtime.VM.abortOnFailure (fun (_ : Unit → IO Unit) (fail : IO.Error → IO Unit) => fail sentinel)))
+  expect "an ordinary throw after a successful wrapped leaf" errorWant
+    (do discard (LeanIn.Runtime.VM.abortOnFailure fun kok _ => kok ())
+        throw sentinel : LeanIn.Runtime.VM Unit)
+  expect "an abort after a successful wrapped leaf" abortedWant
+    (do discard (LeanIn.Runtime.VM.abortOnFailure fun kok _ => kok ())
+        LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit)
+  -- The lifted leaf: its own failure is ordinary, and it carries the abort channel for what follows.
+  expect "a lifted IO failure" errorWant
+    (monadLift (throw sentinel : IO Unit) : LeanIn.Runtime.VM Unit)
+  -- An unscoped abort has no value to resolve, so the runner fails loudly rather than closing quietly.
+  let uncaught (label : String) (act : IO Unit) : IO Unit := do
+    let caught ← IO.mkRef (none : Option String)
+    try act catch e => caught.set (some (toString e))
+    match ← caught.get with
+    | none => throw (IO.userError s!"vm abort control: {label}: the abort was swallowed")
+    | some m =>
+      unless m == toString sentinel do
+        throw (IO.userError s!"vm abort control: {label}: raised {m}, expected {toString sentinel}")
+  uncaught "VM.run" (LeanIn.Runtime.VM.run (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit))
+  let cell : LeanIn.Runtime.RawCell Unit ← LeanIn.Runtime.RawCell.new
+  uncaught "VM.runToCell" (LeanIn.Runtime.VM.runToCell (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit) cell)
+  -- A scoped machine completes both runners: the scope consumes the abort, so nothing reaches the top-level throw
+  -- and the raw cell is resolved with the tagged outcome.
+  let runFailure ← IO.mkRef (none : Option String)
+  try
+    LeanIn.Runtime.VM.run (do
+      discard (LeanIn.Runtime.VM.requestScope (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit))
+      pure ())
+  catch e => runFailure.set (some (toString e))
+  match ← runFailure.get with
+  | none => pure ()
+  | some m => throw (IO.userError s!"vm abort control: a scoped VM.run raised {m}")
+  let cellOutcome ← IO.mkRef (none : Option String)
+  let scopedCell : LeanIn.Runtime.RawCell (LeanIn.Runtime.Outcome Unit) ← LeanIn.Runtime.RawCell.new
+  LeanIn.Runtime.VM.runToCell
+    (LeanIn.Runtime.VM.requestScope (LeanIn.Runtime.VM.abort sentinel : LeanIn.Runtime.VM Unit)) scopedCell
+  LeanIn.Runtime.RawCell.await scopedCell (fun o => cellOutcome.set (some (outcomeText o)))
+  match ← cellOutcome.get with
+  | none => throw (IO.userError "vm abort control: a scoped VM.runToCell left its cell unresolved")
+  | some got =>
+    unless got == abortedWant do
+      throw (IO.userError s!"vm abort control: a scoped VM.runToCell resolved {got}, expected {abortedWant}")
+  -- ==== C3: the streaming response writer's transport classification ====
+  let head ← (match LeanIn.Examples.Http.H1.parseHead
+      "GET /probe HTTP/1.1\r\nHost: x\r\n\r\n".toUTF8 0 {} with
+    | .ok h _ => pure h
+    | _ => throw (IO.userError "vm abort control: could not parse the probe request head"))
+  let req : LeanIO.Backend.LeanIn.Request :=
+    { head
+      body := { recv := fun _ => pure none, drained := pure true, leftover := pure .empty } }
+  let fiveHundreds ← IO.mkRef (0 : Nat)
+  let detectStart : LeanIn.Examples.Http.H1.ResponseHead → LeanIn.Runtime.VM Unit :=
+    fun rh => do
+      if rh.status == 500 then
+        (monadLift (do
+          let n : Nat ← (fiveHundreds.get : IO Nat)
+          (fiveHundreds.set (n + 1) : IO Unit)) : LeanIn.Runtime.VM Unit)
+      else pure ()
+  -- The writer whose `write` is the writer's own wrapper around a scripted completion: no socket, one sentinel.
+  let failingWriter : LeanIn.Examples.Http.Server.ResponseWriter :=
+    { start := detectStart
+      write := fun _ => LeanIn.Runtime.VM.abortOnFailure fun _ fail => fail sentinel
+      finish := pure ()
+      status := pure (true, true, false)
+      code := pure (some 500) }
+  let okWriter : LeanIn.Examples.Http.Server.ResponseWriter :=
+    { start := detectStart
+      write := fun _ => pure ()
+      finish := pure ()
+      status := pure (true, true, false)
+      code := pure (some 500) }
+  let tripWireRoute : LeanIO.Backend.LeanIn.Handler := fun _ w => do
+    w.write "body".toUTF8
+    throw (IO.userError "vm abort control tripwire: a step after the failed write ran")
+  let aborted := outcomeText (← settleOutcome
+    (LeanIO.Backend.LeanIn.catchErrors tripWireRoute req failingWriter))
+  unless aborted == abortedWant do
+    throw (IO.userError s!"vm abort control: a failed response write: expected {abortedWant}, got {aborted}")
+  unless (← fiveHundreds.get) == 0 do
+    throw (IO.userError "vm abort control: the middleware answered a transport failure with a 500")
+  -- The driver's fallback response — a handler that answers nothing — is sent inside the request scope. The
+  -- affirmative clause: with a normal writer the fallback is the 500 the detector sees. The load-bearing clause:
+  -- with a writer whose head send fails the transport's way, that failure is an abort at the scope (what lets the
+  -- driver close and report it), not a raise that escapes to the runner.
+  let fallbackWriter (failStart : Bool) : LeanIn.Examples.Http.Server.ResponseWriter :=
+    { start := fun rh =>
+        if failStart then
+          (LeanIn.Runtime.VM.abortOnFailure
+            (fun (_ : Unit → IO Unit) (f : IO.Error → IO Unit) => f sentinel) : LeanIn.Runtime.VM Unit)
+        else detectStart rh
+      write := fun _ => pure ()
+      finish := pure ()
+      status := pure (true, true, false)
+      code := pure (some 500) }
+  fiveHundreds.set 0
+  let fallbackOk := outcomeText (← settleOutcome
+    (LeanIn.Examples.Http.Server.Stream.respond (fallbackWriter false)
+      { status := 500, reason := "Internal Server Error" } "".toUTF8))
+  unless fallbackOk == "ok" do
+    throw (IO.userError s!"vm abort control: the driver's fallback response: expected ok, got {fallbackOk}")
+  unless (← fiveHundreds.get) == 1 do
+    throw (IO.userError s!"vm abort control: the fallback response's 500 was counted {← fiveHundreds.get} times, expected 1")
+  let fallbackAbort := outcomeText (← settleOutcome
+    (LeanIn.Examples.Http.Server.Stream.respond (fallbackWriter true)
+      { status := 500, reason := "Internal Server Error" } "".toUTF8))
+  unless fallbackAbort == abortedWant do
+    throw (IO.userError s!"vm abort control: a failed fallback head send: expected {abortedWant}, got {fallbackAbort}")
+  -- The detector's affirmative control: an ordinary, `Http:`-prefixed route error does reach that 500.
+  fiveHundreds.set 0
+  let ordinaryRoute : LeanIO.Backend.LeanIn.Handler :=
+    fun _ _ => throw (IO.userError "Http: vm abort control ordinary sentinel")
+  let ordinary := outcomeText (← settleOutcome
+    (LeanIO.Backend.LeanIn.catchErrors ordinaryRoute req okWriter))
+  unless ordinary == "ok" do
+    throw (IO.userError s!"vm abort control: the ordinary error route: expected ok, got {ordinary}")
+  unless (← fiveHundreds.get) == 1 do
+    throw (IO.userError s!"vm abort control: the detector counted {← fiveHundreds.get} 500s, expected exactly 1")
+  IO.println ("vmabort|abort-bypasses-attempt=yes|abort-bypasses-tryE=yes|transport-aborts=yes"
+    ++ "|later-throw-ordinary=yes|unscoped-abort-loud=yes|scoped-runners-complete=yes|fallback-scoped=yes"
+    ++ "|writer-transport-aborts=yes|writer-500-detector=1")
+
 /-- Run every control that can be run, or one executor scenario when named. -/
 def runMode (args : List String) : IO UInt32 := do
   -- The affirmative baseline header, in every mode, before any observation: a check reads it to tell
@@ -5146,6 +5310,7 @@ def runMode (args : List String) : IO UInt32 := do
   controlTryLock
   controlNotifyLost 200
   controlPredicateRecheck 200
+  controlVMAbort
   let _ ← controlMutualExclusion 4 500000
   IO.println ""
   IO.println "  done"

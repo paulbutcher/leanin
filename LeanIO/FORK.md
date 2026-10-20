@@ -23,24 +23,29 @@ The fork's backend has been moved onto LeanIn for the native path:
 | --- | --- |
 | routing | upstream trie parameterised over its handler value; `NativeRouter` provides the upstream composition semantics natively — route middlewares innermost, then the router's with the last added outermost, mounts prefixing, `notFound`, and a one-time `toTrie` — and `LeanIO.Backend.LeanIn` dispatches it on a LeanIn connection |
 | method | token preserved by `H1.Head`, mapped to `Std.Http.Method` or refused (501); a known method with no route is 405 with `Allow`; HEAD is served by the GET handler with the body dropped and `Content-Length: 0`, as upstream documents |
-| bodies | buffered delivery to handlers, bounded by `H1.Limits.maxBody` (1 MiB, 413); malformed/oversized heads answer 400/413/431 before close |
+| bodies | native handlers receive a streaming `BodyReader`; a buffered extractor's `readAll` accumulates the whole body and is **not** capped by `H1.Limits.maxBody` on this path, so it may grow with the input — the cap belongs to the separate buffered driver, which answers an oversize `Content-Length` body 413 before dispatch; malformed/oversized heads answer 400/431 before close |
 | extraction | JSON, plain text and URL-encoded form over the buffered body (415/400/422), reusing LeanIO's MIME declarations, query parser and `FromForm` |
 | request | path parameters captured by the trie, query string/parameter decoding, headers, media type; `withExtract` composes an extractor with a handler; `Middleware := Handler → Handler` |
 | suspension | handlers are `VM` values; `GET /slow` parks 200 ms while a sibling request completes |
-| middleware | `Handler → Handler`; `catchErrors` uses `VM.attempt`, whose catch survives a suspension (`/boom` parks then raises, answered 500), and `requestLogger` observes and passes through |
-| checks | `tests/leanio-native.sh` asserts all of the above at the public socket |
+| middleware | `Handler → Handler`; `catchErrors` uses `VM.attempt`, whose catch survives a suspension (`/boom` parks then raises, answered 500) and whose 500 body is the error's `toString`, and `requestLogger` observes and passes through |
+| cancellation | a request's own transport failure — a failed body read, a stall, a peer close mid-body, a failed response send — is a typed VM abort, not a catchable raise: the streaming driver's request scope turns it into an `aborted` outcome, the driver closes the connection and reports the transport error, and attempts no further 500 or keep-alive; bytes already sent are not retracted, so no claim of zero written bytes is made |
+| checks | `tests/leanio-native.sh` asserts routing, middleware, suspensions, bodies, keep-alive, methods and extraction statuses at the public socket; `tests/http-cancel-contract.sh HC1` and `HC2` assert the cancellation and the prefixed ordinary error at that socket |
 
 Not yet ported: the route macros and `FromRequestBody`/`FromRequestParts` classes still ascribe
-`ContextAsync`/`Request Body.Stream`; streaming bodies/backpressure, multipart and the request-cancellation
-scope are later stages. The fork builds and its own tests run under `lake build LeanIO`.
+`ContextAsync`/`Request Body.Stream`, so the stock streaming APIs are later stages, as is response backpressure;
+and so is the **rest** of the request scope — task/child cancellation, shutdown/drain and scope-exit cleanup. The
+peer-I/O request scope and the streaming reader/writer themselves are implemented (the `bodies` and `cancellation`
+rows above and the paragraph below). The fork builds and its own tests run under `lake build LeanIO`.
 
 ### The native backend's boundary
 
-Handlers use the streaming session: `Request.body` is a `BodyReader`, the handler writes through a
-`ResponseWriter`, and neither direction is accumulated. `readAll` is what a buffered extractor (`jsonBody`,
-`formBody`) calls; a route that streams calls `recv`/`write` itself. Responses are framed as a declared
-`Content-Length`, chunked on HTTP/1.1, or close-delimited. The buffered `maxBody` limit applies only to the
-buffered driver; a streaming body has no accumulated body to bound.
+Handlers use the streaming session: `Request.body` is a `BodyReader` and the handler writes through a
+`ResponseWriter`, so neither direction is accumulated unless the handler asks for it. `readAll` is what a
+buffered extractor (`jsonBody`, `formBody`) calls: it accumulates the whole body with no byte-count check, so on
+this path the accumulation is **not bounded by `H1.Limits.maxBody`** and may grow with the input. The `maxBody`
+bound belongs to the separate buffered driver, which rejects an oversize `Content-Length` body with 413 before
+dispatch. A route that streams calls `recv`/`write` itself and never accumulates. Responses are framed as a
+declared `Content-Length`, chunked on HTTP/1.1, or close-delimited.
 
 Route selection shares the route-declaration form. The unprefixed `GET … => …` selects the stock backend by
 default and the native backend under `set_option leanio.backend.native true`; `native GET … => …` selects the
@@ -55,8 +60,13 @@ Multipart is the upstream parser parameterised over its body source: `BodySource
 operations on both backends - `nextEntry`, `stream`, `discard`, `save` - and `withMultipartForm` runs them
 over the native request reader. One parser serves both.
 
-Cancellation is the transport's: a body or response operation that fails raises through the handler, and
-`catchErrors` re-raises transport failures rather than turning them into a 500 the peer can no longer receive.
+Cancellation is the transport's, and it is typed: `LeanIn.Runtime.VM` carries an abort channel separate from
+`throwE`, `VM.abortOnFailure` classifies one raw completion's own failure as an abort, and the streaming driver's
+`VM.requestScope` turns it into an `aborted` outcome (`docs/decisions.md` D23). `tests/http-cancel-contract.sh HC1`
+drives a half-closed peer at the public socket: it reads zero post-close response bytes and the service answers a
+fresh connection afterwards. The middleware no longer classifies by message text — an `Http:`-prefixed
+**application** error is an ordinary raise, answered 500 with its `toString` body (`HC2`) — and the buffered
+entrypoint has no scope, so an explicit abort in one of its handlers fails loudly rather than closing.
 
 ## Working rules
 

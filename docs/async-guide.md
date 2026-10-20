@@ -50,6 +50,11 @@ A machine call compiles to the callee's `run` with the caller's continuation as 
 no carrier hop — so both machines' state layouts stay in that one call. `spawn` hands back a `RawCell`, and
 `RawCell.await` on it is the join.
 
+The machine handed to `VM.runAsync` may be a `VM.requestScope` of a handler: the await then yields that
+machine's `Outcome` — a value, an ordinary error, or a transport abort — and the driver matches on the three
+cases. The scope is inside the machine, so the compiled form is still the same syntactic `VM.runAsync m` and the
+compiler needs no new effect (D23).
+
 ## Names and ascriptions
 
 Every name the body binds is a field of the next state. A field carries a type in one of three ways:
@@ -130,7 +135,13 @@ nix develop -c bash tests/async-diagnostics.sh
 - The effect set is closed; a body needing anything else awaits a `VM.runAsync` of the interpreted machine,
   which can express dynamic effects at the cost of an interpreter step.
 - Machine calls take one continuation last; `select` is over two cells of one type (no heterogeneous race).
-- A running handler is not cancelled: closing a connection ends the I/O but not a suspended computation.
+- A running handler is not cancelled by a scope of its own: closing a connection ends the I/O but not a
+  suspended computation. A **peer-I/O failure** does end the request: a failed body read, a stall, a peer close
+  mid-body or a failed response send is a VM abort, which the streaming driver's `requestScope` turns into an
+  `aborted` outcome, so the connection closes as a transport error with no further response attempted — bytes
+  already sent stand — instead of sitting parked on a read whose peer is gone (D23). That is not arbitrary
+  cancellation — a handler parked on a leaf nothing falsifies still never returns, and no child computation is
+  cancelled.
 - The single-carrier driver runs the accept loop, the connection's effects and its resumes on one thread; a
   multi-carrier entry is not wired in the shipped executables.
 - A spawned handler's outcome is not supervised by the example's loop (the handle is discarded): each

@@ -127,6 +127,22 @@ is called by the test mode, not by library code, and is already controlled. No `
 added in the library, so `Blocking.lean`'s direct promise reach stays the only one. `#print axioms` is unchanged
 because W13 adds no theorem.
 
+**The streaming request's transport abort changes the TCB in no way (D23).** It adds no primitive and no axiom:
+the classification is Lean code over the machine's own constructors — `abortE`, `tryAbortE`, `Outcome`,
+`VM.requestScope`, and one leaf wrapper `VM.abortOnFailure` whose action delivers its own completion's failure
+to the abort channel — and the operations it wraps are the socket effects the driver already had
+(`Io.recvTimeoutRaw`, `Io.sendRaw`, `Io.sendAllRaw`) plus the existing close. No new extern, `IO.Promise`,
+atomic or syscall is reached and no library module gains a new `Std` import edge (audited by direct calls and
+import edges, not by text search). What the change **adds to the trusted column is a semantic assumption, not a
+primitive**: that an abort raised at a transport operation is preserved through the VM interpreter's three
+continuations, through `bind` (including the IO leaf's rewritten value continuation), through `tryE`/`attempt`,
+and through the compiled driver's `runAsync` await — so that the connection then closes and reports a transport
+error instead of being answered. That correspondence is **tested, not proved**: HC1 at the public loopback socket
+(a half-closed peer gets no post-close response bytes and the service still answers a new connection) and the
+focused controls (`nix develop -c lake exe controls`, the `vmabort` line) for the interpreter-level clauses.
+It is not a discharge of P7 — this is not `Task.Cancel` and cancels no task — and not of P8; the row for P7 is
+unchanged, and this paragraph is an argument and a test record, not a theorem.
+
 The honest framing: **the proof is about a model of the scheduler, and the model is a design decision
 that we control.** The project's central architectural question is therefore not "what do we prove"
 but **"how thin can we make the layer between the proven model and the running code."** That is why
