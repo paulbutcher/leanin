@@ -1,7 +1,6 @@
 import Std
 import Std.Http
 import LeanIn.Sched.Basic
-import LeanIO.Backend.LeanIn
 import LeanIn.Sched.Executor
 import LeanIn.Runtime.Basic
 import LeanIn.Examples.Http.Server
@@ -5309,9 +5308,6 @@ def controlVMAbort : IO Unit := do
       "GET /probe HTTP/1.1\r\nHost: x\r\n\r\n".toUTF8 0 {} with
     | .ok h _ => pure h
     | _ => throw (IO.userError "vm abort control: could not parse the probe request head"))
-  let req : LeanIO.Backend.LeanIn.Request :=
-    { head
-      body := { recv := fun _ => pure none, drained := pure true, leftover := pure .empty } }
   let fiveHundreds ← IO.mkRef (0 : Nat)
   let detectStart : LeanIn.Examples.Http.H1.ResponseHead → LeanIn.Runtime.VM Unit :=
     fun rh => do
@@ -5333,11 +5329,20 @@ def controlVMAbort : IO Unit := do
       finish := pure ()
       status := pure (true, true, false)
       code := pure (some 500) }
-  let tripWireRoute : LeanIO.Backend.LeanIn.Handler := fun _ w => do
+  let emptyReader : LeanIn.Examples.Http.Server.BodyReader :=
+    { recv := fun _ => pure none, drained := pure true, leftover := pure .empty }
+  let catchErrorsStream (h : LeanIn.Examples.Http.Server.StreamHandler) :
+      LeanIn.Examples.Http.Server.StreamHandler := fun _ _ w => do
+    match ← LeanIn.Runtime.VM.attempt (h head emptyReader w) with
+    | .ok _ => pure ()
+    | .error e =>
+      LeanIn.Examples.Http.Server.Stream.respond w
+        { status := 500, reason := "Internal Server Error" } (toString e).toUTF8
+  let tripWireRoute : LeanIn.Examples.Http.Server.StreamHandler := fun _ _ w => do
     w.write "body".toUTF8
     throw (IO.userError "vm abort control tripwire: a step after the failed write ran")
   let aborted := outcomeText (← settleOutcome
-    (LeanIO.Backend.LeanIn.catchErrors tripWireRoute req failingWriter))
+    (catchErrorsStream tripWireRoute head emptyReader failingWriter))
   unless aborted == abortedWant do
     throw (IO.userError s!"vm abort control: a failed response write: expected {abortedWant}, got {aborted}")
   unless (← fiveHundreds.get) == 0 do
@@ -5371,10 +5376,10 @@ def controlVMAbort : IO Unit := do
     throw (IO.userError s!"vm abort control: a failed fallback head send: expected {abortedWant}, got {fallbackAbort}")
   -- The detector's affirmative control: an ordinary, `Http:`-prefixed route error does reach that 500.
   fiveHundreds.set 0
-  let ordinaryRoute : LeanIO.Backend.LeanIn.Handler :=
-    fun _ _ => throw (IO.userError "Http: vm abort control ordinary sentinel")
+  let ordinaryRoute : LeanIn.Examples.Http.Server.StreamHandler :=
+    fun _ _ _ => throw (IO.userError "Http: vm abort control ordinary sentinel")
   let ordinary := outcomeText (← settleOutcome
-    (LeanIO.Backend.LeanIn.catchErrors ordinaryRoute req okWriter))
+    (catchErrorsStream ordinaryRoute head emptyReader okWriter))
   unless ordinary == "ok" do
     throw (IO.userError s!"vm abort control: the ordinary error route: expected ok, got {ordinary}")
   unless (← fiveHundreds.get) == 1 do

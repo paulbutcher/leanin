@@ -57,22 +57,10 @@
   substituting a documented scenario ID as needed. The shell
   invokes the public `controls` executable; `tests/ModelOracle.lean`
   independently computes the pure-model side. No new framework.
-- The HTTP cancellation contract is `tests/http-cancel-contract.md`
-  with `tests/http-cancel-contract.sh`, driven at the public loopback
-  socket of the `leanioCancelContract` service: run
-  `nix develop -c bash tests/http-cancel-contract.sh HC1` (also `HC2`).
-  The service is the fixture's own executable and the host is
-  `127.0.0.1` (`CANCEL_CONTRACT_PORT`, default 8791) — no external
-  service is reached, no `Conn` is forged, and no clock is asserted:
-  HC2's `/ready`/`/release` handshake is a synchronized fake completion
-  and bounded waits only bound a wait. HC1's `/boom` and its following
-  `/ping` are the status-line detector's affirmative control and the
-  recovery control in the same invocation; HC2 binds its expected body to
-  an independently served `/error-text` value. Exit 2 is a setup failure
-  (build, startup, readiness, the interim `100`, a control, or a truncated
-  read); exit 1 is the scenario's own assertion. Both come out green on the
-  tree that carries the abort channel, and `nix develop -c bash tests/http-stream.sh`
-  plus `nix develop -c bash tests/leanio-native.sh` stay the HTTP regressions.
+- The HTTP cancellation contract moved with LeanIO to `scidonia/leanio`
+  (`tests/http-cancel-contract.*`, `leanioCancelContract`); LeanIn keeps
+  `tests/http-stream.sh` for the stream handler itself.
+
 - The timeout cancellation contract is `tests/timeout-cancel-contract.md`
   with `tests/timeout-cancel-contract.sh`: run
   `nix develop -c bash tests/timeout-cancel-contract.sh TC1`. It drives its
@@ -186,12 +174,10 @@
   shape but not support a ratio.
 - The README carries the short table and cites the commit its numbers came
   from; method, ranges and rejected attempts stay in `docs/PERFORMANCE.md`.
-- For the LeanIO port, run `nix develop -c bash tests/leanio-native.sh`
-  after touching `LeanIO/Backend/`, the native example, or the HTTP
-  driver; it asserts routing, middleware, path parameters, suspended
-  handlers, buffered bodies, keep-alive, method-token behaviour and the
-  extraction statuses at the public socket. `LeanIO/FORK.md` records what
-  is ported and what is not.
+LeanIO lives in its own fork, `scidonia/leanio`; its native suite and benchmark run there, not in this
+repository. LeanIn's own HTTP examples are checked by `tests/executor-contract.sh SC20` and the
+`http-cancel-contract` scenarios, which now drive LeanIn's stream handler directly.
+
 - After touching the shim's raw completion registry (`c/netuv.c`,
   `LeanIn/Runtime/Io.lean`), run `nix develop -c lake exe controls
   --raw-registry` with `NETUV_RAW_CHECK=1`. It checks register/take,

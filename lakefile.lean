@@ -29,12 +29,6 @@ library's surface stays the concurrency toolkit. -/
 lean_lib LeanInExamples where
   globs := #[.one `LeanIn.Examples, .submodules `LeanIn.Examples]
 
-/-- The vendored HTTP framework, eventually ported onto the toolkit. Kept as its own target: the library does
-not import it, and its backend is adapted to LeanIn as the port proceeds. -/
-lean_lib LeanIO where
-  globs := #[.one `LeanIO, .submodules `LeanIO]
-
-
 /-- The socket shim: `c/netuv.c` compiled and archived by Lake rather than by the dev shell, so that a plain
 `lake build` produces it and no store path appears in any build flag. Lake traces the source, so editing the C
 rebuilds the object and relinks everything that uses it. -/
@@ -80,20 +74,4 @@ lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 
 lean_exe streamEcho where
   root := `LeanIn.Exe.StreamEcho
-  moreLinkArgs := netuvLinkArgs
-
-lean_exe leanioDrain where
-  root := `LeanIO.Examples.Drain
-  moreLinkArgs := netuvLinkArgs
-
-lean_exe leanioNative where
-  root := `LeanIO.Examples.Native
-  moreLinkArgs := netuvLinkArgs
-
-/-- The cancellation contract's service: seven test-only routes over the production native router with its
-`catchErrors` middleware — `/ping`, `/boom`, `POST /cancel-probe`, `/prefixed-error`, `/error-text`, `/ready`
-and `/release` — so a client can observe at a local loopback socket what a half-closed request body produces
-and what a parked handler's ordinary error returns. -/
-lean_exe leanioCancelContract where
-  root := `LeanIn.Test.HttpCancelContract
   moreLinkArgs := netuvLinkArgs

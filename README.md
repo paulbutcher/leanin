@@ -38,18 +38,9 @@ request. Measured on commit `554e3b0` with one invocation of `bench/screen.sh`; 
 during the run after Node's rows were taken, so the single readings and ratios are an illustration — the
 paired instrument is `bench/paired.sh`. Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
-The fork's LeanIn-backed LeanIO backend, over the same paired instrument (`bench/leanio-pair.sh`, `GET /bench`,
-keep-alive, server and client on distinct pinned cores):
-
-| C | shipped `Std.Http.Server` | `leanioNative` | native / shipped |
-|---|---|---|---|
-| 1 | 5 095 | **56 285** | **11.02×** |
-| 8 | 6 003 | **84 414** | **14.11×** |
-| 32 | 6 037 | **90 392** | **14.80×** |
-
-Requests per second, median of seven interleaved paired rounds, measured on commit `1f6b302`; host load averaged
-5.05 before and 5.53 after. Upstream LeanIO has no server adapter, so the shipped `Std.Http.Server` is the
-available serving baseline. Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §3.7.
+LeanIO — the router and HTTP framework — lives in its own fork at
+[`scidonia/leanio`](https://github.com/scidonia/leanio), with LeanIn as a Lake dependency. It is no longer part of
+this repository.
 
 ## Development Status
 
