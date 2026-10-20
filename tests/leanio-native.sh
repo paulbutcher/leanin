@@ -134,6 +134,10 @@ st, _, body = get("/nping")
 check("native syntax", st.endswith("200 OK") and body == b"native-syntax\n", f"{st} {body!r}")
 st, _, body = post("/ntodos", "application/json", b'{"title":"native","done":false}')
 check("native syntax body extractor", st.endswith("200 OK") and b'"title":"native"' in body, f"{st} {body!r}")
+st, _, body = get("/nuser/42")
+check("native path extractor", st.endswith("200 OK") and body == b"id=42\n", f"{st} {body!r}")
+st, _, body = post("/nform", "application/x-www-form-urlencoded", b"user=bob")
+check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", f"{st} {body!r}")
 st, _, body = get("/nping-option")
 check("option-selected syntax", st.endswith("200 OK") and body == b"option-native\n", f"{st} {body!r}")
 
@@ -176,6 +180,16 @@ try:
 except OSError as e:
     p0 = p1 = b""
 check("saved part bodies", p0 == b"alice" and p1 == b"hello file", f"{p0!r} {p1!r}")
+
+# A client that disconnects while the handler is parked: the response write fails, the connection closes,
+# and the server keeps serving.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.sendall(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+s.close()
+time.sleep(0.35)
+st, _, body = get("/ping")
+check("alive after disconnecting a parked handler", st.endswith("200 OK") and body == b"pong\n",
+      f"{st} {body!r}")
 
 # A client that disconnects mid-body is a cancellation, not a 500 the server can still send; it must not take
 # the server down or leave the connection loop wedged.

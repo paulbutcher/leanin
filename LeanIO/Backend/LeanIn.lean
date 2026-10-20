@@ -8,6 +8,7 @@ public import Std.Http.Data.Method
 public import Lean
 public import LeanIO.Data.Headers.MimeType
 public import LeanIO.Request.FromRequestBody
+public import LeanIO.Request.FromRequestParts
 public import LeanIO.Request.MultiPartForm.Api
 public import LeanIO.Request.Form
 
@@ -376,6 +377,48 @@ instance : FromRequestBodyM LeanIO.PlainText where
     | .ok text => pure (.ok { body := text })
     | .error e => pure (.error e)
 
+/-- A form-encoded body in the native monad. -/
+instance [LeanIO.FromForm α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Form α)] :
+    FromRequestBodyM (LeanIO.Form α) where
+  read env := do
+    match ← LeanIO.Backend.LeanIn.formBody α env.req with
+    | .ok a => pure (.ok { value := a })
+    | .error e => pure (.error e)
+
+/-- The raw body bytes in the native monad. -/
+instance : FromRequestBodyM ByteArray where
+  read env := do
+    return .ok (← readAll env.req.body .empty)
+
+/-- A request-parts extraction in the native backend. As in the stock classes, a failure is the status and
+message to answer with. -/
+class FromRequestPartsM (α : Type) where
+  readParts : Request → Except (Nat × String) α
+
+/-- `Path α` from a named path-parameter map (`FromPath`). -/
+instance [LeanIO.FromPath α] : FromRequestPartsM (LeanIO.Path α) where
+  readParts r :=
+    match LeanIO.FromPath.fromPath (Std.HashMap.ofList r.params) with
+    | .ok v => .ok { value := v }
+    | .error e => .error (400, e)
+
+/-- `Path α` from the single captured parameter (`FromString`). -/
+instance [LeanIO.FromString α] : FromRequestPartsM (LeanIO.Path α) where
+  readParts r :=
+    if r.params.length != 1 then
+      .error (400, "expected exactly one path parameter")
+    else
+      match LeanIO.FromString.parse r.params[0]!.2 with
+      | .ok v => .ok { value := v }
+      | .error e => .error (400, e)
+
+/-- The request's query (`Std.Http.URI.Query`), or 400 when it is malformed. -/
+instance : FromRequestPartsM Std.Http.URI.Query where
+  readParts r :=
+    match r.query? with
+    | some q => .ok q
+    | none => .error (400, "malformed query")
+
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where
   extractParts : Fn → Handler
@@ -390,6 +433,18 @@ instance : NativePartsExtractor (AppM Unit) where
 instance [FromRequestBodyM P] [NativePartsExtractor Rest] : NativeExtractor (P → Rest) where
   extract f req w := do
     match ← FromRequestBodyM.read (α := P) { req, writer := w } with
+    | .ok p => NativePartsExtractor.extractParts (f p) req w
+    | .error (status, msg) => LeanIO.Backend.LeanIn.respond w status (reasonFor status) msg.toUTF8
+
+instance [FromRequestPartsM P] [NativePartsExtractor Rest] : NativeExtractor (P → Rest) where
+  extract f req w := do
+    match FromRequestPartsM.readParts (α := P) req with
+    | .ok p => NativePartsExtractor.extractParts (f p) req w
+    | .error (status, msg) => LeanIO.Backend.LeanIn.respond w status (reasonFor status) msg.toUTF8
+
+instance [FromRequestPartsM P] [NativePartsExtractor Rest] : NativePartsExtractor (P → Rest) where
+  extractParts f req w := do
+    match FromRequestPartsM.readParts (α := P) req with
     | .ok p => NativePartsExtractor.extractParts (f p) req w
     | .error (status, msg) => LeanIO.Backend.LeanIn.respond w status (reasonFor status) msg.toUTF8
 

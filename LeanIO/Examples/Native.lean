@@ -101,6 +101,16 @@ def ntodo : LeanIO.Backend.LeanIn.NativeRoute :=
   native POST "/ntodos" (t : LeanIO.Json Todo) => do
     LeanIO.Backend.LeanIn.AppM.respond 200 "OK" (Lean.toJson t.body).compress.toUTF8
 
+/-- Path-parameter extraction in the native route syntax. -/
+def nuser : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/nuser/{id}" (id : LeanIO.Path Nat) => do
+    LeanIO.Backend.LeanIn.AppM.respond 200 "OK" s!"id={id.value}\n".toUTF8
+
+/-- Form extraction in the native route syntax. -/
+def nform : LeanIO.Backend.LeanIn.NativeRoute :=
+  native POST "/nform" (f : LeanIO.Form (Std.HashMap String String)) => do
+    LeanIO.Backend.LeanIn.AppM.respond 200 "OK" s!"user={(f.value.get? "user").getD ""}\n".toUTF8
+
 section
 set_option leanio.backend.native true
 
@@ -186,6 +196,8 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.route .post "/upload-stream" uploadStream
     |>.route .post "/upload-save" uploadSave
     |>.add nping
+    |>.add nuser
+    |>.add nform
     |>.add npingOption
     |>.add ntodo
     |>.route .get "/boom" (boom clock)
