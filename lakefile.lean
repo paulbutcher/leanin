@@ -78,6 +78,10 @@ lean_exe hello where root := `LeanIn.Exe.Hello
 
 lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 
+lean_exe streamEcho where
+  root := `LeanIn.Exe.StreamEcho
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe leanioNative where
   root := `LeanIO.Examples.Native
   moreLinkArgs := netuvLinkArgs

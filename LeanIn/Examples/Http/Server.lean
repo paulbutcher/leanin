@@ -210,6 +210,375 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
     let closed := await (LeanIn.Runtime.Io.closeRaw c)
     onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
 
+
+/-! ## Streaming session
+
+The buffered `Handler` above hands the application the whole body and takes the whole response back. The
+session below is the port's body boundary: the handler reads the request body incrementally (the bytes already
+in the machine's buffer first, then the socket) and writes the response incrementally, so neither direction is
+bounded by `Limits.maxBody`. Reads and writes are LeanIn effects on the same connection, which is what lets a
+handler park on a body byte that only the peer can send without deadlocking the connection, and a transport
+failure reaches the handler as a raise. -/
+
+/-- The decoder's position in a request body. -/
+structure BodyState where
+  /-- Bytes not yet decoded; `pos` is how far the decoder has read. -/
+  buf : ByteArray := .empty
+  pos : Nat := 0
+  /-- Fixed-length bytes still expected, when the body is `Content-Length` framed. -/
+  remaining : Option Nat := none
+  /-- The chunk decoder's state, when the body is chunked. -/
+  chunk : Option H1.ChunkState := none
+  /-- The body has ended. -/
+  done : Bool := true
+  /-- Bytes after the body's end: a pipelined next request, handed back to the machine. -/
+  leftover : ByteArray := .empty
+deriving Inhabited
+
+/-- A request body as the handler sees it: `recv n` returns at most `n` bytes, then `none` at the end. A
+transport failure raises, so a peer that disconnects mid-body fails the handler rather than looking like EOF. -/
+structure BodyReader where
+  recv : Nat → VM (Option ByteArray)
+  /-- Whether the whole body has been consumed. An unread body closes the connection instead of being parsed as
+  the next request. -/
+  drained : VM Bool
+  /-- Bytes after the body: the machine resumes from these when the connection is reused. -/
+  leftover : VM ByteArray
+
+/-- A response body as the handler writes it. `start` sends the head and fixes the framing: a declared
+`Content-Length`, else chunked on HTTP/1.1, else close-delimited. -/
+structure ResponseWriter where
+  start : H1.ResponseHead → VM Unit
+  write : ByteArray → VM Unit
+  finish : VM Unit
+  /-- Whether the response was started and finished, and whether the handler asked to close. -/
+  status : VM (Bool × Bool × Bool)
+
+/-- A streaming request handler: the head, the body reader, and the response writer. -/
+abbrev StreamHandler := H1.Head → BodyReader → ResponseWriter → VM Unit
+
+namespace Stream
+
+def hexOf (n : Nat) : String :=
+  String.mk (Nat.toDigits 16 n)
+
+/-- Read a state reference as a `VM` effect. -/
+def liftGet {α : Type} (r : IO.Ref α) : VM α := monadLift (r.get : IO α)
+
+/-- Write a state reference as a `VM` effect. -/
+def liftSet {α : Type} (r : IO.Ref α) (a : α) : VM Unit := monadLift (r.set a : IO Unit)
+
+/-- `recv` over a body state: decode from the buffer, reading the socket only when it runs out. -/
+partial def recvSome (st : IO.Ref BodyState) (c : Conn) (clock : Clock)
+    (stall : Std.Time.Millisecond.Offset) (n : Nat) : VM (Option ByteArray) := do
+  let s ← (liftGet st)
+  if s.done then
+    liftSet st { s with leftover := s.buf.extract s.pos s.buf.size }
+    return none
+  if s.pos >= s.buf.size then
+    let rt ← VM.recvTimeout c clock stall
+    match rt with
+    | none => throw (.userError "Http: the peer stalled while sending a request body")
+    | some none => throw (.userError "Http: the peer closed while sending a request body")
+    | some (some bs) =>
+      let s ← (liftGet st)
+      liftSet st { s with buf := s.buf ++ bs }
+      recvSome st c clock stall n
+  else if let some rem := s.remaining then
+    let avail := s.buf.size - s.pos
+    let k := min (min n rem) avail
+    let data := s.buf.extract s.pos (s.pos + k)
+    let rem' := rem - k
+    let done := rem' == 0
+    let leftover := if done then s.buf.extract (s.pos + k) s.buf.size else .empty
+    liftSet st { s with pos := s.pos + k, remaining := some rem', done, leftover }
+    return some data
+  else match s.chunk with
+  | some H1.ChunkState.sizeLine =>
+    match H1.findLF s.buf s.pos with
+    | none =>
+      let rt ← VM.recvTimeout c clock stall
+      match rt with
+      | none => throw (.userError "Http: the peer stalled in a chunk-size line")
+      | some none => throw (.userError "Http: the peer closed in a chunk-size line")
+      | some (some bs) =>
+        let s ← (liftGet st)
+        liftSet st { s with buf := s.buf ++ bs }
+        recvSome st c clock stall n
+    | some nl =>
+      let lineStop := if nl > s.pos && s.buf.get! (nl - 1) == 0x0D then nl - 1 else nl
+      match H1.chunkSize? s.buf s.pos lineStop with
+      | none => throw (.userError "Http: malformed chunk size")
+      | some 0 =>
+        liftSet st { s with pos := nl + 1, chunk := some .trailers }
+        recvSome st c clock stall n
+      | some sz =>
+        liftSet st { s with pos := nl + 1, chunk := some (.data sz) }
+        recvSome st c clock stall n
+  | some (.data rem) =>
+    let avail := s.buf.size - s.pos
+    if avail == 0 then
+      let rt ← VM.recvTimeout c clock stall
+      match rt with
+      | none => throw (.userError "Http: the peer stalled in a chunk")
+      | some none => throw (.userError "Http: the peer closed in a chunk")
+      | some (some bs) =>
+        let s ← (liftGet st)
+        liftSet st { s with buf := s.buf ++ bs }
+        recvSome st c clock stall n
+    else
+      let k := min (min n rem) avail
+      let data := s.buf.extract s.pos (s.pos + k)
+      let rem' := rem - k
+      let st' := if rem' == 0 then { s with pos := s.pos + k, chunk := some .dataCRLF }
+                 else { s with pos := s.pos + k, chunk := some (.data rem') }
+      liftSet st st'
+      return some data
+  | some .dataCRLF =>
+    if s.buf.size - s.pos < 2 then
+      let rt ← VM.recvTimeout c clock stall
+      match rt with
+      | none => throw (.userError "Http: the peer stalled after a chunk")
+      | some none => throw (.userError "Http: the peer closed after a chunk")
+      | some (some bs) =>
+        let s ← (liftGet st)
+        liftSet st { s with buf := s.buf ++ bs }
+        recvSome st c clock stall n
+    else
+      liftSet st { s with pos := s.pos + 2, chunk := some .sizeLine }
+      recvSome st c clock stall n
+  | some .trailers =>
+    match H1.findLF s.buf s.pos with
+    | none =>
+      let rt ← VM.recvTimeout c clock stall
+      match rt with
+      | none => throw (.userError "Http: the peer stalled in trailers")
+      | some none => throw (.userError "Http: the peer closed in trailers")
+      | some (some bs) =>
+        let s ← (liftGet st)
+        liftSet st { s with buf := s.buf ++ bs }
+        recvSome st c clock stall n
+    | some nl =>
+      let lineStop := if nl > s.pos && s.buf.get! (nl - 1) == 0x0D then nl - 1 else nl
+      if lineStop == s.pos then
+        liftSet st { s with pos := nl + 1, chunk := some .done, done := true,
+                                   leftover := s.buf.extract (nl + 1) s.buf.size }
+        return none
+      else
+        liftSet st { s with pos := nl + 1 }
+        recvSome st c clock stall n
+  | some .done =>
+    liftSet st { s with done := true, leftover := s.buf.extract s.pos s.buf.size }
+    return none
+  | none => throw (.userError "Http: body framing lost")
+
+/-- Build the reader for a head and the bytes already buffered behind it. -/
+def bodyReader (head : H1.Head) (initial : ByteArray) (c : Conn) (clock : Clock)
+    (stall : Std.Time.Millisecond.Offset) : IO BodyReader := do
+  let chunked := H1.chunked? head
+  let cl := if chunked then 0 else (H1.contentLength? head.buf head.headers).getD 0
+  let st ← IO.mkRef ({ buf := initial
+                       remaining := if chunked then none else some cl
+                       chunk := if chunked then some .sizeLine else none
+                       done := !chunked && cl == 0 } : BodyState)
+  return {
+    recv := fun n => recvSome st c clock stall n
+    drained := (do
+      let s ← (liftGet st)
+      return s.done)
+    leftover := (do
+      let s ← (liftGet st)
+      return s.leftover)
+  }
+
+/-- The writer for one response on `c`. Framing is chosen once, at `start`. -/
+def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO ResponseWriter := do
+  let st ← IO.mkRef ((false, false, (none : Option Bool)) : Bool × Bool × Option Bool)
+  let set (f : Bool × Bool × Option Bool → Bool × Bool × Option Bool) : VM Unit := do
+    let s ← (liftGet st)
+    liftSet st (f s)
+  return {
+    start := fun rh => do
+      let declared := rh.headers.any (fun (n, _) => n.toLower == "content-length")
+      let closeAsked := rh.headers.any (fun (n, v) =>
+        n.toLower == "connection" && (v.splitOn ",").any (fun t => t.trimAscii.toString.toLower == "close"))
+      let chunked := !declared && version == .v11
+      let rh := { rh with headers := rh.headers.filter (fun (n, _) => n.toLower != "transfer-encoding") }
+      let rh := if chunked then { rh with headers := rh.headers.push ("Transfer-Encoding", "chunked") } else rh
+      let rh := if closeAsked then { rh with headers := rh.headers.push ("Connection", "close") } else rh
+      VM.sendAll c #[H1.encodeResponseHead rh]
+      set (fun _ => (true, false, some chunked))
+    write := fun bs => do
+      let s ← (liftGet st)
+      match s with
+      | (false, _, _) => throw (.userError "Http: response body written before its head")
+      | (_, true, _) => throw (.userError "Http: response body written after finish")
+      | (_, false, some true) =>
+        VM.sendAll c #[s!"{hexOf bs.size}\r\n".toUTF8, bs, "\r\n".toUTF8]
+      | (_, false, _) => VM.send c bs
+    finish := do
+      let s ← (liftGet st)
+      match s with
+      | (false, _, _) => pure ()
+      | (_, true, _) => pure ()
+      | (_, false, some true) =>
+        VM.sendAll c #["0\r\n\r\n".toUTF8]
+        set (fun (a, _, b) => (a, true, b))
+      | (_, false, _) => set (fun (a, _, b) => (a, true, b))
+    status := do
+      let s ← (liftGet st)
+      return (s.1, s.2.1, s.2.2.getD false)
+  }
+
+/-- One buffered response through the writer, for handlers that already hold the whole body. -/
+def respond (w : ResponseWriter) (rh : H1.ResponseHead) (body : ByteArray) : VM Unit := do
+  let rh := if rh.headers.any (fun (n, _) => n.toLower == "content-length") then rh
+            else { rh with headers := rh.headers.push ("Content-Length", toString body.size) }
+  w.start rh
+  w.write body
+  w.finish
+
+end Stream
+
+/-- The streaming pump: stop at the head, before the body is consumed, and hand the decoder the bytes already
+read. The machine is left at the end of its buffer; the body decoder owns those bytes until the handler is done,
+and returns the bytes after the body as the next request. -/
+private partial def pumpStreamGo (m : H1.Machine) (acc : Array ByteArray) : Pump :=
+  if m.halted then { stop := .done, machine := m, out := acc }
+  else
+    let (m', step) := H1.Machine.step m
+    let acc := acc ++ step.output.data
+    match step.events.find? (fun e => match e with | .failed _ => true | _ => false) with
+    | some (.failed e) =>
+      let (status, reason) : Nat × String := match e with
+        | .bodyTooLarge    => (413, "Payload Too Large")
+        | .headersTooLarge => (431, "Request Header Fields Too Large")
+        | .badRequest      => (400, "Bad Request")
+      pumpStreamGo ({ m'.closeWithError status reason with halted := false }) acc
+    | _ =>
+      if m'.head?.isSome then
+        let head := m'.head?.getD default
+        let initial := m'.buf.extract m'.pos m'.buf.size
+        let m'' := { m' with head? := none, pos := m'.buf.size, bodyRemaining := 0,
+                             chunkState := none, bodyDone := true, reqBody := .empty }
+        { stop := .needHandler, machine := m'', out := acc, req? := some (head, initial) }
+      else if m'.halted then { stop := .done, machine := m', out := acc }
+      else if madeProgress m m' step.output.size step.events then pumpStreamGo m' acc
+      else { stop := .needRead, machine := m', out := acc }
+
+/-- The streaming connection loop. The head is dispatched as soon as it parses; the body and the response are
+the handler's to read and write, so neither is buffered. The connection is reused only when the body was fully
+read, the response was started and finished, and the machine's disposition keeps it alive. -/
+async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHandler)
+    (m : LeanIn.Examples.Http.H1.Machine) (onClose : Except IO.Error Unit → IO Unit) := do
+  let r : Pump := pumpStreamGo m #[]
+  let machine : H1.Machine := r.machine
+  let out : Array ByteArray := r.out
+  match r.stop with
+  | .needHandler =>
+    if out.size > 0 then
+      let sw := await (LeanIn.Runtime.Io.sendAllRaw c out)
+      match sw with
+      | .error e =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | .ok _ => pure ()
+    let req : H1.Head × ByteArray := r.req?.getD (default, .empty)
+    let head : H1.Head := req.1
+    let initial : ByteArray := req.2
+    let answered : Except IO.Error (Bool × ByteArray × (Bool × Bool × Bool) × ResponseWriter) :=
+      await (LeanIn.Runtime.VM.runAsync (VM.attempt (do
+      let reader ← (monadLift (Stream.bodyReader head initial c cfg.clock cfg.stallTimeout) : VM BodyReader)
+      let writer ← (monadLift (Stream.responseWriter c head.version machine.keepAlive) : VM ResponseWriter)
+      try
+        handler head reader writer
+      catch e =>
+        let st ← writer.status
+        if !st.1 then Stream.respond writer { status := 500, reason := "Internal Server Error" } "".toUTF8
+        throw e
+      let drained ← reader.drained
+      let left ← reader.leftover
+      let st ← writer.status
+      return (drained, left, st, writer))))
+    match answered with
+    | .ok res =>
+      let drained : Bool := res.1
+      let left : ByteArray := res.2.1
+      let st : Bool × Bool × Bool := res.2.2.1
+      let writer : ResponseWriter := res.2.2.2
+      let started : Bool := st.1
+      let finished : Bool := st.2.1
+      if !started then
+        let ignored := await (LeanIn.Runtime.VM.runAsync (VM.attempt (Stream.respond writer
+          { status := 500, reason := "Internal Server Error" } "".toUTF8)))
+        pure ()
+      if drained && finished && machine.keepAlive then
+        let m := H1.Machine.feed { machine with buf := .empty, pos := 0 } left
+        recurse
+      else
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+    | .error e =>
+      let closed := await (LeanIn.Runtime.Io.closeRaw c)
+      onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+  | .needRead =>
+    if out.size > 0 then
+      let sw := await (LeanIn.Runtime.Io.sendAllRaw c out)
+      match sw with
+      | .error e =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | .ok _ => pure ()
+    if cfg.clock.swept then
+      let rt := await (LeanIn.Runtime.Io.recvStallRaw c cfg.stallTimeout 65536)
+      match rt with
+      | none =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+      | some (.error e) =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | some (.ok none) =>
+        let m := H1.Machine.noMoreInput machine
+        recurse
+      | some (.ok (some bs)) =>
+        let m := H1.Machine.feed machine bs
+        recurse
+    else
+      let rt := await (LeanIn.Runtime.Io.recvTimeoutRaw c cfg.clock.schedule cfg.stallTimeout 65536)
+      match rt with
+      | none =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+      | some (.error e) =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | some (.ok none) =>
+        let m := H1.Machine.noMoreInput machine
+        recurse
+      | some (.ok (some bs)) =>
+        let m := H1.Machine.feed machine bs
+        recurse
+  | .done =>
+    if out.size > 0 then
+      let sw := await (LeanIn.Runtime.Io.sendAllRaw c out)
+      match sw with
+      | .error e =>
+        let closed := await (LeanIn.Runtime.Io.closeRaw c)
+        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      | .ok _ => pure ()
+    let closed := await (LeanIn.Runtime.Io.closeRaw c)
+    onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+
+/-- Serve a streaming handler on one connection. -/
+def serveConnStream (cfg : Config) (c : Conn) (handler : StreamHandler) : Task.EAsync IO.Error Unit :=
+  ⟨fun k ctx => do
+    let cell ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
+    driveStream.run c cfg handler ({ limits := cfg.h1, buffered := false } : H1.Machine)
+      (fun r => Task.Join.resolve cell ctx.resumeShared r)
+    (Task.Async.await (show Task.Task (Except IO.Error Unit) from ⟨cell, ctx.cancel⟩)).step
+      (fun r ctx' => k r ctx') ctx⟩
+
 /-- **Serve one connection**: run the compiled loop from a fresh machine built from `cfg.h1` alone. The
 connection outlives a single exchange -- it ends when the machine halts, or when the peer closes or stalls past
 `cfg.stallTimeout`. The returned computation completes only when the machine's terminal close fires `onClose`:

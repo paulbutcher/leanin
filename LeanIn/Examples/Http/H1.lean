@@ -368,6 +368,9 @@ structure Machine where
   /-- The request body accumulated so far, up to `limits.maxBody`. The driver hands it to the handler with the
   head once framing completes (`takeRequest`); this is buffered delivery, not streaming. -/
   reqBody : ByteArray := .empty
+  /-- Whether this machine buffers the body and therefore applies `limits.maxBody`. The streaming driver turns
+  this off: its body is read incrementally by the handler, so there is no buffered body to bound. -/
+  buffered : Bool := true
   out : Array ByteArray := #[]
   keepAlive : Bool := true
   messageCount : Nat := 0
@@ -463,7 +466,7 @@ def step (m : Machine) : Machine × StepResult :=
       let chunked := chunked? head
       let cl := if chunked then 0 else (contentLength? m.buf head.headers).getD 0
       let count := m.messageCount + 1
-      if !chunked && cl > m.limits.maxBody then
+      if m.buffered && !chunked && cl > m.limits.maxBody then
         failBody m .bodyTooLarge
       else
         let bodyDone := !chunked && cl == 0

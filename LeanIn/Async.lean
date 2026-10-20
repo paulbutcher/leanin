@@ -801,7 +801,10 @@ private meta partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List 
 end
 
 /-- `async name (c : Conn) (x : T) … := do …` — lower the body to a state machine. -/
-elab "async " n:ident " (" c:ident " : " cty:term " )" params:bracketedBinder* " := " body:doSeq : command => do
+syntax (docComment)? "async " ident " (" ident " : " term " )" bracketedBinder* " := " doSeq : command
+
+elab_rules : command
+  | `($[$doc?:docComment]? async $n:ident ( $c:ident : $cty:term ) $params:bracketedBinder* := $body:doSeq) => do
   -- The threaded parameters (each `(x : T)`), with their signature types. The names are scope-erased: a
   -- `bracketedBinder` parameter and the body's references to it can carry different macro scopes (an
   -- inline-parsed parameter like the connection does not), which would leave a state field unresolvable.
@@ -852,6 +855,10 @@ elab "async " n:ident " (" c:ident " : " cty:term " )" params:bracketedBinder* "
   let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : $cty) $params* : IO Unit :=
     $stepn $(mkIdent c.getId) $s0app)
   Lean.Elab.Command.elabCommand runCmd
+  -- The declaration the comment sits above is the machine; `name` itself is only a prefix (`name.St`,
+  -- `name.step`, `name.run`). Attach the docstring to `name.run`, the callable entry.
+  if let some d := doc? then
+    Lean.Elab.Command.liftTermElabM <| Lean.addDocString runn.getId Syntax.missing d
   -- A spawner, when the machine is callable: its last parameter is the continuation `(α → IO Unit)`, so
   -- `Foo.spawn push …` schedules the machine as an executor item and hands back the completion cell as the
   -- handle. The payload type comes from that continuation's own domain; a machine whose last parameter has
