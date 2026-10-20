@@ -1079,7 +1079,7 @@ def runtimeHttp : IO UInt32 := do
   statusRef.set respHead.status
   -- Our handler: it records the thread it ran on and answers with the pinned head and body. `serveConn` awaits
   -- it inline, so the thread it reads is the carrier the connection runs on.
-  let handler : LeanIn.Examples.Http.Server.Handler := fun head => do
+  let handler : LeanIn.Examples.Http.Server.Handler := fun head _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids.modify (· ++ [tid]) : IO Unit)
     monadLift (methodRef.set (toString head.method) : IO Unit)
@@ -1231,7 +1231,7 @@ def runtimeHttpService : IO UInt32 := do
   let e1 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids1 ← IO.mkRef ([] : List UInt64)
   let handled1 ← IO.mkRef (0 : Nat)
-  let handler1 : LeanIn.Examples.Http.Server.Handler := fun _ => do
+  let handler1 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids1.modify (· ++ [tid]) : IO Unit)
     monadLift (handled1.modify (· + 1) : IO Unit)
@@ -1282,7 +1282,7 @@ def runtimeHttpService : IO UInt32 := do
   let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids2 ← IO.mkRef ([] : List UInt64)
   let cfg2 : LeanIn.Examples.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
-  let handler2 : LeanIn.Examples.Http.Server.Handler := fun _ => do
+  let handler2 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids2.modify (· ++ [tid]) : IO Unit)
     -- The suspension is the point: the raise reaches the driver from a *resumed* continuation, not from the
@@ -1331,7 +1331,7 @@ def runtimeHttpService : IO UInt32 := do
   let addr3 ← Runtime.Listener.sockName l3
   let e3 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids3 ← IO.mkRef ([] : List UInt64)
-  let handler3 : LeanIn.Examples.Http.Server.Handler := fun _ => return (respHead, pinnedBody)
+  let handler3 : LeanIn.Examples.Http.Server.Handler := fun _ _body => return (respHead, pinnedBody)
   for _ in List.range 3 do e3.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore3, _) ← e3.observe
   let hc ← Runtime.HarnessClock.new

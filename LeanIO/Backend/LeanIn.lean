@@ -70,17 +70,17 @@ def response (status : Nat) (reason : String) (body : ByteArray)
 An unknown method token is refused with 501 rather than dispatched. A path known under other methods answers 405
 with `Allow`; a miss goes to the trie's `notFound` handler or a 404. Middlewares are expected to be composed
 onto handlers before insertion, as in the upstream trie. -/
-def dispatch (trie : RouteTrie Handler) : Handler := fun h =>
+def dispatch (trie : RouteTrie Handler) : Handler := fun h body =>
   match method? h with
   | none => pure (response 501 "Not Implemented" "method not supported\n".toUTF8)
   | some m =>
     match trie.lookup m (segments h) with
-    | .found _ handler => handler h
+    | .found _ handler => handler h body
     | .methodMismatch allowed =>
       pure (response 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)])
     | .noMatch =>
       match trie.notFound with
-      | some handler => handler h
+      | some handler => handler h body
       | none => pure (response 404 "Not Found" "not found\n".toUTF8)
 
 /-- Serve `handler` on `port` with the given hooks (so an application can build handlers against the same live

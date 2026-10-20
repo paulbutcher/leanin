@@ -35,11 +35,11 @@ open LeanIn.Examples.Http
 
 /-- A request handler of ours: the parsed request head to the response head and its fully buffered body, in the
 `VM`. It may suspend, and its suspension is a suspension of the connection's machine. -/
-abbrev Handler := H1.Head → VM (H1.ResponseHead × ByteArray)
+abbrev Handler := H1.Head → ByteArray → VM (H1.ResponseHead × ByteArray)
 
 namespace Handler
 /-- Lift a pure handler to an async one: its computation is just `pure`, which `pump` answers inline. -/
-def ofPure (h : H1.Head → H1.ResponseHead × ByteArray) : Handler := fun head => pure (h head)
+def ofPure (h : H1.Head → H1.ResponseHead × ByteArray) : Handler := fun head _ => pure (h head)
 end Handler
 
 /-- **The driver's own configuration**: the protocol's limits, the clock the read deadline is read from, and the
@@ -79,7 +79,8 @@ structure Pump where
   stop    : Stop := .done
   machine : H1.Machine := {}
   out     : Array ByteArray := #[]
-  head?   : Option H1.Head := none
+  /-- A complete request whose handler suspends: the head and its buffered body. -/
+  req?    : Option (H1.Head × ByteArray) := none
 deriving Inhabited
 
 /-- The connection pump, pure: step the machine, accumulate the bytes it wants written, and stop at the first
@@ -89,14 +90,28 @@ private partial def pumpGo (handler : Handler) (m : H1.Machine) (acc : Array Byt
   else
     let (m', step) := H1.Machine.step m
     let acc := acc ++ step.output.data
-    match step.events.find? (fun e => match e with | .endHeaders _ => true | _ => false) with
-    | some (.endHeaders head) =>
-      match handler head with
-      | .pure (respHead, body) =>
-        pumpGo handler (H1.Machine.send m' respHead |>.sendData #[body] |>.userClosedBody) acc
-      | _ => { stop := .needHandler, machine := m', out := acc, head? := some head }
+    -- A rejected head (bad syntax, too many headers, a body past the limit) is answered and the connection
+    -- closed: the machine cannot return to a parseable state.
+    match step.events.find? (fun e => match e with | .failed _ => true | _ => false) with
+    | some (.failed e) =>
+      let (status, reason) : Nat × String := match e with
+        | .bodyTooLarge    => (413, "Payload Too Large")
+        | .headersTooLarge => (431, "Request Header Fields Too Large")
+        | .badRequest      => (400, "Bad Request")
+      -- The failed step halted the machine; clearing that here lets the error response be flushed (the
+      -- closing flag halts it again once the bytes are out).
+      pumpGo handler ({ m'.closeWithError status reason with halted := false }) acc
     | _ =>
-      if m'.halted then { stop := .done, machine := m', out := acc }
+      -- A request is dispatched only when its framing is complete: no body (`Content-Length: 0` at
+      -- `endHeaders`) or the whole body accumulated. Dispatch before the next head is parsed, or the
+      -- following request's bytes would be consumed as this one's body by a later `step`.
+      if m'.head?.isSome && m'.bodyRemaining == 0 then
+        let (head, body, m'') := m'.takeRequest
+        match handler head body with
+        | .pure (respHead, respBody) =>
+          pumpGo handler (m''.send respHead |>.sendData #[respBody] |>.userClosedBody) acc
+        | _ => { stop := .needHandler, machine := m'', out := acc, req? := some (head, body) }
+      else if m'.halted then { stop := .done, machine := m', out := acc }
       else if madeProgress step.output.size step.events then pumpGo handler m' acc
       else { stop := .needRead, machine := m', out := acc }
 
@@ -125,8 +140,10 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
         onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
       | .ok _ => pure ()
-    let head : H1.Head := r.head?.getD default
-    let answered := await (LeanIn.Runtime.VM.runAsync (VM.attempt (handler head)))
+    let req : H1.Head × ByteArray := r.req?.getD (default, .empty)
+    let head : H1.Head := req.1
+    let body : ByteArray := req.2
+    let answered := await (LeanIn.Runtime.VM.runAsync (VM.attempt (handler head body)))
     match answered with
     | .ok (respHead, body) =>
       let m := H1.Machine.send machine respHead |>.sendData #[body] |>.userClosedBody

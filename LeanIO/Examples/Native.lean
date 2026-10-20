@@ -25,17 +25,22 @@ namespace LeanIO.Examples.Native
 open LeanIn.Examples.Http
 
 def ping : Handler :=
-  fun _ => pure (LeanIO.Backend.LeanIn.response 200 "OK" "pong\n".toUTF8)
+  fun _ _body => pure (LeanIO.Backend.LeanIn.response 200 "OK" "pong\n".toUTF8)
 
 def slow (clock : LeanIn.Runtime.Clock) : Handler :=
-  fun _ => do
+  fun _ _body => do
     let _ ← LeanIn.Runtime.VM.sleep clock 200
     pure (LeanIO.Backend.LeanIn.response 200 "OK" "slept\n".toUTF8)
+
+/-- Echo the buffered request body, at whatever length the body delivered. -/
+def echo : Handler :=
+  fun _ body => pure (LeanIO.Backend.LeanIn.response 200 "OK" body)
 
 def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
   (RouteTrie.empty : RouteTrie Handler)
     |>.addRoute .get [Segment.lit "ping"] ping
     |>.addRoute .get [Segment.lit "slow"] (slow clock)
+    |>.addRoute .post [Segment.lit "echo"] echo
 
 end LeanIO.Examples.Native
 

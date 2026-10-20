@@ -109,6 +109,7 @@ instance : ToString Version := ⟨Version.toString⟩
 inductive HeadError where
   | badRequest
   | headersTooLarge
+  | bodyTooLarge
 deriving Inhabited, Repr, BEq
 
 /-- Limits on a parsed head. -/
@@ -117,6 +118,8 @@ structure Limits where
   maxHeaders : Nat := 100
   /-- The most messages one connection may serve before keep-alive is dropped. -/
   maxMessages : Nat := 100
+  /-- The most request-body bytes buffered before the request is rejected with 413. -/
+  maxBody : Nat := 1048576
 deriving Inhabited
 
 /-- The result of trying to parse a head from a buffer at a position. -/
@@ -303,6 +306,9 @@ structure Machine where
   pos : Nat := 0
   head? : Option Head := none
   bodyRemaining : Nat := 0
+  /-- The request body accumulated so far, up to `limits.maxBody`. The driver hands it to the handler with the
+  head once framing completes (`takeRequest`); this is buffered delivery, not streaming. -/
+  reqBody : ByteArray := .empty
   out : Array ByteArray := #[]
   keepAlive : Bool := true
   messageCount : Nat := 0
@@ -326,11 +332,15 @@ def step (m : Machine) : Machine × StepResult :=
   else if m.halted then (m, {})
   else if m.bodyRemaining > 0 then
     let avail := m.buf.size - m.pos
-    if avail ≥ m.bodyRemaining then
-      ({ m with pos := m.pos + m.bodyRemaining, bodyRemaining := 0, head? := none },
+    if avail == 0 then
+      (m, { events := #[.needMoreData] })
+    else if avail ≥ m.bodyRemaining then
+      ({ m with pos := m.pos + m.bodyRemaining, bodyRemaining := 0,
+                reqBody := m.reqBody ++ m.buf.extract m.pos (m.pos + m.bodyRemaining) },
        { events := #[.bodyChunk (m.buf.extract m.pos (m.pos + m.bodyRemaining))] })
     else
-      ({ m with pos := m.buf.size, bodyRemaining := m.bodyRemaining - avail, head? := none },
+      ({ m with pos := m.buf.size, bodyRemaining := m.bodyRemaining - avail,
+                reqBody := m.reqBody ++ m.buf.extract m.pos m.buf.size },
        { events := #[.bodyChunk (m.buf.extract m.pos m.buf.size)] })
   else
     match parseHead m.buf m.pos m.limits with
@@ -339,9 +349,20 @@ def step (m : Machine) : Machine × StepResult :=
     | .ok head rest =>
       let cl := (contentLength? m.buf head.headers).getD 0
       let count := m.messageCount + 1
-      ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
-                keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
-       { events := #[.endHeaders head] })
+      if cl > m.limits.maxBody then
+        ({ m with halted := true, err? := some .bodyTooLarge },
+         { events := #[.failed .bodyTooLarge] })
+      else
+        ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
+                  reqBody := .empty,
+                  keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
+         { events := #[.endHeaders head] })
+
+/-- Take the request when its framing is complete: the head, its buffered body, and the machine with both
+cleared so the next exchange starts fresh. A request with `Content-Length: 0` is complete at its `endHeaders`;
+one with a body is complete when `bodyRemaining` reaches zero. -/
+def takeRequest (m : Machine) : Head × ByteArray × Machine :=
+  ((m.head?.getD default), m.reqBody, { m with head? := none, reqBody := .empty })
 
 /-- Queue an encoded response head. The `Connection` directive on the wire is the machine's own disposition,
 reconciled with the handler's: a handler's `Connection: close` is honoured -- recorded here, so `userClosedBody`
