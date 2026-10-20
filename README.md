@@ -16,20 +16,18 @@ The concurrency engine is quite general but we have demonstrated it with an HTTP
 
 | shape | server | C=1 | C=8 | C=32 |
 |---|---|---|---|---|
-| depth 1 | Node 22 | 70 593 | 146 038 | 147 049 |
-| depth 1 | **leanin** | **66 040** | **150 736** | **132 916** |
-| depth 1 | shipped `Std.Http.Server` | 5 463 | 5 851 | 7 733 |
-| pipe 16 | Node 22 | 173 792 | 181 052 | 181 153 |
-| pipe 16 | **leanin** | **419 596** | **521 336** | **508 627** |
-| pipe 16 | shipped `Std.Http.Server` | 7 636 | 11 572 | 12 649 |
-| churn | Node 22 | 29 988 | 48 526 | 51 064 |
-| churn | **leanin** | 15 430 | 43 486 | 50 762 |
-| churn | shipped `Std.Http.Server` | 2 808 | 2 044 | 1 546 |
+| depth 1 | Node 22 | 70 729 | 124 145 | 112 915 |
+| depth 1 | **leanin** | **70 250** | **144 518** | **162 714** |
+| depth 1 | shipped `Std.Http.Server` | 5 592 | 5 499 | 7 321 |
+| pipe 16 | Node 22 | 169 492 | 148 022 | 141 954 |
+| pipe 16 | **leanin** | **352 966** | **432 545** | **456 357** |
+| pipe 16 | shipped `Std.Http.Server` | 7 495 | 11 782 | 11 622 |
+| churn | Node 22 | 29 054 | 35 442 | 39 942 |
+| churn | **leanin** | 15 310 | 35 961 | 42 521 |
+| churn | shipped `Std.Http.Server` | 2 611 | 2 212 | 1 500 |
 
-`C` is the number of concurrent connections; values are requests per second. Shapes: **depth 1** keeps one
-request in flight per connection, **pipe 16** keeps sixteen in flight, **churn** opens one connection per
-request. Measured on commit `41943fa` with one invocation of `bench/screen.sh` (the script landed in `7f27a27`);
-readings vary with host state. Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+Measured on commit `e55b7db` with one invocation of `bench/screen.sh`; readings vary with host state (load
+rose from ~2.6 to 7.4 during the run, after Node's rows were taken). Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 

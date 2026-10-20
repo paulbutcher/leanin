@@ -990,6 +990,37 @@ C=32; the close path drains the peer's end of stream before closing rather than 
 behaviour that removed the reset storm, and its cost shows here. Against the shipped server we are 5–12× ahead
 in d1, 22–40× in p16, and 5–33× in churn.
 
+**The raw registry moves to C (`e55b7db`).** The marking term was attacked at the ownership boundary rather
+than through indirection: the shim now holds one **owned Lean closure pointer** per `(connection, op)` in a
+C array behind the shim's own mutex, instead of a `Std.Mutex` holding a Lean `HashMap`. Storing a closure in a
+Lean reference — global or reached through one — marks it and its captures multi-threaded, which is what the
+publication control showed (22 984 vs 277 ns/iter), and then every exclusive update copies. A C pointer is not
+visible to that classification, the shim still never calls Lean, and the public raw operations keep a real lock;
+taking an entry transfers ownership back to Lean, and a withdrawn entry is dropped.
+
+Measured against `133aff1`: **47 970 Ir/request against 58 807 (−18.4 %)**, and paired, nine rounds per level,
+**1.121 at C=1 (IQR 1.103–1.127), 1.183 at C=8 (1.175–1.202), 1.400 at C=32 (1.354–1.416)**. SC19/20/23/24/27
+and BT1–3 pass, including SC24's exact stall instant; a 30 s mixed stress run at C=8 (keep-alive 177 690 rps,
+pipelined 484 298 rps, churn 42 096 rps) reports zero errors and the server stays healthy.
+
+The load-shape screen on `e55b7db` (one invocation; load rose from ~2.6 to 7.4 during it, after Node's rows):
+
+| shape | arm | C=1 | C=8 | C=32 |
+|---|---|---|---|---|
+| d1 | Node | 70 729 | 124 145 | 112 915 |
+| d1 | leanin | 70 250 | **144 518** | **162 714** |
+| d1 | shipped | 5 592 | 5 499 | 7 321 |
+| p16 | Node | 169 492 | 148 022 | 141 954 |
+| p16 | leanin | **352 966** | **432 545** | **456 357** |
+| p16 | shipped | 7 495 | 11 782 | 11 622 |
+| churn | Node | 29 054 | 35 442 | 39 942 |
+| churn | leanin | 15 310 | 35 961 | 42 521 |
+| churn | shipped | 2 611 | 2 212 | 1 500 |
+
+Depth-1 is at parity at C=1, **1.16× at C=8 and 1.44× at C=32**; pipelining is **2.1–3.2×**; churn is still
+0.53× at C=1 and 1.02–1.06× by C=8/C=32. The C=32 depth-1 figure is the one to re-check on a settled box: Node's
+rows were taken before the load rose, so the ordering is conservative rather than flattering.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
