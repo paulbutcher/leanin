@@ -16,18 +16,24 @@ The concurrency engine is quite general but we have demonstrated it with an HTTP
 
 | shape | server | C=1 | C=8 | C=32 |
 |---|---|---|---|---|
-| depth 1 | Node 22 | 70 729 | 124 145 | 112 915 |
-| depth 1 | **leanin** | **70 250** | **144 518** | **162 714** |
-| depth 1 | shipped `Std.Http.Server` | 5 592 | 5 499 | 7 321 |
-| pipe 16 | Node 22 | 169 492 | 148 022 | 141 954 |
-| pipe 16 | **leanin** | **352 966** | **432 545** | **456 357** |
-| pipe 16 | shipped `Std.Http.Server` | 7 495 | 11 782 | 11 622 |
-| churn | Node 22 | 29 054 | 35 442 | 39 942 |
-| churn | **leanin** | 15 310 | 35 961 | 42 521 |
-| churn | shipped `Std.Http.Server` | 2 611 | 2 212 | 1 500 |
+| depth 1 | Node 22 | 64 100 | 140 011 | 144 473 |
+| depth 1 | **leanin** | **62 568** | **147 791** | **126 481** |
+| depth 1 | shipped `Std.Http.Server` | 5 323 | 5 584 | 7 626 |
+| pipe 16 | Node 22 | 164 090 | 168 179 | 177 930 |
+| pipe 16 | **leanin** | **424 573** | **512 451** | **411 417** |
+| pipe 16 | shipped `Std.Http.Server` | 7 472 | 11 436 | 12 462 |
+| churn | Node 22 | 26 067 | 46 106 | 48 686 |
+| churn | **leanin** | 16 128 | 42 115 | 39 992 |
+| churn | shipped `Std.Http.Server` | 2 815 | 1 923 | 1 438 |
+| **depth 1** | **leanin / Node** | **0.98×** | **1.06×** | **0.88×** |
+| **pipe 16** | **leanin / Node** | **2.59×** | **3.05×** | **2.31×** |
+| **churn** | **leanin / Node** | **0.62×** | **0.91×** | **0.82×** |
 
-Measured on commit `e55b7db` with one invocation of `bench/screen.sh`; readings vary with host state (load
-rose from ~2.6 to 7.4 during the run, after Node's rows were taken). Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+`C` is the number of concurrent connections; values are requests per second. Shapes: **depth 1** keeps one
+request in flight per connection, **pipe 16** keeps sixteen in flight, **churn** opens one connection per
+request. Measured on commit `554e3b0` with one invocation of `bench/screen.sh`; host load rose from ~2.5 to 8.1
+during the run after Node's rows were taken, so the single readings and ratios are an illustration — the
+paired instrument is `bench/paired.sh`. Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
