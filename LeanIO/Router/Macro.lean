@@ -234,14 +234,15 @@ meta def expandNativeArrow (methodName : Name) (pat : TSyntax `str) (bs : Array 
   let handler ←
     match bs.toList with
     | [] =>
-      `(let fn (_ : Unit) : LeanIO.Backend.LeanIn.AppM Unit := $body
+      `(let fn (_ : Unit) : LeanIO.Backend.LeanIn.AppM Unit :=
+          LeanIO.Backend.LeanIn.runBody $body
         LeanIO.Backend.LeanIn.NativeExtractor.extract fn)
     | binders =>
-      let ascribedBody : Term := ← `(($body : LeanIO.Backend.LeanIn.AppM Unit))
       let lam ← binders.foldrM (fun b inner => do
         match b with
         | `(extractorBinder| ($pat:term : $ty:term)) => `(fun ($pat : $ty) => $inner)
-        | _ => Macro.throwErrorAt b "invalid extractor binder") ascribedBody
+        | _ => Macro.throwErrorAt b "invalid extractor binder")
+        (← `(LeanIO.Backend.LeanIn.runBody $body))
       `(let fn := $lam; LeanIO.Backend.LeanIn.NativeExtractor.extract fn)
   `({ method := $methodTerm, pattern := $patTerm, handler := $handler :
       LeanIO.Backend.LeanIn.NativeRoute })

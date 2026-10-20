@@ -138,6 +138,16 @@ st, _, body = get("/nuser/42")
 check("native path extractor", st.endswith("200 OK") and body == b"id=42\n", f"{st} {body!r}")
 st, _, body = post("/nform", "application/x-www-form-urlencoded", b"user=bob")
 check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", f"{st} {body!r}")
+# Stock-style response values and extractor binders under the unprefixed syntax.
+st, _, body = get("/dropin")
+check("dropin string", st.endswith("200 OK") and body == b"ok\n", f"{st} {body!r}")
+st, _, body = get("/dropin-status")
+check("dropin status tuple", st.endswith("201 Created") and body == b"made\n", f"{st} {body!r}")
+st, _, body = get("/dropin/7")
+check("dropin path extractor", st.endswith("200 OK") and body == b"id=7\n", f"{st} {body!r}")
+st, _, body = post("/dropin-json", "application/json", b'{"title":"dropin","done":true}')
+check("dropin json value", st.endswith("200 OK") and b'"title":"dropin"' in body, f"{st} {body!r}")
+
 st, _, body = get("/nping-option")
 check("option-selected syntax", st.endswith("200 OK") and body == b"option-native\n", f"{st} {body!r}")
 

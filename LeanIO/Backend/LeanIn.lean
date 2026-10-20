@@ -425,6 +425,71 @@ instance : FromRequestPartsM Std.Http.URI.Query where
     | some q => .ok q
     | none => .error (400, "malformed query")
 
+/-- A response value in the native backend, mirroring `LeanIO.IntoResponse`: the value a route body returns
+rather than writing the writer by hand. -/
+class IntoResponseM (α : Type) where
+  write : α → AppM Unit
+
+/-- Run a route body and write whatever response value it returned. -/
+def runResponse {α : Type} [IntoResponseM α] (m : AppM α) : AppM Unit := do
+  IntoResponseM.write (← m)
+
+instance : IntoResponseM Unit where
+  write _ := pure ()
+
+instance : IntoResponseM String where
+  write text :=
+    AppM.respond 200 "OK" text.toUTF8 #[("Content-Type", "text/plain; charset=utf-8")]
+
+instance : IntoResponseM ByteArray where
+  write bytes :=
+    AppM.respond 200 "OK" bytes #[("Content-Type", "application/octet-stream")]
+
+instance : IntoResponseM IO.Error where
+  write e := AppM.respond 500 "Internal Server Error" (toString e).toUTF8
+
+instance : IntoResponseM Std.Http.Status where
+  write status :=
+    AppM.respond status.toCode.toNat (status.reasonPhrase) .empty
+
+instance : IntoResponseM (Std.Http.Status × String) where
+  write p :=
+    let (status, text) := p
+    AppM.respond status.toCode.toNat status.reasonPhrase text.toUTF8
+      #[("Content-Type", "text/plain; charset=utf-8")]
+
+instance [Lean.ToJson α] : IntoResponseM (Std.Http.Status × α) where
+  write p :=
+    let (status, value) := p
+    AppM.respond status.toCode.toNat status.reasonPhrase
+      (Lean.toJson value).compress.toUTF8 #[("Content-Type", "application/json")]
+
+instance [IntoResponseM ε] [IntoResponseM α] : IntoResponseM (Except ε α) where
+  write
+    | .ok a => IntoResponseM.write a
+    | .error e => IntoResponseM.write e
+
+instance : IntoResponseM (H1.ResponseHead × ByteArray) where
+  write p := fun env => do
+    let (head, body) := p
+    env.writer.start head
+    env.writer.write body
+    env.writer.finish
+
+/-- A route body in the native backend: either a response value or an `AppM` computation. This is what lets
+the unprefixed route syntax keep LeanIO's `=> "text"` and `=> do …` forms. -/
+class RunBody (F : Type) where
+  runBody : F → AppM Unit
+
+instance [IntoResponseM R] : RunBody R where
+  runBody r := IntoResponseM.write r
+
+instance [IntoResponseM R] : RunBody (AppM R) where
+  runBody m := runResponse m
+
+/-- Apply a route body's response conversion. -/
+def runBody {F : Type} [RunBody F] (f : F) : AppM Unit := RunBody.runBody f
+
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where
   extractParts : Fn → Handler

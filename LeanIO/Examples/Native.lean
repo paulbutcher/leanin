@@ -114,6 +114,19 @@ def nform : LeanIO.Backend.LeanIn.NativeRoute :=
 section
 set_option leanio.backend.native true
 
+/-- Stock-style response values: plain string, status tuples, extractor binders and JSON. -/
+def dropinText : LeanIO.Backend.LeanIn.NativeRoute :=
+  GET "/dropin" => "ok\n"
+
+def dropinStatus : LeanIO.Backend.LeanIn.NativeRoute :=
+  GET "/dropin-status" => (Std.Http.Status.created, "made\n")
+
+def dropinPath : LeanIO.Backend.LeanIn.NativeRoute :=
+  GET "/dropin/{id}" (id : LeanIO.Path Nat) => (Std.Http.Status.ok, s!"id={id.value}\n")
+
+def dropinJson : LeanIO.Backend.LeanIn.NativeRoute :=
+  POST "/dropin-json" (t : LeanIO.Json Todo) => (Std.Http.Status.ok, t.body)
+
 /-- The same route syntax with no backend prefix: `set_option leanio.backend.native true` selects the native
 backend for this scope. -/
 def npingOption : LeanIO.Backend.LeanIn.NativeRoute :=
@@ -199,6 +212,10 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add nuser
     |>.add nform
     |>.add npingOption
+    |>.add dropinText
+    |>.add dropinStatus
+    |>.add dropinPath
+    |>.add dropinJson
     |>.add ntodo
     |>.route .get "/boom" (boom clock)
     |>.route .get "/logged" (LeanIO.Backend.LeanIn.requestLogger "req" ping)

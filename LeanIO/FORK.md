@@ -12,7 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
-| 2026-10-20 | `Backend.LeanIn`: native `FromRequestBodyM` for `Form`/`ByteArray`; `FromRequestPartsM` for `Path` and `URI.Query` | the native route syntax can use the body and parts binder forms, not only JSON/text |
+| 2026-10-20 | `Backend.LeanIn`: `IntoResponseM`/`RunBody`, so stock-style route bodies (`=> "text"`, status tuples, JSON values, `Except`, `ResponseHead × ByteArray`) work on the native backend; native `FromRequestBodyM` for `Form`/`ByteArray`; `FromRequestPartsM` for `Path` and `URI.Query` | the native route syntax can use the body and parts binder forms, not only JSON/text |
 | 2026-10-20 | `MultiPartForm` parameterised over `BodySource m body` (defaults `ContextAsync`/`Body.Stream`); native `BodySource VM BodyReader`; `readUntilGo` extracts from the read's start position | one upstream multipart parser serves both backends; the cursor fix makes headers split across reads parse correctly |
 
 ## Port status
@@ -49,10 +49,16 @@ declared `Content-Length`, chunked on HTTP/1.1, or close-delimited.
 
 Route selection shares the route-declaration form. The unprefixed `GET … => …` selects the stock backend by
 default and the native backend under `set_option leanio.backend.native true`; `native GET … => …` selects the
-native backend regardless of the option. A native body is an `AppM` computation (request and writer in the
-environment) and binders read through the native extractor classes: bodies `Json α`, `PlainText`, `Form α` and
-`ByteArray`; parts `Path α` (from `FromPath` or `FromString`) and `URI.Query`. `nativeRoute GET "/ping" ping`
-takes an already-built handler.
+native backend regardless of the option. Under the native backend a body may be an `AppM` computation or a
+response value, as in LeanIO: `=> "text"`, `=> Status.created`, `=> (Status.ok, value)` (text or JSON),
+`=> (status × headers × value)`, `ByteArray`, `Except`, or `ResponseHead × ByteArray`; `RunBody` chooses the
+value or computation form. Binders read through the native extractor classes: bodies `Json α`, `PlainText`,
+`Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`) and `URI.Query`.
+`nativeRoute GET "/ping" ping` takes an already-built handler.
+
+Remaining non-drop-in surfaces: a raw `(req : Request Body.Stream)` binder, stock middleware values typed at
+`HandlerFn`, and the stock streaming request/response API are stock-typed and do not apply to a native handler;
+native routes use the backend's `Request`/`ResponseWriter` and `Middleware := Handler → Handler`.
 
 Multipart is the upstream parser parameterised over its body source: `BodySource m body` with defaults
 `ContextAsync`/`Body.Stream` keeps the stock API unchanged, and the native backend adds
