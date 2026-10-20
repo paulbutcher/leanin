@@ -198,14 +198,18 @@ block showed sixteen sleeps completing in 51 ms, and its own control reported th
 accepted a blocking-shaped order. The claim is "no start comes after the first wake", which is what the detector
 now tests.
 
-**What is left behind, stated.** A `withTimeout` that returns because its computation finished leaves its timer
-pending until it fires: one parked task, and nothing else. Cancelling it needs a handle on the timer — the
+**What is left behind, stated.** A `withTimeout` that returns because its computation finished leaves the timer's
+cancelled wheel entry pending until its deadline is reaped: an inert scheduled fire, not a parked task. Cancelling that entry needs a handle — the
 `IO.Promise` and `Task` seam is where one would come from — and an operation that drops scheduled work, which
 `Runtime.cancel` now is (W5). What is still missing is the timer's half, so a pending fire is still the loser's
-write to ignore rather than a cancellation to make. What is *not* left untested is the loser's write:
-`firstWins` and `lateTimerIgnored` in SC8's record are the first-writer law itself, the second of them with the
-timer genuinely firing after the winner wrote — and the loud `resolve` in either position would raise out of the
-driver instead, so reaching the record at all is part of that evidence.
+write to ignore rather than a cancellation to make. The computation's half is no longer open: when the deadline
+wins, `withTimeout` cancels the spawned computation's own handle, so the steps it had queued are skipped rather
+than run — and that is the `Task.Async` computation only, not an already-submitted raw read or write and not an
+operation already executing on a blocking or foreign thread
+([`tests/timeout-cancel-contract.md`](../tests/timeout-cancel-contract.md) TC1). What is *not* left untested is
+the loser's write: `firstWins` and `lateTimerIgnored` in SC8's record are the first-writer law itself, the second
+of them with the timer genuinely firing after the winner wrote — and the loud `resolve` in either position would
+raise out of the driver instead, so reaching the record at all is part of that evidence.
 
 **The comparison, and what it is against.** Sixteen 50 ms sleeps cost 51 ms on one carrier against **100 ms** for
 the same sixteen sleeps run *concurrently* on the stock pool, one `IO.asTask` each — **1.9×, and it is one thread
@@ -899,9 +903,9 @@ the registry's core is confirmed rather than refuted — what fails is a stale f
 before it is a switch cost.
 
 What the next attempt needs, therefore, is a **handle**: `sleep` returns `Task.Async Unit`, which carries no
-cancellation, and `withTimeout` keeps no handle on either of its arms today, so the interface must grow one. The
-call sites that move are `Runtime.sleep` and `withTimeout` in `Runtime/Time.lean` — not `Clock.live` alone. Do not
-transcribe the registry again without it.
+cancellation, and `withTimeout` kept no handle on either of its arms at that point, so the interface had to grow
+one. The call sites that move are `Runtime.sleep` and `withTimeout` in `Runtime/Time.lean` — not `Clock.live`
+alone. Do not transcribe the registry again without it.
 
 ### The timing wheel: a list, a pump, and the shape that landed
 
@@ -923,13 +927,13 @@ stale was a hang, not a saving, and the unreferenced `uv_async_t` keeps the wake
 open.
 
 **The wheel is ordered, because the loop parks until the next deadline.** A flat list was the throughput bug:
-`withTimeout` never cancels its loser, so thousands of 12 s deadlines accumulate, and the loop's two per-iteration
-readings — the earliest deadline for the park timeout, the timers already due — each cost O(n). The wheel is a
-`Std.TreeMap Nat (Array WheelTimer)`: insertion is one `insert` per drained timer, the park timeout is a
-`minKey?`, firing is a pop-while-due, all O(log n), so the accumulated losers no longer inflate an iteration. A
-hashed wheel was the alternative and the wrong fit here: it answers "what fires this tick" in O(1) but not "what
-is the earliest deadline," which is the reading a park-until-next loop actually makes, and the slot bit-map and
-cascading it needs are more machinery for the same result.
+`withTimeout` leaves each deadline in the wheel, so thousands of 12 s deadlines accumulate, and the loop's two
+per-iteration readings — the earliest deadline for the park timeout, the timers already due — each cost O(n).
+The wheel is a `Std.TreeMap Nat (Array WheelTimer)`: insertion is one `insert` per drained timer, the park
+timeout is a `minKey?`, firing is a pop-while-due, all O(log n), so the accumulated losers no longer inflate an
+iteration. A hashed wheel was the alternative and the wrong fit here: it answers "what fires this tick" in O(1)
+but not "what is the earliest deadline," which is the reading a park-until-next loop actually makes, and the slot
+bit-map and cascading it needs are more machinery for the same result.
 
 **The stop has to retire the loop, not restart it.** The shim's `uv_loop` is created on demand, so a naive stop
 leaves the next `run_once` to build a fresh loop for a leftover timer and park on it — a shutdown that hangs on
@@ -946,8 +950,8 @@ note prescribed growing a handle and changing `withTimeout`'s interface, on the 
 the stale fire and the loser's cost. The landed shape answers both without it. The stale fire is a correctness
 bug, and the token settles it: the fire checks `isSet` and is inert, so a winning read's loser never resumes an
 already-completed computation. The loser's cost is a throughput question, and the ordered map settles that: the
-loser stays in the wheel until its own deadline — the deferred `withTimeout` cancellation decision (D20),
-unchanged here — but it is a relic the map absorbs at O(log n) rather than a scan the flat list paid O(n) for.
+loser stays in the wheel until its own deadline — the deferred timer-entry cancellation (D20), unchanged here —
+but it is a relic the map absorbs at O(log n) rather than a scan the flat list paid O(n) for.
 So the interface grew nothing, and `Runtime.sleep`/`withTimeout` in `Runtime/Time.lean` did not move.
 
 **Gate discipline for these.** Bound each scenario at 600 s and no less — SC18 legitimately needs ~124 s on this

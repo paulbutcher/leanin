@@ -176,7 +176,11 @@ On client disconnect, cancellation, or shutdown, specify what happens to:
   backpressure and a producer parked behind a slow peer are still outstanding.)*
 - Multipart parser state and file handles. *(Outstanding.)*
 - Child authentication/backend requests. *(Outstanding: no child cancellation.)*
-- Queued writes and late completions. *(Outstanding; `withTimeout` still does not cancel its loser.)*
+- Queued writes and late completions. *(Partly: `withTimeout` cancels the `Task.Async` computation whose deadline
+  won — its token is set, so steps it had queued are skipped at `Item.fire` and it runs nothing further. That is
+  not a withdrawal of an already-submitted raw read or write, and it does not preempt an operation already
+  executing on a blocking or foreign thread: those finish, and the race's first writer stands. Cancelling them is
+  outstanding.)*
 
 Every terminating handler/producer must have an observable outcome. Do not inherit the current compiled-machine possibility of ending a path without resolving its completion handle. *(For a cancelled streaming request that is now the case: the request scope resolves the driver's await with an `aborted` outcome, the driver closes the connection and reports the transport error, so nothing stays parked — HC1 observes the connection complete and the service answering again. Buffered handlers and producers are unchanged.)*
 

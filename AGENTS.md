@@ -73,6 +73,17 @@
   read); exit 1 is the scenario's own assertion. Both come out green on the
   tree that carries the abort channel, and `nix develop -c bash tests/http-stream.sh`
   plus `nix develop -c bash tests/leanio-native.sh` stay the HTTP regressions.
+- The timeout cancellation contract is `tests/timeout-cancel-contract.md`
+  with `tests/timeout-cancel-contract.sh`: run
+  `nix develop -c bash tests/timeout-cancel-contract.sh TC1`. It drives its
+  own `lake exe controls --runtime-time-loser` mode — one carrier, fresh
+  `HarnessClock`s, no live clock, no socket — and reads the executable's
+  `timeoutLoser|` record for the computation whose `withTimeout` deadline
+  won. The recorder's `after` action is run and the same detector reads the
+  marker while it is present before the loser is read for its absence, and
+  eight record near misses are rejected by that detector in the same
+  invocation. Exit 2 is a setup failure (build, an absent or repeated
+  record, a false affirmative control); exit 1 is the scenario's own Then.
 - In each scenario name the actor, an external boundary and the
   observable outcome. Stage data and record actual actions where
   they happen; bind compared values to their record's named fields,

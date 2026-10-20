@@ -1158,8 +1158,8 @@ Same client and mode as the 7.98 row above (`load.mjs`, keep-alive, one connecti
 🟢 on every row, and the gate holds at 22/22. The 2.6× throughput is mostly the seam, not the switches: taking
 the ~99 µs `awaitAsync` bridge off the read's critical path is what moves p50 from 162 µs to 63 µs, and at one
 connection the throughput follows the latency. The switch figure is with the losers accumulating — `withTimeout`
-never cancels its loser (D20), so thousands of 12 s deadlines stay in the wheel through a run — and it is the
-ordered map that keeps that cheap: the loop's two per-iteration readings, the earliest deadline for the park
+leaves each deadline in the wheel (D20), so thousands of 12 s entries accumulated in the measured run — and it is
+the ordered map that keeps that cheap: the loop's two per-iteration readings, the earliest deadline for the park
 timeout and the timers already due, are O(log n) where a flat list paid O(n) for the same pair, which is what
 halved an earlier flat-list attempt's throughput (3 809 req/s) and doubled its p50 (240 µs). The thread that
 parked only for timers is gone from the switch attribution entirely.

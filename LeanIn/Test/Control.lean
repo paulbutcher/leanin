@@ -1372,15 +1372,15 @@ def runtimeHttpService : IO UInt32 := do
   let pendingAfter3 ← Runtime.HarnessClock.pending hc
   let tids3 ← srvTids3.get
   let distinct3 := distinctOf tids3
-  -- **Drive once more, then read.** `Runtime.withTimeout` never cancels its loser, so the read arm the
-  -- deadline beat is still a step of this executor after the peer's run has returned: the peer's socket
-  -- closing completes that read on the loop's own thread, which enqueues the losing arm's continuation here
-  -- and nothing takes it. Wait for that one step (a bounded live-time wait, because the socket's completion
-  -- lands after the run returns rather than during it) and fire it, so what this clause reads below is the
-  -- queue *after* the leftover has run. Firing it performs the losing arm's own tail — a `resolveFirst` the
-  -- race has already decided — and enqueues nothing; a step the run had dropped that was *not* this loser
-  -- would still be held afterwards, and a step that resumed the connection loop would write to the wire and
-  -- queue again.
+  -- **Drive once more, then read.** A deadline that wins sets the `Task.Async` computation token, so the
+  -- loser's later steps are skipped; an already-submitted raw peer read is not withdrawn, though, and can
+  -- still complete after the peer's run, enqueueing the stamped continuation here as an item nothing else
+  -- takes. Wait for that one item (a bounded live-time wait, because the socket's completion lands after the
+  -- run returns rather than during it) and fire it, so what this clause reads below is the queue *after* the
+  -- leftover has been taken. `Item.fire` sees the cancelled token and skips its action, so no residual
+  -- executor work remains: not a claim that the raw I/O registration or operation is cancelled, nor that
+  -- another item's behaviour changes. A dropped step that was *not* this loser would still be held
+  -- afterwards, and a step that resumed the connection loop would write to the wire and queue again.
   let driveStart ← IO.monoNanosNow
   let mut leftover? ← e3.takeFor 0
   while leftover?.isNone && (← IO.monoNanosNow) - driveStart < 200000000 do
@@ -1983,6 +1983,54 @@ def executorRoute (bound : Nat) : IO UInt32 := do
   (← IO.getStdout).flush
   return 0
 
+/-- **The timeout's loser, on harness clocks only.**
+
+A computation spawned under a deadline at virtual instant 10 records that it started, sleeps to instant 30, and
+would record that it resumed; the root stays live to instant 50, so the loser's own wake has the run rather than
+waiting behind the root. `after=false` at instant 50 is the claim — the loser recorded nothing after its wake
+because the deadline that won stopped it. `start=true` says the same recorder saw the loser begin, which is a
+control for that recorder rather than for the `after` detector.
+
+The `after` detector's affirmative control is the same action, executed for real on a separate harness clock:
+`recordAfter` appends `"after"`, a virtual sleep runs it on a clean clock, and the same `List.contains` reads
+that marker through the same event reference before the reference is cleared for the losing run. The two
+readings differ only in whether the action ran, so an absent marker is about the loser and not about a detector
+that cannot fire. Nothing here reads a live clock, sleeps for real or touches the loop.
+
+Diagnostic: `lake exe controls --runtime-time-loser`; the same record is the last row of `--runtime-time`. -/
+def timeoutLoserObservation : IO Unit := do
+  let events ← IO.mkRef ([] : List String)
+  let recordAfter : LeanIn.Task.Async Unit :=
+    LeanIn.Task.Async.ofIO (events.modify (· ++ ["after"]) : IO Unit)
+  -- The detector's affirmative control, on its own clock: the same action, the same reference, the same read.
+  let hcControl ← Runtime.HarnessClock.new
+  let cControl := Runtime.HarnessClock.clock hcControl
+  let eControl ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let _ ← Runtime.runVirtual hcControl eControl (do
+    Runtime.sleep cControl 5
+    recordAfter)
+  let afterDetectedWhenPresent := (← events.get).contains "after"
+  events.set []
+  -- The losing run: the deadline wins at instant 10, the loser sleeps to instant 30 and takes the same action
+  -- after it, and the root stays live past the loser's wake.
+  let hcLoser ← Runtime.HarnessClock.new
+  let cLoser := Runtime.HarnessClock.clock hcLoser
+  let eLoser ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let loser : LeanIn.Task.Async Unit := do
+    events.modify (· ++ ["start"])
+    Runtime.sleep cLoser 30
+    recordAfter
+  let outcome ← Runtime.runVirtual hcLoser eLoser (do
+    let outcome ← Runtime.withTimeout cLoser 10 loser
+    Runtime.sleep cLoser 40
+    pure outcome)
+  let advanced ← Runtime.HarnessClock.now hcLoser
+  let recorded ← events.get
+  let started := recorded.contains "start"
+  let after := recorded.contains "after"
+  let outcomeStr := match outcome with | none => "none" | some _ => "some"
+  IO.println s!"timeoutLoser|outcome={outcomeStr}|start={started}|after={after}|advanced={advanced}|afterDetectedWhenPresent={afterDetectedWhenPresent}"
+
 /-- **W3's evidence: timers on our carriers.**
 
 `n` sleepers and one late spawn, with the *order* of the events doing the work a clock would otherwise be asked
@@ -1993,6 +2041,10 @@ wake is a start" *is* the overlap, read from the recorded order and not from ela
 outcomes are deterministic for the same reason: one inner computation never finishes and must time out, the
 other finishes immediately and must not. The measured row is printed and never asserted, for the reason the
 socket check gives.
+
+The last record is the timeout's other half, read from harness clocks rather than from elapsed time:
+`timeoutLoserObservation` runs the loser and its detector's affirmative control, and prints the same record the
+dedicated `--runtime-time-loser` mode prints.
 
 Diagnostic: `lake exe controls --runtime-time`. -/
 def runtimeTime : IO UInt32 := do
@@ -2070,7 +2122,84 @@ def runtimeTime : IO UInt32 := do
   IO.println s!"time|sleepers={n}|overlap={overlap}|lateBeforeWake={lateBeforeWake}|wakes={wakes}|timeoutHit={hitStr}|timeoutMiss={missStr}|firstWins={firstStr}|lateTimerIgnored={lateStr}|sleepUs={(t1 - t0) / 1000}"
   IO.println s!"timebase|stockPoolSleepUs={(t3 - t2) / 1000}|serialSleepUs={(t5 - t4) / 1000}"
   IO.println s!"timectl|blockingOrderOverlaps={blockingOrderOverlaps}|missingWakeWakes={missingWakeWakes}"
+  -- The timeout's other half, read only through harness clocks; the record is the same one the dedicated
+  -- `--runtime-time-loser` mode prints.
+  timeoutLoserObservation
   return 0
+
+/-- **The timeout's loser alone, with no live clock in the process.**
+
+The dedicated mode for the timeout-cancellation behaviour check: it prints the `timeoutLoser|` record and runs
+nothing else — no live clock, no real sleep, no socket, no metered W3 work — so a reading from it cannot be
+attributed to the live half of `--runtime-time`.
+
+Diagnostic: `lake exe controls --runtime-time-loser`. -/
+def runtimeTimeLoser : IO UInt32 := do
+  timeoutLoserObservation
+  return 0
+
+/-- **A deadline that fires from inside the computation it times out.**
+
+The deadline is armed at virtual instant 10 before the child's first step is taken, and the child advances the
+harness clock *while it is executing*: the fire runs on the child's own step, cancels the child's handle and
+resolves the outer cell with `none`, and only then does the child return. Cancellation is therefore the first
+writer to the child's handle, and the ordinary completion path that follows it is the second — so completing a
+cancelled child must keep the first outcome, and the public timeout must return `none` rather than failing the
+driver the run goes through.
+
+`observeFailure` is the detector for a failure escaping the run. It is invoked on a deliberately thrown
+`IO.Error` first, in the same invocation, so `failureDetectedWhenPresent=true` says the detector sees an escaped
+failure at all; the overlap run is then read through that already-fired detector. The remaining fields are what
+the child itself did: that it started, that advancing the clock from inside it actually fired the armed
+deadline (`HarnessClock.advance` reports whether it had a pending timer to run), and that it returned.
+`harnessAt=10` is the harness clock's own reading afterwards. The failure text is not classified, only its
+presence.
+
+Nothing here reads a live clock, sleeps for real or touches the loop: one carrier and one `HarnessClock`,
+advanced by the child's own step.
+
+Diagnostic: `lake exe controls`. -/
+def controlTimeoutOverlap : IO Unit := do
+  let observeFailure {α : Type} (act : IO α) : IO (Except IO.Error α) := do
+    try
+      return .ok (← act)
+    catch e =>
+      return .error e
+  -- The detector's affirmative control, ahead of the reading it is a detector for.
+  let sentinel := IO.userError "timeout overlap control: deliberate sentinel"
+  let failureDetectedWhenPresent := match ← observeFailure (throw sentinel : IO Unit) with
+    | .error _ => true
+    | .ok _    => false
+  let childStarted ← IO.mkRef false
+  let timerAdvancedFromChild ← IO.mkRef false
+  let childReturned ← IO.mkRef false
+  let hc ← Runtime.HarnessClock.new
+  let clock := Runtime.HarnessClock.clock hc
+  let e ← Sched.Executor.new LeanIn.Task.Item 256 1
+  let child : LeanIn.Task.Async Unit := do
+    childStarted.set true
+    -- Armed at instant 10 by the `withTimeout` below, and fired from inside the computation it times out.
+    let advanced ← Runtime.HarnessClock.advance hc
+    timerAdvancedFromChild.set advanced
+    childReturned.set true
+  let observed ← observeFailure (Runtime.runVirtual hc e (Runtime.withTimeout clock 10 child))
+  let started ← childStarted.get
+  let advancedFromChild ← timerAdvancedFromChild.get
+  let returned ← childReturned.get
+  let harnessAt ← Runtime.HarnessClock.now hc
+  let outcomeStr := match observed with
+    | .error _      => "error"
+    | .ok none      => "none"
+    | .ok (some ()) => "some"
+  let record := s!"timeoutOverlap|childStarted={started}|timerAdvancedFromChild={advancedFromChild}|childReturned={returned}|harnessAt={harnessAt}|outcome={outcomeStr}|failureDetectedWhenPresent={failureDetectedWhenPresent}"
+  IO.println record
+  (← IO.getStdout).flush
+  unless failureDetectedWhenPresent do
+    throw (IO.userError s!"timeout overlap control: the failure detector missed a deliberately thrown error ({record})")
+  unless started && advancedFromChild && returned && harnessAt == 10 do
+    throw (IO.userError s!"timeout overlap control: the child did not advance the armed deadline from its own step and return at instant 10 ({record})")
+  unless outcomeStr == "none" do
+    throw (IO.userError s!"timeout overlap control: the deadline's first-wins outcome was not none ({record})")
 
 /-- **The error channel, isolated.**
 
@@ -5280,6 +5409,7 @@ def runMode (args : List String) : IO UInt32 := do
   | "--runtime-http-service" :: _ => return ← runtimeHttpService
   | "--runtime-machine-time" :: _ => return ← runtimeMachineTime
   | "--runtime-time" :: _ => return ← runtimeTime
+  | "--runtime-time-loser" :: _ => return ← runtimeTimeLoser
   | "--runtime-connect" :: _ => return ← runtimeConnect
   | "--runtime-drain" :: _ => return ← runtimeDrain
   | "--runtime-cancel" :: _ => return ← runtimeCancel
@@ -5311,6 +5441,7 @@ def runMode (args : List String) : IO UInt32 := do
   controlNotifyLost 200
   controlPredicateRecheck 200
   controlVMAbort
+  controlTimeoutOverlap
   let _ ← controlMutualExclusion 4 500000
   IO.println ""
   IO.println "  done"

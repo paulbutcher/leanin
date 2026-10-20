@@ -1030,19 +1030,27 @@ with the usual 500 and its `toString` body.
 alive indefinitely: the total time to a complete head is unbounded. (ii) The bound is on reads, not on a handler
 or on `accept`: a handler that never returns is unbounded — cancellation is W5's and W7's item — and the accept
 leaf belongs to the accept loop. D23's abort covers only the peer's own I/O failure, not an arbitrary parked
-handler. (iii) `withTimeout` does not cancel its loser, and it leaves a relic on
-**either** side. When the read wins, the timer stays pending until it fires with nobody waiting: one timer
+handler. (iii) `withTimeout` cancels the `Task.Async` computation when the deadline wins, and it leaves a relic
+on **either** side. The cancellation stops that computation's own steps: the deadline's fire sets its token, so a
+step the loser had queued is skipped at `Item.fire` rather than run. It is **not** a withdrawal of an
+already-submitted raw read or write, and it does not preempt an operation already executing on a blocking or
+foreign thread: those finish, and the race's first writer still stands because both arms resolve through
+`Join.resolveFirst`. When the read wins, the timer stays pending until it fires with nobody waiting: one timer
 registration per read that won, which the SC20 records read as `pendingHooks` 3 in the keep-alive clause (its two
 request reads and the end-of-stream read), 1 in the failure clause (its single request read), and 0 in the
 stalled clause, whose read lost. When the **timer** wins, the losing read arm is left as its own queued step —
 one held item, identified by that arm's cancel token, appearing as that arm's socket registration finishes after
 the run returns, and consumed by the next drive, which takes the count from 1 to 0 with no timer, no
-registration and no second step. It is the race's loss and not connection work: nothing the connection owed is
+registration and no second step. That token is set by the time the item is taken, so firing it runs nothing and
+the `resolveFirst` it would have made is never reached; the item's presence is the relic, not work. It is the
+race's loss and not connection work: nothing the connection owed is
 left unrun. **Because both are the race's relics and not this driver's behaviour, no scenario asserts a leftover
 count**: `pendingHooks` is printed in all three SC20 records and asserted in none; `inFlightAfter == 0` is
 asserted in the two clauses whose read won, and in the stalled clause after the drive that consumes the losing
-arm; and `pendingAfter == 0` is asserted only where the timer itself resolved the read. Cancelling the loser is
-W5's and W7's subject and is not done here: it would change the timer machinery rather than the driver.
+arm; and `pendingAfter == 0` is asserted only where the timer itself resolved the read. Removing the timer's
+wheel entry rather than letting it fire inert is the timer machinery's own remainder
+([`tokio-workplan.md`](tokio-workplan.md)'s W3 debt), not this driver's; cancelling the losing computation is
+`Runtime/Time.lean`'s and is done there (`tests/timeout-cancel-contract.md` TC1).
 (iv) A failed *socket* operation still ends the connection past
 `Conn.shutdown`; the handler-failure path no longer reaches that short-circuit, because the failure is answered
 inside the loop. On the streaming path a failed send is now an abort (D23) too, and it closes the connection the
@@ -1244,7 +1252,7 @@ ______________________________________________________________________
 ## Open
 
 No decision is open: D19's residual is closed by D22, and D23 is this register's last entry. The limits those
-records leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s uncancelled
-loser on either side, the second measurement condition as D21 reads it, the harness clock's single-advancer
-convention as D22 reads it, and D23's request scope limited to peer I/O on the streaming path — are stated in
-their own entries rather than here.
+records leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s inert wheel
+entry when its computation wins and the skipped step it leaves queued when its deadline wins, the second
+measurement condition as D21 reads it, the harness clock's single-advancer convention as D22 reads it, and D23's
+request scope limited to peer I/O on the streaming path — are stated in their own entries rather than here.

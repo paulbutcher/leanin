@@ -1516,9 +1516,12 @@ response with one byte appended, a client on the server thread, a task left in f
 with one byte appended, a response whose `\r\n` was rewritten to `\n`, a task left in flight; for O3 a run that never
 reached the stated instant, a client that read a byte, a client that gave up first, a timer left outstanding.
 
-**The two leftovers, and why no clause asserts the count of them.** `Runtime.withTimeout` never cancels its loser,
-on either side, and this milestone does not change that: cancelling a raced loser is a cancellation decision over
-`Runtime/Time.lean` — a primitive's own item, and one that would make these clauses assert the timer machinery
+**The two leftovers, and why no clause asserts the count of them.** `Runtime.withTimeout` cancels the `Task.Async`
+computation when the deadline wins: the loser's token is set, so a later step of it is skipped rather than run.
+That does not withdraw a read already submitted to the socket, nor preempt an operation already executing, so a
+leftover exists because the race left it, not because the loser was cancelled. A winning computation leaves the
+timer's own wheel entry registered until the deadline reaps it; removing it eagerly is a separate deferral over
+`Runtime/Time.lean`'s timer machinery, and asserting either leftover would make these clauses assert that
 rather than the driver. What the race leaves is a relic on whichever side lost, and the records read it:
 
 - **Where the read won, the timer stays registered.** A `withTimeout` whose read won leaves its sleep arm's timer
@@ -1535,7 +1538,8 @@ rather than the driver. What the race leaves is a relic on whichever side lost, 
   arm's — and nothing takes it, because the run has already returned. That queued step is what `inFlightAfter` reads
   as 1 while it is there. The mode now waits for one queued step past the run (bounded in live time, because that
   socket completion lands after the run returns) and fires it before reading, so the value this clause asserts is 0;
-  firing it runs the losing arm's own tail — a `resolveFirst` the race has already decided — and enqueues nothing.
+  firing it finds the loser's token already set — the deadline's cancellation — so it runs nothing and enqueues
+  nothing.
 - **What that establishes, and the guard it keeps.** The step left behind is the race's loser and not live
   connection work: it is attributed to the losing arm's own token, the connection loop's own continuation is a
   different computation — the connection body's token — which has already been consumed, and firing the leftover
