@@ -1,5 +1,6 @@
 import LeanIO.Router.Macro
 import LeanIO.Backend.LeanIn
+import LeanIO.Backend.LeanIn.Middlewares
 
 /-!
 # `leanioNative` — the first native LeanIn-backed LeanIO server
@@ -142,6 +143,24 @@ def countStream (f : LeanIO.FormFile LeanIn.Runtime.VM LeanIn.Examples.Http.Serv
   f.stream fun chunk => monadLift (r.modify (· + chunk.size) : IO Unit)
   monadLift (r.get : IO Nat)
 
+/-- Extension middleware demo: the value inserted by `withExtension`. -/
+structure Meta where
+  value : String
+deriving TypeName
+
+def extensionDemo : Handler :=
+  fun req w => do
+    match req.extensions.get Meta with
+    | some m => LeanIO.Backend.LeanIn.respond w 200 "OK" s!"meta={m.value}\n".toUTF8
+    | none => LeanIO.Backend.LeanIn.respond w 500 "Internal Server Error" "missing extension".toUTF8
+
+/-- Basic auth with the native middleware; validator runs in `VM`. -/
+def authDemo : LeanIO.Backend.LeanIn.Middlewares.AuthConfig :=
+  .basic fun user pass => pure (user == "admin" && pass.value == "secret")
+
+def secureDemo : Handler :=
+  fun _ w => LeanIO.Backend.LeanIn.respond w 200 "OK" "secret-area\n".toUTF8
+
 /-- The upstream multipart API on the native reader: each entry is a field or a `FormFile`. -/
 partial def uploadWalk (mp : LeanIO.MultiPartForm LeanIn.Runtime.VM LeanIn.Examples.Http.Server.BodyReader)
     (i : Nat) (acc : String) : LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
@@ -216,6 +235,9 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinStatus
     |>.add dropinPath
     |>.add dropinJson
+    |>.route .get "/ext" extensionDemo
+    |>.routeWith .get "/auth" secureDemo #[LeanIO.Backend.LeanIn.Middlewares.auth authDemo]
+    |>.addMiddleware (LeanIO.Backend.LeanIn.Middlewares.withExtension Meta { value := "hello" })
     |>.add ntodo
     |>.route .get "/boom" (boom clock)
     |>.route .get "/logged" (LeanIO.Backend.LeanIn.requestLogger "req" ping)

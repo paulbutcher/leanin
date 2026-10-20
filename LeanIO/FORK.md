@@ -12,6 +12,7 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
 | 2026-10-20 | `Router.Macro`: route syntax is an elaborator; `leanio.backend.native` option; `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | the unprefixed route syntax selects a backend by option, and streaming request and response bodies |
+| 2026-10-20 | `Backend.LeanIn.Middlewares`: `catchErrors`, `requestLogger`, `withExtension`, `auth` over the native handler; native `Request` carries typed extensions | the built-in middleware is usable natively with the stock names/parameters; only custom HandlerFn middleware remains a source change |
 | 2026-10-20 | `Backend.LeanIn`: `IntoResponseM`/`RunBody`, so stock-style route bodies (`=> "text"`, status tuples, JSON values, `Except`, `ResponseHead × ByteArray`) work on the native backend; native `FromRequestBodyM` for `Form`/`ByteArray`; `FromRequestPartsM` for `Path` and `URI.Query` | the native route syntax can use the body and parts binder forms, not only JSON/text |
 | 2026-10-20 | `MultiPartForm` parameterised over `BodySource m body` (defaults `ContextAsync`/`Body.Stream`); native `BodySource VM BodyReader`; `readUntilGo` extracts from the read's start position | one upstream multipart parser serves both backends; the cursor fix makes headers split across reads parse correctly |
 
@@ -27,7 +28,7 @@ The fork's backend has been moved onto LeanIn for the native path:
 | extraction | JSON, plain text and URL-encoded form over the buffered body (415/400/422), reusing LeanIO's MIME declarations, query parser and `FromForm` |
 | request | path parameters captured by the trie, query string/parameter decoding, headers, media type; `withExtract` composes an extractor with a handler; `Middleware := Handler → Handler` |
 | suspension | handlers are `VM` values; `GET /slow` parks 200 ms while a sibling request completes |
-| middleware | `Handler → Handler`; `catchErrors` uses `VM.attempt`, whose catch survives a suspension (`/boom` parks then raises, answered 500) and whose 500 body is the error's `toString`, and `requestLogger` observes and passes through |
+| middleware | `Handler → Handler`; `LeanIO.Backend.LeanIn.Middlewares` ports the four built-ins (`catchErrors`, `requestLogger`, `withExtension`, `auth`) with the same names/parameters, validators in `VM Bool`, and typed request extensions. `catchErrors` uses `VM.attempt`, whose catch survives a suspension (`/boom` parks then raises, answered 500) and whose 500 body is the error's `toString` |
 | cancellation | a request's own transport failure — a failed body read, a stall, a peer close mid-body, a failed response send — is a typed VM abort, not a catchable raise: the streaming driver's request scope turns it into an `aborted` outcome, the driver closes the connection and reports the transport error, and attempts no further 500 or keep-alive; bytes already sent are not retracted, so no claim of zero written bytes is made |
 | checks | `tests/leanio-native.sh` asserts routing, middleware, suspensions, bodies, keep-alive, methods and extraction statuses at the public socket; `tests/http-cancel-contract.sh HC1` and `HC2` assert the cancellation and the prefixed ordinary error at that socket |
 
@@ -56,9 +57,10 @@ value or computation form. Binders read through the native extractor classes: bo
 `Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`) and `URI.Query`.
 `nativeRoute GET "/ping" ping` takes an already-built handler.
 
-Remaining non-drop-in surfaces: a raw `(req : Request Body.Stream)` binder, stock middleware values typed at
-`HandlerFn`, and the stock streaming request/response API are stock-typed and do not apply to a native handler;
-native routes use the backend's `Request`/`ResponseWriter` and `Middleware := Handler → Handler`.
+Remaining non-drop-in surfaces: a raw `(req : Request Body.Stream)` binder, custom middleware written against
+the stock `HandlerFn`/`ContextAsync` pair (the built-ins have native equivalents with the same names and
+parameters), and the stock streaming request/response API. Native routes use the backend's
+`Request`/`ResponseWriter` and `Middleware := Handler → Handler`; `Request` carries typed extensions.
 
 Multipart is the upstream parser parameterised over its body source: `BodySource m body` with defaults
 `ContextAsync`/`Body.Stream` keeps the stock API unchanged, and the native backend adds

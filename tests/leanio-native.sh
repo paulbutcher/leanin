@@ -138,6 +138,16 @@ st, _, body = get("/nuser/42")
 check("native path extractor", st.endswith("200 OK") and body == b"id=42\n", f"{st} {body!r}")
 st, _, body = post("/nform", "application/x-www-form-urlencoded", b"user=bob")
 check("native form extractor", st.endswith("200 OK") and body == b"user=bob\n", f"{st} {body!r}")
+# Native middleware: extensions, basic auth statuses.
+st, _, body = get("/ext")
+check("extension middleware", st.endswith("200 OK") and body == b"meta=hello\n", f"{st} {body!r}")
+st, _, _ = get("/auth")
+check("auth missing header", st.endswith("401 Unauthorized"), st)
+st, _, _ = request(b"GET /auth HTTP/1.1\r\nHost: x\r\nAuthorization: Basic YWRtaW46d3Jvbmc=\r\n\r\n")
+check("auth wrong password", st.endswith("403 Forbidden"), st)
+st, _, body = request(b"GET /auth HTTP/1.1\r\nHost: x\r\nAuthorization: Basic YWRtaW46c2VjcmV0\r\n\r\n")
+check("auth success", st.endswith("200 OK") and body == b"secret-area\n", f"{st} {body!r}")
+
 # Stock-style response values and extractor binders under the unprefixed syntax.
 st, _, body = get("/dropin")
 check("dropin string", st.endswith("200 OK") and body == b"ok\n", f"{st} {body!r}")

@@ -51,6 +51,9 @@ structure Request where
   head : H1.Head
   body : LeanIn.Examples.Http.Server.BodyReader
   params : List (String × String) := []
+  /-- Request extensions, as in LeanIO's `Request`: middleware can insert typed values and a handler can read
+  them back with `Extensions.get`. -/
+  extensions : Std.Http.Extensions := .empty
 
 /-- A native handler: the request and the response writer, so a response need not be accumulated. -/
 abbrev Handler := Request → LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
