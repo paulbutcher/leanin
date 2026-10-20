@@ -103,6 +103,36 @@ st, _, body = read_response(s)
 check("keep-alive after body", st.endswith("200 OK") and body == b"next", f"{st} {body!r}")
 s.close()
 
+# Chunked request framing: two chunks plus a trailer, delivered across several reads.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.settimeout(5)
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+time.sleep(0.05)
+s.sendall(b"5\r\nhello\r\n")
+time.sleep(0.05)
+s.sendall(b"6\r\n world\r\n0\r\nX-Trailer: y\r\n\r\n")
+st, head, body = read_response(s)
+check("chunked body", st.endswith("200 OK") and body == b"hello world", f"{st} {body!r}")
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+st, _, body = read_response(s)
+check("chunked keep-alive", st.endswith("200 OK") and body == b"abc", f"{st} {body!r}")
+s.close()
+
+# A chunk size past the body limit is refused before its data arrives.
+st, _, _ = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n200000\r\n")
+check("oversized chunked", st.endswith("413 Payload Too Large"), st)
+
+# Expect: 100-continue gets the interim response before the body is sent.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.settimeout(5)
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+st, _, body = read_response(s)
+check("100 continue", st.endswith("100 Continue") and body == b"", f"{st} {body!r}")
+s.sendall(b"hello")
+st, _, body = read_response(s)
+check("body after continue", st.endswith("200 OK") and body == b"hello", f"{st} {body!r}")
+s.close()
+
 # HEAD is served by the GET handler with the body dropped and Content-Length: 0.
 st, head, body = request(b"HEAD /ping HTTP/1.1\r\nHost: x\r\n\r\n")
 check("HEAD from GET", st.endswith("200 OK") and body == b"" and b"content-length: 0" in head.lower(),

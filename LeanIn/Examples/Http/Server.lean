@@ -60,8 +60,12 @@ structure Config where
 /-- Whether a step got anywhere: it wrote bytes, or handled an event other than `needMoreData`, which the
 machine re-emits on every starved step. The loop reads only when this is false, so no iteration can return to
 the same machine state without writing or reading. -/
-def madeProgress (encoded : Nat) (events : Array H1.Event) : Bool :=
-  encoded > 0 || events.any fun e => match e with
+def madeProgress (before after : H1.Machine) (encoded : Nat) (events : Array H1.Event) : Bool :=
+  encoded > 0 ||
+  before.pos != after.pos ||
+  before.chunkState != after.chunkState ||
+  before.bodyDone != after.bodyDone ||
+  events.any fun e => match e with
     | .needMoreData => false
     | _ => true
 
@@ -109,14 +113,14 @@ private partial def pumpGo (handler : Handler) (m : H1.Machine) (acc : Array Byt
       -- A request is dispatched only when its framing is complete: no body (`Content-Length: 0` at
       -- `endHeaders`) or the whole body accumulated. Dispatch before the next head is parsed, or the
       -- following request's bytes would be consumed as this one's body by a later `step`.
-      if m'.head?.isSome && m'.bodyRemaining == 0 then
+      if m'.head?.isSome && m'.bodyDone then
         let (head, body, m'') := m'.takeRequest
         match handler head body with
         | .pure (respHead, respBody) =>
           pumpGo handler (m''.send respHead |>.sendData #[respBody] |>.userClosedBody) acc
         | _ => { stop := .needHandler, machine := m'', out := acc, req? := some (head, body) }
       else if m'.halted then { stop := .done, machine := m', out := acc }
-      else if madeProgress step.output.size step.events then pumpGo handler m' acc
+      else if madeProgress m m' step.output.size step.events then pumpGo handler m' acc
       else { stop := .needRead, machine := m', out := acc }
 
 /-- The pump from a fresh accumulator. -/

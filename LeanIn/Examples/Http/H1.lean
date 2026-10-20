@@ -116,6 +116,20 @@ inductive HeadError where
   | bodyTooLarge
 deriving Inhabited, Repr, BEq
 
+/-- Where the decoder is in a chunked request body. -/
+inductive ChunkState where
+  /-- Waiting for a chunk-size line (hex, optionally followed by extensions). -/
+  | sizeLine
+  /-- Inside a chunk with this many bytes still to come. -/
+  | data (remaining : Nat)
+  /-- The CRLF that ends a chunk's data. -/
+  | dataCRLF
+  /-- After the zero-size chunk: trailer lines until the terminating blank line. -/
+  | trailers
+  /-- Terminated. -/
+  | done
+deriving Inhabited, Repr, BEq
+
 /-- Limits on a parsed head. -/
 structure Limits where
   /-- The most header lines accepted before the head is rejected. -/
@@ -293,6 +307,42 @@ def contentLength? (buf : ByteArray) (headers : Array (Slice × Slice)) : Option
         return if any then some acc else none
     else none
 
+/-- Hex value of one ASCII digit, `none` if it is not one. -/
+def hexDigit (c : UInt8) : Option Nat :=
+  if c ≥ 0x30 && c ≤ 0x39 then some (c - 0x30).toNat
+  else if c ≥ 0x61 && c ≤ 0x66 then some ((c - 0x61).toNat + 10)
+  else if c ≥ 0x41 && c ≤ 0x46 then some ((c - 0x41).toNat + 10)
+  else none
+
+/-- Parse a chunk-size line `[start, stop)`: hex digits, then optional chunk extensions (`;…`) or OWS. -/
+def chunkSize? (buf : ByteArray) (start stop : Nat) : Option Nat := Id.run do
+  let mut acc := 0
+  let mut any := false
+  for i in [start:stop] do
+    let c := buf.get! i
+    if c == 0x3B then break                                     -- chunk extension: ignore the rest
+    match hexDigit c with
+    | some d => acc := acc * 16 + d; any := true
+    | none => if c == 0x20 || c == 0x09 then break else return none
+  return if any then some acc else none
+
+/-- Whether `Transfer-Encoding` makes `chunked` the final coding. -/
+def chunked? (head : Head) : Bool :=
+  match head.headerValue? "transfer-encoding".toUTF8 with
+  | none => false
+  | some v =>
+    let toks := v.splitOn "," |>.map (fun t => t.trimAscii.toString.toLower) |>.filter (fun t => !t.isEmpty)
+    toks.getLast? == some "chunked"
+
+/-- Whether the request asks the server to send `100 Continue` before its body. -/
+def expectsContinue (head : Head) : Bool :=
+  match head.headerValue? "expect".toUTF8 with
+  | none => false
+  | some v => (v.splitOn ",").any fun t => t.trimAscii.toString.toLower == "100-continue"
+
+/-- The interim response for `Expect: 100-continue`. -/
+def continueBytes : ByteArray := "HTTP/1.1 100 Continue\r\n\r\n".toUTF8
+
 /-- Whether the request asks for the connection to be closed (HTTP/1.0 defaults to close). -/
 def wantsClose (buf : ByteArray) (head : Head) : Bool :=
   let connName := "connection".toUTF8
@@ -309,7 +359,12 @@ structure Machine where
   buf : ByteArray := .empty
   pos : Nat := 0
   head? : Option Head := none
+  /-- Bytes left in a `Content-Length` body. -/
   bodyRemaining : Nat := 0
+  /-- The chunked decoder's position, when the request uses `Transfer-Encoding: chunked`. -/
+  chunkState : Option ChunkState := none
+  /-- Whether the current request's body has been fully received. True when it has no body. -/
+  bodyDone : Bool := true
   /-- The request body accumulated so far, up to `limits.maxBody`. The driver hands it to the handler with the
   head once framing completes (`takeRequest`); this is buffered delivery, not streaming. -/
   reqBody : ByteArray := .empty
@@ -328,37 +383,94 @@ def feed (m : Machine) (bs : ByteArray) : Machine :=
   if m.pos ≥ m.buf.size then { m with buf := bs, pos := 0 }
   else { m with buf := m.buf ++ bs }
 
+/-- Reject a body that is malformed or exceeds `maxBody`, and stop the connection. -/
+def failBody (m : Machine) (e : HeadError) : Machine × StepResult :=
+  ({ m with halted := true, err? := some e }, { events := #[.failed e] })
+
+/-- Consume a `Content-Length` body fragment. -/
+def stepFixed (m : Machine) : Machine × StepResult :=
+  let avail := m.buf.size - m.pos
+  if avail == 0 then (m, { events := #[.needMoreData] })
+  else
+    let n := min avail m.bodyRemaining
+    let chunk := m.buf.extract m.pos (m.pos + n)
+    let done := n == m.bodyRemaining
+    ({ m with pos := m.pos + n, bodyRemaining := m.bodyRemaining - n,
+              reqBody := m.reqBody ++ chunk, bodyDone := done },
+     { events := #[.bodyChunk chunk] })
+
+/-- Consume a chunked body fragment: size line, data, terminating CRLF, then trailers. Each `step` consumes what
+is available and asks for more when it runs out, so a chunk split across reads is decoded in stages. -/
+partial def stepChunked (m : Machine) (st : ChunkState) : Machine × StepResult :=
+  match st with
+  | .sizeLine =>
+    match findLF m.buf m.pos with
+    | none => (m, { events := #[.needMoreData] })
+    | some nl =>
+      let lineStop := if nl > m.pos && m.buf.get! (nl - 1) == 0x0D then nl - 1 else nl
+      match chunkSize? m.buf m.pos lineStop with
+      | none => failBody m .badRequest
+      | some 0 => ({ m with pos := nl + 1, chunkState := some .trailers }, {})
+      | some n =>
+        if m.reqBody.size + n > m.limits.maxBody then failBody m .bodyTooLarge
+        else ({ m with pos := nl + 1, chunkState := some (.data n) }, {})
+  | .data remaining =>
+    let avail := m.buf.size - m.pos
+    if avail == 0 then (m, { events := #[.needMoreData] })
+    else
+      let n := min avail remaining
+      let chunk := m.buf.extract m.pos (m.pos + n)
+      let st := if n == remaining then .dataCRLF else .data (remaining - n)
+      ({ m with pos := m.pos + n, reqBody := m.reqBody ++ chunk, chunkState := some st },
+       { events := #[.bodyChunk chunk] })
+  | .dataCRLF =>
+    let avail := m.buf.size - m.pos
+    if avail == 0 then (m, { events := #[.needMoreData] })
+    else
+      let c0 := m.buf.get! m.pos
+      if c0 == 0x0D then
+        if avail < 2 then (m, { events := #[.needMoreData] })
+        else if m.buf.get! (m.pos + 1) == 0x0A then
+          ({ m with pos := m.pos + 2, chunkState := some .sizeLine }, {})
+        else failBody m .badRequest
+      else if c0 == 0x0A then ({ m with pos := m.pos + 1, chunkState := some .sizeLine }, {})
+      else failBody m .badRequest
+  | .trailers =>
+    match findLF m.buf m.pos with
+    | none => (m, { events := #[.needMoreData] })
+    | some nl =>
+      let lineStop := if nl > m.pos && m.buf.get! (nl - 1) == 0x0D then nl - 1 else nl
+      if lineStop == m.pos then
+        ({ m with pos := nl + 1, chunkState := some .done, bodyDone := true }, {})
+      else ({ m with pos := nl + 1 }, {})                       -- trailer field: consumed, not surfaced
+  | .done => ({ m with bodyDone := true }, {})
+
 /-- One step: flush queued output, else finish if halted, else consume the body, else try to parse a head. -/
 def step (m : Machine) : Machine × StepResult :=
   if m.out.size > 0 then
     let m' := if m.closing then { m with out := #[], halted := true } else { m with out := #[] }
     (m', { output := { data := m.out } })
   else if m.halted then (m, {})
-  else if m.bodyRemaining > 0 then
-    let avail := m.buf.size - m.pos
-    if avail == 0 then
-      (m, { events := #[.needMoreData] })
-    else if avail ≥ m.bodyRemaining then
-      ({ m with pos := m.pos + m.bodyRemaining, bodyRemaining := 0,
-                reqBody := m.reqBody ++ m.buf.extract m.pos (m.pos + m.bodyRemaining) },
-       { events := #[.bodyChunk (m.buf.extract m.pos (m.pos + m.bodyRemaining))] })
-    else
-      ({ m with pos := m.buf.size, bodyRemaining := m.bodyRemaining - avail,
-                reqBody := m.reqBody ++ m.buf.extract m.pos m.buf.size },
-       { events := #[.bodyChunk (m.buf.extract m.pos m.buf.size)] })
+  else if m.head?.isSome && !m.bodyDone then
+    match m.chunkState with
+    | some st => stepChunked m st
+    | none => stepFixed m
   else
     match parseHead m.buf m.pos m.limits with
     | .incomplete => (m, { events := #[.needMoreData] })
     | .failed e => ({ m with halted := true, err? := some e }, { events := #[.failed e] })
     | .ok head rest =>
-      let cl := (contentLength? m.buf head.headers).getD 0
+      let chunked := chunked? head
+      let cl := if chunked then 0 else (contentLength? m.buf head.headers).getD 0
       let count := m.messageCount + 1
-      if cl > m.limits.maxBody then
-        ({ m with halted := true, err? := some .bodyTooLarge },
-         { events := #[.failed .bodyTooLarge] })
+      if !chunked && cl > m.limits.maxBody then
+        failBody m .bodyTooLarge
       else
+        let bodyDone := !chunked && cl == 0
+        let interim := if expectsContinue head && !bodyDone then m.out.push continueBytes else m.out
         ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
-                  reqBody := .empty,
+                  chunkState := if chunked then some .sizeLine else none, bodyDone,
+                  reqBody := .empty, out := interim,
                   keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
          { events := #[.endHeaders head] })
 
@@ -366,7 +478,8 @@ def step (m : Machine) : Machine × StepResult :=
 cleared so the next exchange starts fresh. A request with `Content-Length: 0` is complete at its `endHeaders`;
 one with a body is complete when `bodyRemaining` reaches zero. -/
 def takeRequest (m : Machine) : Head × ByteArray × Machine :=
-  ((m.head?.getD default), m.reqBody, { m with head? := none, reqBody := .empty })
+  ((m.head?.getD default), m.reqBody,
+   { m with head? := none, reqBody := .empty, bodyRemaining := 0, chunkState := none, bodyDone := true })
 
 /-- Queue an encoded response head. The `Connection` directive on the wire is the machine's own disposition,
 reconciled with the handler's: a handler's `Connection: close` is honoured -- recorded here, so `userClosedBody`
@@ -397,7 +510,7 @@ def sendData (m : Machine) (chunks : Array ByteArray) : Machine :=
 /-- The handler has finished the body: keep the connection alive, or close it -- the close halts once the
 queued answer has been flushed, not before, so the answer is not dropped. -/
 def userClosedBody (m : Machine) : Machine :=
-  if m.keepAlive then { m with head? := none, bodyRemaining := 0 }
+  if m.keepAlive then { m with head? := none, bodyRemaining := 0, chunkState := none, bodyDone := true }
   else if m.out.size > 0 then { m with closing := true }
   else { m with halted := true }
 
