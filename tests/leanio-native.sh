@@ -210,6 +210,10 @@ check("range file 416", st.endswith("416 Range Not Satisfiable"), st)
 st, _, body = get("/query?page=3&size=25")
 check("derived query", st.endswith("200 OK") and body == b"page=3 size=25\n", f"{st} {body!r}")
 
+# Remote address.
+st, _, body = get("/remote")
+check("remote address", st.endswith("200 OK") and body.startswith(b"127.0.0.1:"), f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

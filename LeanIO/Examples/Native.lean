@@ -227,6 +227,11 @@ def queryDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/query" (q : LeanIO.Query PageParams) =>
     (Std.Http.Status.ok, s!"page={q.value.page} size={q.value.size}\n")
 
+/-- The client's remote address. -/
+def remoteDemo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/remote" (ra : Std.Http.Server.RemoteAddr) =>
+    (Std.Http.Status.ok, s!"{ra.addr}\n")
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -314,6 +319,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add rangeFileDemo
     |>.add cachedDemo
     |>.add queryDemo
+    |>.add remoteDemo
     |>.add rangeDemo
     |>.route .get "/cleanup" cleanupDemo
     |>.route .get "/child" childDemo

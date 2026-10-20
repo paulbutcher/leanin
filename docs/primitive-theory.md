@@ -251,3 +251,10 @@ reach stays the only one and D7's register is unchanged. `#print axioms` is unch
 theorem — the
 handle's critical-section claim and the counters' consistency are stated and argued in D18, not proved here. The
 finding is again D13's: a new mechanism over already-registered primitives adds a design, not a primitive.
+
+
+## Peer address lookup
+
+`np_uv_peer_ipv4`/`np_uv_peer_port` call `uv_tcp_getpeername` on the shim's connection handle, synchronously on
+the caller's thread; they allocate nothing and touch no Lean state, and a refused lookup returns `(0,0)` which
+the backend reports as an unavailable remote address. They are the only primitive `Request.RemoteAddr` uses.

@@ -229,6 +229,19 @@ private def flagGet (r : Std.Mutex Bool) : IO Bool := r.atomically do pure (← 
 /-- Set a cross-thread flag under its lock, so the release is visible to the thread that polls it. -/
 private def flagSet (r : Std.Mutex Bool) (b : Bool) : IO Unit := r.atomically do set b
 
+/-- The peer's IPv4 address, packed into the low 32 bits; 0 when unavailable. -/
+@[extern "np_uv_peer_ipv4"] opaque npUvPeerIpv4 (idx : UInt32) : IO UInt32
+/-- The peer's port; 0 when unavailable. -/
+@[extern "np_uv_peer_port"] opaque npUvPeerPort (idx : UInt32) : IO UInt32
+
+/-- The peer's socket address, when the shim can read it. -/
+def peerAddr (c : Conn) : IO (Option Std.Net.SocketAddress) := do
+  let ip ← npUvPeerIpv4 c.idx
+  let port ← npUvPeerPort c.idx
+  if ip == 0 && port == 0 then return none
+  let oct (shift : UInt32) : UInt8 := ((ip >>> shift) &&& 0xFF).toUInt8
+  return some (.v4 ⟨⟨#v[oct 24, oct 16, oct 8, oct 0]⟩, port.toUInt16⟩)
+
 namespace Io
 
 /-- The running loop's connection table, if a listener is bound: `startListener` replaces it, and `Io.stop`

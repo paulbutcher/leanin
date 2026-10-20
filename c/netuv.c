@@ -58,6 +58,7 @@
 #include <lean/lean.h>
 #include <uv.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -855,6 +856,30 @@ LEAN_EXPORT lean_object *np_uv_stop(void) {
     if (g_async_up) uv_async_send(&g_async);   /* end the poll the loop thread is parked in */
   }
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+/* The peer's address, for the request's RemoteAddr. The IPv4 address is returned as four octets packed in the
+ * low 32 bits (network order) so Lean builds the SocketAddress without parsing, and the port separately. A
+ * missing or refused lookup is (0, 0), which Lean reports as unavailable. */
+static int peer_addr(uint32_t idx, struct sockaddr_storage *ss, socklen_t *len) {
+  if (idx >= MAX_CONN || !g_conns[idx].used) return 0;
+  *len = sizeof(*ss);
+  return uv_tcp_getpeername(&g_conns[idx].handle, (struct sockaddr *)ss, len) == 0;
+}
+
+LEAN_EXPORT lean_object *np_uv_peer_ipv4(uint32_t idx) {
+  struct sockaddr_storage ss; socklen_t len;
+  if (!peer_addr(idx, &ss, &len) || ss.ss_family != AF_INET)
+    return lean_io_result_mk_ok(lean_box(0));
+  uint32_t ip = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+  return lean_io_result_mk_ok(lean_box_uint32(ip));
+}
+
+LEAN_EXPORT lean_object *np_uv_peer_port(uint32_t idx) {
+  struct sockaddr_storage ss; socklen_t len;
+  if (!peer_addr(idx, &ss, &len) || ss.ss_family != AF_INET)
+    return lean_io_result_mk_ok(lean_box(0));
+  return lean_io_result_mk_ok(lean_box_uint32(ntohs(((struct sockaddr_in *)&ss)->sin_port)));
 }
 
 LEAN_EXPORT lean_object *np_uv_err_name(uint32_t code) {

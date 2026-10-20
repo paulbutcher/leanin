@@ -74,6 +74,8 @@ structure Request where
   extensions : Std.Http.Extensions := .empty
   /-- The request scope, when dispatched through the backend. -/
   scope : Option Scope := none
+  /-- The peer's address, when the connection's shim can supply it. -/
+  peer : Option Std.Net.SocketAddress := none
 
 /-- A native handler: the request and the response writer, so a response need not be accumulated. -/
 abbrev Handler := Request → LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
@@ -754,6 +756,13 @@ instance : FromRequestPartsM LeanIO.HeaderRange where
     | some range => .ok { ranges := LeanIO.parseRange range }
     | none => .ok { ranges := none }
 
+/-- The client's remote address, when the shim could read it. -/
+instance : FromRequestPartsM Std.Http.Server.RemoteAddr where
+  readParts r :=
+    match r.peer with
+    | some addr => .ok { addr }
+    | none => .error (500, "remote address not available")
+
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where
   extractParts : Fn → Handler
@@ -863,20 +872,20 @@ def dispatch (trie : RouteTrie Handler) : CoreHandler := fun head body w =>
   | none => respond w 501 "Not Implemented" "method not supported\n".toUTF8
   | some m =>
     match trie.lookup m (pathSegments head) with
-    | .found params handler => runScoped handler { head, body, params } w
+    | .found params handler => runScoped handler { head, body, params, peer := body.peer } w
     | .methodMismatch allowed =>
       -- LeanIO serves HEAD from the GET handler and drops the body; the response declares
       -- `Content-Length: 0` rather than the length the body would have had, because declaring a length it
       -- will not send would strand the client. This matches the upstream trie's documented behaviour.
       if m == .head && allowed.contains .get then
         match trie.lookup .get (pathSegments head) with
-        | .found params handler => runScoped handler { head, body, params } (discardBody w)
+        | .found params handler => runScoped handler { head, body, params, peer := body.peer } (discardBody w)
         | _ => respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
       else
         respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
     | .noMatch =>
       match trie.notFound with
-      | some handler => runScoped handler { head, body } w
+      | some handler => runScoped handler { head, body, peer := body.peer } w
       | none => respond w 404 "Not Found" "not found\n".toUTF8
 
 /-- Serve `handler` on `port` with the given hooks (so an application can build handlers against the same live

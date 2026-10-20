@@ -3,6 +3,7 @@ module
 public import Std.Http.Data
 public import LeanIn.Examples.Http.H1
 public import LeanIn.Runtime.Net
+public import LeanIn.Runtime.Io
 public import LeanIn.Runtime.Clock
 public import LeanIn.Runtime.Time
 public import LeanIn.Runtime.VM
@@ -260,6 +261,8 @@ structure BodyReader where
   drained : VM Bool
   /-- Bytes after the body: the machine resumes from these when the connection is reused. -/
   leftover : VM ByteArray
+  /-- The peer's address, when the shim can read it. -/
+  peer : Option Std.Net.SocketAddress := none
 
 namespace BodyReader
 
@@ -415,7 +418,9 @@ def bodyReader (head : H1.Head) (initial : ByteArray) (c : Conn) (clock : Clock)
                        remaining := if chunked then none else some cl
                        chunk := if chunked then some .sizeLine else none
                        done := !chunked && cl == 0 } : BodyState)
+  let peer ← LeanIn.Runtime.peerAddr c
   return {
+    peer
     recv := fun n => recvSome st c clock stall n
     drained := (do
       let s ← (liftGet st)
