@@ -55,7 +55,7 @@ native backend regardless of the option. Under the native backend a body may be 
 response value, as in LeanIO: `=> "text"`, `=> Status.created`, `=> (Status.ok, value)` (text or JSON),
 `=> (status × headers × value)`, `ByteArray`, `Except`, or `ResponseHead × ByteArray`; `RunBody` chooses the
 value or computation form. Binders read through the native extractor classes: bodies `Json α`, `PlainText`,
-`Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`), `URI.Query`, and Std `Method`,
+`Form α`, `ByteArray`; parts `Path α` (from `FromPath` or `FromString`), `URI.Query`, `RequestTarget`, `URI.Path`, and Std `Method`,
 `Version` and `Headers`. Native `Request` also exposes a stock-shaped `line : Std.Http.Request.Head`, so
 middleware/handlers reading `req.line.method/uri/headers` need no accessor changes.
 `nativeRoute GET "/ping" ping` takes an already-built handler.

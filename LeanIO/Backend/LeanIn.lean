@@ -547,6 +547,14 @@ instance : FromRequestPartsM Std.Http.Headers where
       acc.insert! name value) Std.Http.Headers.empty
     .ok hs
 
+/-- The request target as Std's request-target type. -/
+instance : FromRequestPartsM Std.Http.RequestTarget where
+  readParts r := .ok r.stdTarget
+
+/-- The URI path of the request target. -/
+instance : FromRequestPartsM Std.Http.URI.Path where
+  readParts r := .ok r.stdTarget.path
+
 /-- The binders after a body extractor: a body that is already in `AppM`. -/
 class NativePartsExtractor (Fn : Type) where
   extractParts : Fn → Handler
