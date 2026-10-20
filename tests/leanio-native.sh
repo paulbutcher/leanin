@@ -129,6 +129,12 @@ st, _, body = read_response(s)
 check("body after continue", st.endswith("200 OK") and body == b"hello", f"{st} {body!r}")
 s.close()
 
+# The native route declaration syntax and its body extractor.
+st, _, body = get("/nping")
+check("native syntax", st.endswith("200 OK") and body == b"native-syntax\n", f"{st} {body!r}")
+st, _, body = post("/ntodos", "application/json", b'{"title":"native","done":false}')
+check("native syntax body extractor", st.endswith("200 OK") and b'"title":"native"' in body, f"{st} {body!r}")
+
 # Multipart: two parts, one with a filename, parsed by the native backend.
 boundary = "X-BOUNDARY"
 parts = (
@@ -146,6 +152,28 @@ raw = (f"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; 
 st, _, body = request(raw)
 check("multipart parts", st.endswith("200 OK") and body == b"parts=2 user:-:5:text/plain file:a.txt:10:text/plain\n",
       f"{st} {body!r}")
+
+# Multipart read incrementally, with the request split across writes.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.settimeout(5)
+s.sendall((f"POST /upload-stream HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary={boundary}\r\n"
+           f"Content-Length: {len(parts)}\r\n\r\n").encode() + parts[:20])
+time.sleep(0.05)
+s.sendall(parts[20:])
+st, _, body = read_response(s)
+check("multipart streamed", st.endswith("200 OK") and body == b"streamed=2 user:5;file:10;\n",
+      f"{st} {body!r}")
+s.close()
+
+# Part `save` writes each body to a file.
+st, _, body = request(raw.replace(b"/upload ", b"/upload-save ", 1))
+check("multipart saved", st.endswith("200 OK") and body == b"saved=2\n", f"{st} {body!r}")
+try:
+    p0 = open("/tmp/leanio-part-0","rb").read()
+    p1 = open("/tmp/leanio-part-1","rb").read()
+except OSError as e:
+    p0 = p1 = b""
+check("saved part bodies", p0 == b"alice" and p1 == b"hello file", f"{p0!r} {p1!r}")
 
 # A client that disconnects mid-body is a cancellation, not a 500 the server can still send; it must not take
 # the server down or leave the connection loop wedged.

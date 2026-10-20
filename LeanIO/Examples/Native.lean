@@ -90,6 +90,17 @@ def postForm : Handler :=
       LeanIO.Backend.LeanIn.respond w 200 "OK" s!"user={user}\n".toUTF8
     | .error (status, msg) => LeanIO.Backend.LeanIn.respond w status (reasonFor status) msg.toUTF8
 
+/-- The route declaration syntax with the native backend selected explicitly: a body in `AppM` and no
+handler-valued argument. -/
+def nping : LeanIO.Backend.LeanIn.NativeRoute :=
+  native GET "/nping" => do
+    LeanIO.Backend.LeanIn.AppM.respond 200 "OK" "native-syntax\n".toUTF8
+
+/-- The same syntax with a body extractor: the binder is read through the native `FromRequestBodyM` instance. -/
+def ntodo : LeanIO.Backend.LeanIn.NativeRoute :=
+  native POST "/ntodos" (t : LeanIO.Json Todo) => do
+    LeanIO.Backend.LeanIn.AppM.respond 200 "OK" (Lean.toJson t.body).compress.toUTF8
+
 /-- A multipart upload: each part's name, filename and body length. -/
 def upload : Handler :=
   LeanIO.Backend.LeanIn.withMultipart fun parts _req w => do
@@ -97,6 +108,40 @@ def upload : Handler :=
       s!"{p.name}:{p.filename.getD "-"}:{p.body.size}:{p.contentType}"
     LeanIO.Backend.LeanIn.respond w 200 "OK"
       (s!"parts={parts.size} " ++ String.intercalate " " (parts.toList.map describe) ++ "\n").toUTF8
+
+/-- Drain one streamed part, counting its bytes. -/
+partial def drainPart (p : LeanIO.Backend.LeanIn.PartReader) (n : Nat) : LeanIn.Runtime.VM Nat := do
+  match ← p.recv 4096 with
+  | some chunk => drainPart p (n + chunk.size)
+  | none => pure n
+
+/-- Walk a streamed multipart body, counting each part's bytes without buffering it. -/
+partial def walkParts (m : LeanIO.Backend.LeanIn.MReader) (i : Nat) (acc : String) :
+    LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+  | w => do
+    match ← m.next with
+    | none =>
+      LeanIO.Backend.LeanIn.respond w 200 "OK" (s!"streamed={i} {acc}\n").toUTF8
+    | some p =>
+      let n ← drainPart p 0
+      walkParts m (i + 1) (acc ++ s!"{p.name}:{n};") w
+
+/-- A multipart upload read part by part: the response is written after the walk, but no part is buffered. -/
+def uploadStream : Handler :=
+  LeanIO.Backend.LeanIn.withMultipartStream fun m _req w => walkParts m 0 "" w
+
+/-- Save each streamed part to `/tmp/leanio-part-<n>`, exercising the part `save` operation. -/
+partial def saveParts (m : LeanIO.Backend.LeanIn.MReader) (i : Nat) :
+    LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
+  | w => do
+    match ← m.next with
+    | none => LeanIO.Backend.LeanIn.respond w 200 "OK" s!"saved={i}\n".toUTF8
+    | some p =>
+      LeanIO.Backend.LeanIn.PartReader.save p s!"/tmp/leanio-part-{i}"
+      saveParts m (i + 1) w
+
+def uploadSave : Handler :=
+  LeanIO.Backend.LeanIn.withMultipartStream fun m _req w => saveParts m 0 w
 
 /-- Echo the request body. The reader delivers it incrementally; this route accumulates it to answer with one
 `Content-Length` body, while a streaming route would `recv` and `write` instead. -/
@@ -107,7 +152,7 @@ def echo : Handler :=
 
 def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :=
   LeanIO.Backend.LeanIn.NativeRouter.empty
-    |>.add (native GET "/ping" ping)
+    |>.add (nativeRoute GET "/ping" ping)
     |>.route .get "/slow" (slow clock)
     |>.route .get "/user/{id}" (tag "users" userById)
     |>.route .post "/echo" echo
@@ -115,6 +160,10 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.route .post "/text" postText
     |>.route .post "/form" postForm
     |>.route .post "/upload" upload
+    |>.route .post "/upload-stream" uploadStream
+    |>.route .post "/upload-save" uploadSave
+    |>.add nping
+    |>.add ntodo
     |>.route .get "/boom" (boom clock)
     |>.route .get "/logged" (LeanIO.Backend.LeanIn.requestLogger "req" ping)
     |>.addMiddleware LeanIO.Backend.LeanIn.catchErrors

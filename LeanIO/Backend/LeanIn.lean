@@ -289,6 +289,200 @@ def boundary? (r : Request) : Option String :=
       | ["boundary", b] => some (unquote (b.trimAscii.toString))
       | _ => none
 
+/-- Naive byte search: the index of `needle` in `hay` at or after `from`. -/
+def findBytes (hay : ByteArray) (needle : ByteArray) (start : Nat) : Option Nat := Id.run do
+  if needle.size == 0 || hay.size < needle.size then return none
+  let mut i := start
+  while i + needle.size ≤ hay.size do
+    let mut j := 0
+    while j < needle.size && hay.get! (i + j) == needle.get! j do j := j + 1
+    if j == needle.size then return some i
+    i := i + 1
+  return none
+
+/-- A streaming multipart reader's state. -/
+structure MState where
+  buf : ByteArray := .empty
+  pos : Nat := 0
+  /-- 0: before the first delimiter, 1: headers, 2: part body, 3: done. -/
+  phase : Nat := 0
+  boundary : ByteArray := .empty
+deriving Inhabited
+
+/-- One part of a multipart body, read incrementally. -/
+structure PartReader where
+  name : String
+  filename : Option String := none
+  contentType : String := "text/plain"
+  headers : Array (String × String) := #[]
+  recv : Nat → LeanIn.Runtime.VM (Option ByteArray)
+
+/-- The streaming multipart reader. -/
+structure MReader where
+  next : LeanIn.Runtime.VM (Option PartReader)
+
+namespace PartReader
+
+/-- Stream a part body chunk by chunk; nothing is accumulated. -/
+partial def stream (p : PartReader) (cb : ByteArray → LeanIn.Runtime.VM Unit) : LeanIn.Runtime.VM Unit := do
+  match ← p.recv 65536 with
+  | some chunk => cb chunk; stream p cb
+  | none => pure ()
+
+/-- Read a part body whole (small parts only). -/
+partial def bytesLoop (p : PartReader) (acc : ByteArray) : LeanIn.Runtime.VM ByteArray := do
+  match ← p.recv 65536 with
+  | some chunk => bytesLoop p (acc ++ chunk)
+  | none => pure acc
+
+def bytes (p : PartReader) : LeanIn.Runtime.VM ByteArray := bytesLoop p .empty
+
+/-- Consume a part body without keeping it. -/
+def discard (p : PartReader) : LeanIn.Runtime.VM Unit :=
+  stream p (fun _ => pure ())
+
+/-- Write a part body to a file, chunk by chunk. -/
+def save (p : PartReader) (path : System.FilePath) : LeanIn.Runtime.VM Unit := do
+  let handle ← (monadLift (IO.FS.Handle.mk path .write) : LeanIn.Runtime.VM _)
+  let fs := IO.FS.Stream.ofHandle handle
+  stream p (fun chunk => monadLift (fs.write chunk : IO Unit))
+  monadLift (fs.flush : IO Unit)
+
+end PartReader
+
+namespace MP
+
+def getSt (st : IO.Ref MState) : LeanIn.Runtime.VM MState :=
+  monadLift (st.get : IO MState)
+
+def setSt (st : IO.Ref MState) (s : MState) : LeanIn.Runtime.VM Unit :=
+  monadLift (st.set s : IO Unit)
+
+def delim (boundary : ByteArray) : ByteArray := "\r\n--".toUTF8 ++ boundary
+
+/-- Append one socket read to the buffer; `false` at EOF. -/
+def more (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader) : LeanIn.Runtime.VM Bool := do
+  match ← c.recv 65536 with
+  | some chunk =>
+    let s ← getSt st
+    let compact := s.pos > 65536
+    let buf := if compact then s.buf.extract s.pos s.buf.size else s.buf
+    let pos := if compact then 0 else s.pos
+    setSt st { s with buf := buf ++ chunk, pos }
+    pure true
+  | none => pure false
+
+/-- Read until `marker` is in the buffer; the position of its start, or `none` at EOF. -/
+partial def seekMarker (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader)
+    (marker : ByteArray) : LeanIn.Runtime.VM (Option Nat) := do
+  let s ← getSt st
+  match findBytes s.buf marker s.pos with
+  | some i => pure (some i)
+  | none => if ← more st c then seekMarker st c marker else pure none
+
+def parseHeaderLines (head : String) : Array (String × String) :=
+  head.splitOn "\r\n" |>.filterMap (fun line =>
+    match line.splitOn ":" with
+    | n :: vs => some (n.trimAscii.toString.toLower, String.intercalate ":" vs |>.trimAscii.toString)
+    | _ => none) |>.toArray
+
+def param (hs : Array (String × String)) (key : String) : Option String :=
+  let disp := hs.findSome? fun (n, v) => if n == "content-disposition" then some v else none
+  disp.bind fun v =>
+    (v.splitOn ";").findSome? fun p =>
+      match p.trimAscii.toString.splitOn "=" with
+      | [k, x] => if k == key then some (unquote (x.trimAscii.toString)) else none
+      | _ => none
+
+/-- Consume the delimiter at the cursor and either finish (closing `--`) or move to the next part's headers. -/
+def finishPart (s : MState) : MState :=
+  let after := s.pos + 4 + s.boundary.size
+  if after + 2 ≤ s.buf.size && s.buf.get! after == 0x2D && s.buf.get! (after + 1) == 0x2D then
+    { s with pos := after + 2, phase := 3 }
+  else
+    { s with pos := after + 2, phase := 1 }
+
+/-- `recv` for one part: body bytes, stopping at the delimiter. -/
+partial def partRecv (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader) (n : Nat)
+    : LeanIn.Runtime.VM (Option ByteArray) := do
+  let s ← getSt st
+  let needle := delim s.boundary
+  match findBytes s.buf needle s.pos with
+  | some i =>
+    if i == s.pos then
+      if s.buf.size < s.pos + 4 + s.boundary.size + 2 then
+        if ← more st c then partRecv st c n
+        else throw (IO.userError "Multipart: multipart body ended at a delimiter")
+      else
+        setSt st (finishPart s)
+        pure none
+    else
+      let k := min n (i - s.pos)
+      setSt st { s with pos := s.pos + k }
+      pure (some (s.buf.extract s.pos (s.pos + k)))
+  | none =>
+    let safe := s.buf.size - s.pos - (needle.size - 1)
+    if safe > 0 then
+      let k := min n safe
+      setSt st { s with pos := s.pos + k }
+      pure (some (s.buf.extract s.pos (s.pos + k)))
+    else if ← more st c then partRecv st c n
+    else throw (IO.userError "Multipart: multipart body ended before its delimiter")
+
+/-- Parse the next part's headers, or finish. -/
+partial def nextPart (st : IO.Ref MState) (c : LeanIn.Examples.Http.Server.BodyReader)
+    : LeanIn.Runtime.VM (Option PartReader) := do
+  let s ← getSt st
+  match s.phase with
+  | 3 => pure none
+  | 0 =>
+    match ← seekMarker st c ("--".toUTF8 ++ s.boundary) with
+    | none => pure none
+    | some i =>
+      let s ← getSt st
+      let after := i + 2 + s.boundary.size
+      if after + 2 ≤ s.buf.size && s.buf.get! after == 0x2D && s.buf.get! (after + 1) == 0x2D then
+        setSt st { s with pos := after + 2, phase := 3 }
+        pure none
+      else
+        setSt st { s with pos := after + 2, phase := 1 }
+        nextPart st c
+  | 1 =>
+    match ← seekMarker st c "\r\n\r\n".toUTF8 with
+    | none => throw (IO.userError "Multipart: truncated multipart headers")
+    | some i =>
+      let s ← getSt st
+      let hs := parseHeaderLines (String.fromUTF8? (s.buf.extract s.pos i) |>.getD "")
+      setSt st { s with pos := i + 4, phase := 2 }
+      pure (some {
+        name := (param hs "name").getD ""
+        filename := param hs "filename"
+        contentType := (hs.findSome? fun (n, v) => if n == "content-type" then some v else none).getD "text/plain"
+        headers := hs
+        recv := partRecv st c })
+  | _ => throw (IO.userError "Multipart: multipart phase lost")
+
+end MP
+
+/-- Stream a multipart body: `next` yields each part with its own incremental `recv`. -/
+def withMultipartStream (f : MReader → Handler) : Handler :=
+  fun req w => do
+    match boundary? req with
+    | none =>
+      w.start { status := 400, reason := "Bad Request",
+                headers := #[("Content-Length", toString "missing multipart boundary".toUTF8.size)] }
+      w.write "missing multipart boundary".toUTF8
+      w.finish
+    | some b =>
+      if req.mediaType? != some "multipart/form-data" then
+        w.start { status := 415, reason := "Unsupported Media Type",
+                  headers := #[("Content-Length", toString "unsupported media type".toUTF8.size)] }
+        w.write "unsupported media type".toUTF8
+        w.finish
+      else
+        let st ← (monadLift (IO.mkRef ({ boundary := b.toUTF8 } : MState)) : LeanIn.Runtime.VM _)
+        f { next := MP.nextPart st req.body } req w
+
 /-- Split a multipart body into parts. The delimiters are `--boundary`; a part ends at the next delimiter,
 and the closing delimiter is followed by `--`. Part headers are separated from the part body by a blank line.
 The body is the reader's bytes, so this is the buffered form; a streaming part reader is a later step. -/
@@ -358,6 +552,76 @@ def respond (w : LeanIn.Examples.Http.Server.ResponseWriter) (status : Nat) (rea
   w.write body
   w.finish
 
+/-- The application environment a route body sees under the parameterised syntax: the request and the response
+writer, so a body can read and write without receiving them as arguments. -/
+structure Env where
+  req : Request
+  writer : LeanIn.Examples.Http.Server.ResponseWriter
+
+/-- The native application monad. A body written in the route syntax runs in `AppM`; the handler supplies the
+environment once. -/
+abbrev AppM := ReaderT Env LeanIn.Runtime.VM
+
+namespace AppM
+
+/-- The request being handled. -/
+def request : AppM Request := fun env => pure env.req
+
+/-- Send a buffered response: head with `Content-Length`, one write, finish. -/
+def respond (status : Nat) (reason : String) (body : ByteArray)
+    (headers : Array (String × String) := #[]) : AppM Unit :=
+  fun env => LeanIO.Backend.LeanIn.respond env.writer status reason body headers
+
+/-- The response writer, for a body that streams. -/
+def writer : AppM LeanIn.Examples.Http.Server.ResponseWriter := fun env => pure env.writer
+
+/-- The request body reader, for a route that streams the request. -/
+def bodyReader : AppM LeanIn.Examples.Http.Server.BodyReader := fun env => pure env.req.body
+
+end AppM
+
+/-- A request-body extraction in the native application monad. The failure is the status and message to answer
+with, as in the buffered extractors. -/
+class FromRequestBodyM (α : Type) where
+  read : Env → LeanIn.Runtime.VM (Except (Nat × String) α)
+
+/-- JSON bodies in the native monad. -/
+instance [Lean.FromJson α] [LeanIO.MimeType.HasMimeTypes (LeanIO.Json α)] : FromRequestBodyM (LeanIO.Json α) where
+  read env := do
+    match ← jsonBody α env.req with
+    | .ok a => pure (.ok { body := a })
+    | .error e => pure (.error e)
+
+/-- Plain-text bodies in the native monad. -/
+instance : FromRequestBodyM LeanIO.PlainText where
+  read env := do
+    match ← textBody env.req with
+    | .ok text => pure (.ok { body := text })
+    | .error e => pure (.error e)
+
+/-- The binders after a body extractor: a body that is already in `AppM`. -/
+class NativePartsExtractor (Fn : Type) where
+  extractParts : Fn → Handler
+
+/-- Adapt a route body's binders to a native handler, mirroring `LeanIO.Extractor` for the stock backend. -/
+class NativeExtractor (Fn : Type) where
+  extract : Fn → Handler
+
+instance : NativePartsExtractor (AppM Unit) where
+  extractParts f req w := f { req, writer := w }
+
+instance [FromRequestBodyM P] [NativePartsExtractor Rest] : NativeExtractor (P → Rest) where
+  extract f req w := do
+    match ← FromRequestBodyM.read (α := P) { req, writer := w } with
+    | .ok p => NativePartsExtractor.extractParts (f p) req w
+    | .error (status, msg) => LeanIO.Backend.LeanIn.respond w status (reasonFor status) msg.toUTF8
+
+instance : NativeExtractor (Unit → AppM Unit) where
+  extract f req w := f () { req, writer := w }
+
+instance : NativeExtractor (AppM Unit) where
+  extract f req w := f { req, writer := w }
+
 /-- Error scope as a handler: `VM.attempt` carries the catch through every suspension, so a handler that
 parks and then raises is caught here exactly as one that raises at once. The failure becomes a 500 rather than
 escaping the connection. -/
@@ -369,7 +633,9 @@ def catchErrors : Middleware :=
       -- A transport failure is the request's cancellation, not an application error: it must not be turned
       -- into a response the peer can no longer receive.
       if (toString e).startsWith "Http:" then throw e
-      else respond w 500 "Internal Server Error" (toString e).toUTF8
+      else
+        monadLift (IO.eprintln s!"leanio: 500: {e}")
+        respond w 500 "Internal Server Error" (toString e).toUTF8
 
 /-- Observing middleware: logs method, path and status through `IO` lifted into the machine, then returns the
 response unchanged. -/

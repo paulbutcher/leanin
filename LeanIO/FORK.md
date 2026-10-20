@@ -11,7 +11,8 @@ backend is being moved onto LeanIn. Upstream changes are not merged automaticall
 | 2026-10-20 | `Data/Headers/HeaderName.lean`: removed `contentEncoding`, `ifNoneMatch`, `lastModified`, `ifModifiedSince` | `Std.Http.Header.Name` provides them in Lean 4.35.0 |
 | 2026-10-20 | tests moved from `Tests.*` to `LeanIO.Tests.*` | they live inside the fork's namespace |
 | 2026-10-20 | `Router.RouteTrie` parameterised over its handler value (`RouteTrie H`); `RouteTrie HandlerFn` is the upstream instantiation | the LeanIn backend needs the same trie, lookup and fold over a native handler type; `dispatch` and the `Std.Http.Server.Handler` instance stay typed at `HandlerFn` |
-| 2026-10-20 | `Router.Macro`: `native`/`nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter` | explicit backend selection, and streaming request and response bodies on the native backend |
+| 2026-10-20 | `Router.Macro`: `native … => …` and `nativeRoute` syntax; `Backend.LeanIn` handlers take `BodyReader`/`ResponseWriter`; `AppM` and native extractor classes | explicit backend selection sharing the route-declaration form, and streaming request and response bodies |
+| 2026-10-20 | `Backend.LeanIn`: `withMultipartStream`, `MReader`/`PartReader` with `stream`/`bytes`/`discard`/`save` | per-part streaming multipart on the native reader; the buffered `withMultipart` remains for whole-part consumers |
 
 ## Port status
 
@@ -34,18 +35,21 @@ scope are later stages. The fork builds and its own tests run under `lake build 
 
 ### The native backend's boundary
 
-Handlers now use the streaming session: `Request.body` is a `BodyReader`, the handler writes through a
+Handlers use the streaming session: `Request.body` is a `BodyReader`, the handler writes through a
 `ResponseWriter`, and neither direction is accumulated. `readAll` is what a buffered extractor (`jsonBody`,
-`formBody`, multipart) calls; a route that streams calls `recv`/`write` itself. The response is framed as a
-declared `Content-Length`, chunked on HTTP/1.1, or close-delimited. The buffered `maxBody` limit applies only
-to the buffered driver; a streaming body has no accumulated body to bound.
+`formBody`) calls; a route that streams calls `recv`/`write` itself. Responses are framed as a declared
+`Content-Length`, chunked on HTTP/1.1, or close-delimited. The buffered `maxBody` limit applies only to the
+buffered driver; a streaming body has no accumulated body to bound.
 
-Route selection is explicit: `native GET "/ping" ping` (also `nativeRoute`) declares a route whose handler is
-the backend's `Request → ResponseWriter → VM Unit`. The upstream `GET … => …` syntax remains stock-LeanIO and
-does not select a backend; its extractor classes are still typed at `ContextAsync`.
+Route selection is explicit and shares the route-declaration form: `native GET "/todos" (body : Json T) => …`
+expands to a `NativeRoute`, with the body in `AppM` (request and writer in the environment) and binders read
+through the native `FromRequestBodyM`/`NativeExtractor` classes. `nativeRoute GET "/ping" ping` takes an
+already-built handler. The unprefixed `GET … => …` remains stock-LeanIO and does not select a backend.
 
-Multipart is parsed from the reader's bytes (`withMultipart`) and returns whole parts, so a part body is
-buffered per request. A per-part streaming reader, and the upstream multipart API over it, are not ported.
+Multipart has both shapes: `withMultipart` reads whole parts, and `withMultipartStream` yields a `PartReader`
+per part with an incremental `recv`; `PartReader` also provides `stream`, `bytes`, `discard` and `save`.
+These are the native equivalents of the upstream part operations; the upstream `MultiPartForm`/`FormFile`
+class stack itself remains stock-typed.
 
 Cancellation is the transport's: a body or response operation that fails raises through the handler, and
 `catchErrors` re-raises transport failures rather than turning them into a 500 the peer can no longer receive.

@@ -199,19 +199,10 @@ router.addRoute (POST "/todos" (req : Request CreateTodoRequest) => ...)
 -/
 syntax method str extractorBinder* "=>" term : term
 
-macro_rules
-  | `($method:method $pat:str $bs:extractorBinder* => $body:term) => do
-    let some source := method.raw.reprint | Macro.throwErrorAt method "failed to read method keyword"
-    let methodName := source.trimAscii |>.toString |> Name.mkSimple
-    expandRouteTerm (resolveMethodCon methodName) pat bs body
-
-/-- `nativeRoute GET "/user/{id}" (fun req => …)` - a route value for `NativeRouter.add`. It reuses the method
-keywords and compile-time pattern validation above, and expands to the LeanIn backend's `NativeRoute` rather
-than the stock `Route`. -/
+/-- A route value for the native backend, from an already-built handler: `nativeRoute GET "/ping" ping`. -/
 syntax "nativeRoute" method str term : term
-syntax "native " method str term : term
 
-meta def expandNativeRoute (m : TSyntax `method) (pat : TSyntax `str) (body : TSyntax `term) :
+meta def expandNativeRouteValue (m : TSyntax `method) (pat : TSyntax `str) (body : TSyntax `term) :
     MacroM Term := do
   let some source := m.raw.reprint | Macro.throwErrorAt m "failed to read method keyword"
   let methodName := source.trimAscii |>.toString |> Name.mkSimple
@@ -220,10 +211,47 @@ meta def expandNativeRoute (m : TSyntax `method) (pat : TSyntax `str) (body : TS
   match validateRoutePattern patStr with
   | .error e => Macro.throwErrorAt pat e
   | .ok () => pure ()
-  `({ method := $methodTerm, pattern := RoutePattern.ofString $pat, handler := $body : LeanIO.Backend.LeanIn.NativeRoute })
+  `({ method := $methodTerm, pattern := RoutePattern.ofString $pat, handler := $body :
+      LeanIO.Backend.LeanIn.NativeRoute })
+
+/-- The native expansion of the arrow route syntax: the body is an `AppM` computation and the binder chain is
+adapted by the native extractor classes. -/
+meta def expandNativeArrow (methodName : Name) (pat : TSyntax `str) (bs : Array Syntax)
+    (body : TSyntax `term) : MacroM Term := do
+  let patStr := pat.getString
+  match validateRoutePattern patStr with
+  | .error e => Macro.throwErrorAt pat e
+  | .ok () => pure ()
+  let patTerm ← mkRoutePatternTerm patStr
+  let methodTerm : Term := mkIdent (resolveMethodCon methodName)
+  let handler ←
+    match bs.toList with
+    | [] =>
+      `(let fn (_ : Unit) : LeanIO.Backend.LeanIn.AppM Unit := $body
+        LeanIO.Backend.LeanIn.NativeExtractor.extract fn)
+    | binders =>
+      let ascribedBody : Term := ← `(($body : LeanIO.Backend.LeanIn.AppM Unit))
+      let lam ← binders.foldrM (fun b inner => do
+        match b with
+        | `(extractorBinder| ($pat:term : $ty:term)) => `(fun ($pat : $ty) => $inner)
+        | _ => Macro.throwErrorAt b "invalid extractor binder") ascribedBody
+      `(let fn := $lam; LeanIO.Backend.LeanIn.NativeExtractor.extract fn)
+  `({ method := $methodTerm, pattern := $patTerm, handler := $handler :
+      LeanIO.Backend.LeanIn.NativeRoute })
+
+/-- `native GET "/todos" (body : Json T) => …` — the route declaration syntax, selecting the native backend.
+The unprefixed `GET … => …` remains the stock backend. -/
+syntax "native " method str extractorBinder* "=>" term : term
 
 macro_rules
-  | `(nativeRoute $m:method $pat:str $body:term) => expandNativeRoute m pat body
-  | `(native $m:method $pat:str $body:term) => expandNativeRoute m pat body
+  | `($method:method $pat:str $bs:extractorBinder* => $body:term) => do
+    let some source := method.raw.reprint | Macro.throwErrorAt method "failed to read method keyword"
+    let methodName := source.trimAscii |>.toString |> Name.mkSimple
+    expandRouteTerm (resolveMethodCon methodName) pat bs body
+  | `(native $method:method $pat:str $bs:extractorBinder* => $body:term) => do
+    let some source := method.raw.reprint | Macro.throwErrorAt method "failed to read method keyword"
+    let methodName := source.trimAscii |>.toString |> Name.mkSimple
+    expandNativeArrow methodName pat bs body
+  | `(nativeRoute $method:method $pat:str $body:term) => expandNativeRouteValue method pat body
 
 end LeanIO.Router
