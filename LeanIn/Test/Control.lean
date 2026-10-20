@@ -1079,7 +1079,7 @@ def runtimeHttp : IO UInt32 := do
   statusRef.set respHead.status
   -- Our handler: it records the thread it ran on and answers with the pinned head and body. `serveConn` awaits
   -- it inline, so the thread it reads is the carrier the connection runs on.
-  let handler : LeanIn.Examples.Http.Server.Handler := fun head => do
+  let handler : LeanIn.Examples.Http.Server.Handler := fun head _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids.modify (· ++ [tid]) : IO Unit)
     monadLift (methodRef.set (toString head.method) : IO Unit)
@@ -1231,7 +1231,7 @@ def runtimeHttpService : IO UInt32 := do
   let e1 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids1 ← IO.mkRef ([] : List UInt64)
   let handled1 ← IO.mkRef (0 : Nat)
-  let handler1 : LeanIn.Examples.Http.Server.Handler := fun _ => do
+  let handler1 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids1.modify (· ++ [tid]) : IO Unit)
     monadLift (handled1.modify (· + 1) : IO Unit)
@@ -1282,7 +1282,7 @@ def runtimeHttpService : IO UInt32 := do
   let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids2 ← IO.mkRef ([] : List UInt64)
   let cfg2 : LeanIn.Examples.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
-  let handler2 : LeanIn.Examples.Http.Server.Handler := fun _ => do
+  let handler2 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids2.modify (· ++ [tid]) : IO Unit)
     -- The suspension is the point: the raise reaches the driver from a *resumed* continuation, not from the
@@ -1331,7 +1331,7 @@ def runtimeHttpService : IO UInt32 := do
   let addr3 ← Runtime.Listener.sockName l3
   let e3 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids3 ← IO.mkRef ([] : List UInt64)
-  let handler3 : LeanIn.Examples.Http.Server.Handler := fun _ => return (respHead, pinnedBody)
+  let handler3 : LeanIn.Examples.Http.Server.Handler := fun _ _body => return (respHead, pinnedBody)
   for _ in List.range 3 do e3.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore3, _) ← e3.observe
   let hc ← Runtime.HarnessClock.new
@@ -5151,12 +5151,32 @@ def runMode (args : List String) : IO UInt32 := do
   IO.println "  done"
   return 0
 
+/-- The parser keeps the method token: an unknown method must not become a known one, and a known method
+still classifies as itself. -/
+def h1MethodTokenSelfTest : IO Unit := do
+  let parse (s : String) : IO LeanIn.Examples.Http.H1.Head := do
+    match LeanIn.Examples.Http.H1.parseHead s.toUTF8 0 {} with
+    | .ok h _ => return h
+    | _ => throw (IO.userError s!"h1 method token: could not parse {s}")
+  let pf ← parse "PROPFIND /x HTTP/1.1\r\nHost: x\r\n\r\n"
+  unless pf.method == .other do
+    throw (IO.userError "h1 method token: PROPFIND was classified as a known method")
+  unless pf.methodTokenString == "PROPFIND" do
+    throw (IO.userError s!"h1 method token: PROPFIND token read as {pf.methodTokenString}")
+  let g ← parse "GET /x HTTP/1.1\r\n\r\n"
+  unless g.method == .get && g.methodTokenString == "GET" do
+    throw (IO.userError s!"h1 method token: GET read as {g.method} / {g.methodTokenString}")
+
 /-- **Run the named mode, then stop the I/O loop this process started.**
 
 The stop is the process's own bookkeeping rather than a mode's: a mode that bound a listener leaves a loop thread
 parked in the shim's `uv_run`, and the Lean task manager waits for every dedicated task at shutdown, so without
 this the process would print its record and then never exit. It is a no-op in a mode that bound no listener. -/
 def main (args : List String) : IO UInt32 := do
+  if args.contains "--h1-method-token" then
+    h1MethodTokenSelfTest
+    IO.println "h1 method token: unknown kept as a token, known classified -- ok"
+    return 0
   if args.contains "--raw-registry" then
     LeanIn.Runtime.Io.rawRegistrySelfTest
     IO.println "raw registry: register/take/no-double-take/replace/withdraw, live count 0 -- ok"

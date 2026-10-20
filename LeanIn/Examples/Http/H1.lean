@@ -64,7 +64,12 @@ head was parsed from, which rides along so the head is self-contained: `targetSt
 view without the caller having to keep the buffer. -/
 structure Head where
   buf     : ByteArray := .empty
+  /-- The method as the parser classifies it. `Method.other` carries no token, so the raw token is kept in
+  `methodToken`: an adapter that must preserve the request method (LeanIO does) reads the token instead of
+  collapsing distinct methods into `other`. -/
   method  : Method := .get
+  /-- The method token exactly as sent, a view into `buf`. -/
+  methodToken : Slice := default
   version : Version := .v11
   target  : Slice := default
   headers : Array (Slice × Slice) := #[]
@@ -78,6 +83,10 @@ def targetString (h : Head) : String := (h.targetString?).getD ""
 /-- The value view of the first header whose name matches `name` (ASCII case-insensitive). -/
 def headerSlice? (h : Head) (name : ByteArray) : Option Slice :=
   h.headers.findSome? fun (n, v) => if Slice.eqBytesCI h.buf n name then some v else none
+/-- The method token exactly as sent, `none` if it is not valid UTF-8. -/
+def methodTokenString? (h : Head) : Option String := Slice.toString? h.buf h.methodToken
+/-- The method token exactly as sent (empty if it is not valid UTF-8). -/
+def methodTokenString (h : Head) : String := (h.methodTokenString?).getD ""
 /-- The value of the first header matching `name` as a `String`. -/
 def headerValue? (h : Head) (name : ByteArray) : Option String :=
   (h.headerSlice? name).bind (fun v => Slice.toString? h.buf v)
@@ -100,6 +109,7 @@ instance : ToString Version := ⟨Version.toString⟩
 inductive HeadError where
   | badRequest
   | headersTooLarge
+  | bodyTooLarge
 deriving Inhabited, Repr, BEq
 
 /-- Limits on a parsed head. -/
@@ -108,6 +118,8 @@ structure Limits where
   maxHeaders : Nat := 100
   /-- The most messages one connection may serve before keep-alive is dropped. -/
   maxMessages : Nat := 100
+  /-- The most request-body bytes buffered before the request is rejected with 413. -/
+  maxBody : Nat := 1048576
 deriving Inhabited
 
 /-- The result of trying to parse a head from a buffer at a position. -/
@@ -155,7 +167,7 @@ def trimOWS (buf : ByteArray) (start stop : Nat) : Slice := Id.run do
   return { start := i, stop := j }
 
 /-- Parse the request line `METHOD SP target SP HTTP/<major>.<minor>` from `[start, stop)`. -/
-def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Slice × Version) := Id.run do
+def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Slice × Slice × Version) := Id.run do
   let mut i := start
   while i < stop && buf.get! i != 0x20 do i := i + 1
   if i >= stop then return none
@@ -175,7 +187,7 @@ def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Sl
   if vb != 0x31 && vb != 0x30 then return none
   let v := if vb == 0x31 then Version.v11 else Version.v10
   match methodOf buf start mStop with
-  | some m => return some (m, { start := tStart, stop := tStop }, v)
+  | some m => return some (m, { start := start, stop := mStop }, { start := tStart, stop := tStop }, v)
   | none => return none
 
 /-- The result of scanning the header section. -/
@@ -212,11 +224,11 @@ def parseHead (buf : ByteArray) (pos : Nat) (limits : Limits) : HeadResult :=
     let afterLine := nl + 1
     match parseRequestLine buf pos lineStop with
     | none => .failed .badRequest
-    | some (method, target, version) =>
+    | some (method, methodToken, target, version) =>
       match parseHeaders buf afterLine 0 limits.maxHeaders #[] with
       | .incomplete => .incomplete
       | .failed e => .failed e
-      | .ok headers bodyStart => .ok { buf, method, version, target, headers } bodyStart
+      | .ok headers bodyStart => .ok { buf, method, methodToken, version, target, headers } bodyStart
 
 /-! ## The connection machine
 
@@ -294,6 +306,9 @@ structure Machine where
   pos : Nat := 0
   head? : Option Head := none
   bodyRemaining : Nat := 0
+  /-- The request body accumulated so far, up to `limits.maxBody`. The driver hands it to the handler with the
+  head once framing completes (`takeRequest`); this is buffered delivery, not streaming. -/
+  reqBody : ByteArray := .empty
   out : Array ByteArray := #[]
   keepAlive : Bool := true
   messageCount : Nat := 0
@@ -317,11 +332,15 @@ def step (m : Machine) : Machine × StepResult :=
   else if m.halted then (m, {})
   else if m.bodyRemaining > 0 then
     let avail := m.buf.size - m.pos
-    if avail ≥ m.bodyRemaining then
-      ({ m with pos := m.pos + m.bodyRemaining, bodyRemaining := 0, head? := none },
+    if avail == 0 then
+      (m, { events := #[.needMoreData] })
+    else if avail ≥ m.bodyRemaining then
+      ({ m with pos := m.pos + m.bodyRemaining, bodyRemaining := 0,
+                reqBody := m.reqBody ++ m.buf.extract m.pos (m.pos + m.bodyRemaining) },
        { events := #[.bodyChunk (m.buf.extract m.pos (m.pos + m.bodyRemaining))] })
     else
-      ({ m with pos := m.buf.size, bodyRemaining := m.bodyRemaining - avail, head? := none },
+      ({ m with pos := m.buf.size, bodyRemaining := m.bodyRemaining - avail,
+                reqBody := m.reqBody ++ m.buf.extract m.pos m.buf.size },
        { events := #[.bodyChunk (m.buf.extract m.pos m.buf.size)] })
   else
     match parseHead m.buf m.pos m.limits with
@@ -330,9 +349,20 @@ def step (m : Machine) : Machine × StepResult :=
     | .ok head rest =>
       let cl := (contentLength? m.buf head.headers).getD 0
       let count := m.messageCount + 1
-      ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
-                keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
-       { events := #[.endHeaders head] })
+      if cl > m.limits.maxBody then
+        ({ m with halted := true, err? := some .bodyTooLarge },
+         { events := #[.failed .bodyTooLarge] })
+      else
+        ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
+                  reqBody := .empty,
+                  keepAlive := !wantsClose m.buf head && count < m.limits.maxMessages },
+         { events := #[.endHeaders head] })
+
+/-- Take the request when its framing is complete: the head, its buffered body, and the machine with both
+cleared so the next exchange starts fresh. A request with `Content-Length: 0` is complete at its `endHeaders`;
+one with a body is complete when `bodyRemaining` reaches zero. -/
+def takeRequest (m : Machine) : Head × ByteArray × Machine :=
+  ((m.head?.getD default), m.reqBody, { m with head? := none, reqBody := .empty })
 
 /-- Queue an encoded response head. The `Connection` directive on the wire is the machine's own disposition,
 reconciled with the handler's: a handler's `Connection: close` is honoured -- recorded here, so `userClosedBody`

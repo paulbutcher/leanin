@@ -70,7 +70,7 @@ def main (args : List String) : IO UInt32 := do
   let staticBody : ByteArray := "hello from leanin\nmethod=GET path=/bench version=HTTP/1.1\n".toUTF8
   let staticHead : H1.ResponseHead :=
     { status := 200, reason := "OK", headers := #[("Content-Length", toString staticBody.size)] }
-  let handler : LeanIn.Examples.Http.Server.Handler := fun head => do
+  let handler : LeanIn.Examples.Http.Server.Handler := fun head _body => do
     if metrics then
       monadLift (reportMetrics e hooks served metricsT0)
     if static then
