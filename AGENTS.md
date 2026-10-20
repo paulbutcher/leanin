@@ -159,6 +159,12 @@
   shape but not support a ratio.
 - The README carries the short table and cites the commit its numbers came
   from; method, ranges and rejected attempts stay in `docs/PERFORMANCE.md`.
+- For the LeanIO port, run `nix develop -c bash tests/leanio-native.sh`
+  after touching `LeanIO/Backend/`, the native example, or the HTTP
+  driver; it asserts routing, middleware, path parameters, suspended
+  handlers, buffered bodies, keep-alive, method-token behaviour and the
+  extraction statuses at the public socket. `LeanIO/FORK.md` records what
+  is ported and what is not.
 - After touching the shim's raw completion registry (`c/netuv.c`,
   `LeanIn/Runtime/Io.lean`), run `nix develop -c lake exe controls
   --raw-registry` with `NETUV_RAW_CHECK=1`. It checks register/take,
