@@ -214,6 +214,10 @@ check("derived query", st.endswith("200 OK") and body == b"page=3 size=25\n", f"
 st, _, body = get("/remote")
 check("remote address", st.endswith("200 OK") and body.startswith(b"127.0.0.1:"), f"{st} {body!r}")
 
+# Native body transform.
+st, _, body = post("/upper", "text/plain", b"hello world")
+check("body transform", st.endswith("200 OK") and body == b"HELLO WORLD", f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

@@ -275,6 +275,27 @@ partial def readAllLoop (r : BodyReader) (acc : ByteArray) : VM ByteArray := do
 
 def readAll (r : BodyReader) : VM ByteArray := readAllLoop r .empty
 
+/-- A stateful chunk transform over a body: the native counterpart of `BodyExt.Transform`, without the stock
+`Async`/`StateT` machinery. Each `recv` applies `f` to the chunk with the running state. -/
+def mapState (r : BodyReader) (f : σ → ByteArray → VM (σ × ByteArray)) (init : σ) :
+    IO BodyReader := do
+  let st ← IO.mkRef init
+  return {
+    r with
+    recv := fun n => do
+      match ← r.recv n with
+      | none => pure none
+      | some chunk => do
+        let s ← (monadLift (BaseIO.toIO st.get) : VM σ)
+        let (s', out) ← f s chunk
+        monadLift (BaseIO.toIO (st.set s') : VM Unit)
+        pure (some out)
+  }
+
+/-- A stateless chunk transform. -/
+def map (r : BodyReader) (f : ByteArray → ByteArray) : IO BodyReader :=
+  r.mapState (fun _ chunk => pure ((), f chunk)) ()
+
 end BodyReader
 
 /-- A response body as the handler writes it. `start` sends the head and fixes the framing: a declared

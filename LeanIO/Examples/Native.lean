@@ -232,6 +232,15 @@ def remoteDemo : LeanIO.Backend.LeanIn.NativeRoute :=
   native GET "/remote" (ra : Std.Http.Server.RemoteAddr) =>
     (Std.Http.Status.ok, s!"{ra.addr}\n")
 
+/-- A body transform: uppercase each chunk through the native stateful map. -/
+def upperDemo : Handler :=
+  fun req w => do
+    let r ← (monadLift (req.body.mapState
+      (fun _ chunk => pure ((), (String.fromUTF8? chunk).getD "" |>.toUpper.toUTF8)) ()
+      : LeanIn.Runtime.VM _))
+    let body ← r.readAll
+    LeanIO.Backend.LeanIn.respond w 200 "OK" body
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -315,6 +324,7 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinJson
     |>.add methodDemo
     |>.route .get "/line" lineDemo
+    |>.route .post "/upper" upperDemo
     |>.add fileDemo
     |>.add rangeFileDemo
     |>.add cachedDemo
