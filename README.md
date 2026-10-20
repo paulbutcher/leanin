@@ -86,8 +86,8 @@ The toolchain uses both lake and nix.
 
 | File | For | Toolchain |
 |---|---|---|
-| `lean-toolchain` | `elan` users | `leanprover/lean4:v4.35.0-rc3` |
-| `flake.nix` | `nix` users | `lean4`, nixpkgs' `lean4` derivation at the `v4.35.0-rc3` tag |
+| `lean-toolchain` | `elan` users | `leanprover/lean4:v4.35.0` |
+| `flake.nix` | `nix` users | the official `v4.35.0` binary release |
 
 The nix path builds that release from nixpkgs' own derivation rather than installing through `elan`, because
 `elan` resolves `lean-toolchain` by downloading from the network, which an offline run may not do. nixpkgs

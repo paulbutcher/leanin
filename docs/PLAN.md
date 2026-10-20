@@ -111,8 +111,8 @@ ______________________________________________________________________
 ## 4. Workspace and toolchain
 
 - Toolchain named in two places that must agree: `lean-toolchain`
-  (`leanprover/lean4:v4.35.0-rc3`, for elan) and `flake.nix` (`lean4`, nixpkgs' `lean4` derivation at
-  the `v4.35.0-rc3` tag, for nix) — because `Std.WP` exists only in the 4.35 line. The nix path
+  (`leanprover/lean4:v4.35.0`, for elan) and `flake.nix` (the official `v4.35.0` binary release, for nix) —
+  because `Std.WP` exists only in the 4.35 line. The nix path
   builds from source through nixpkgs rather than installing through elan, which resolves
   `lean-toolchain` over a network that offline runs cannot use.
 - Build: `nix develop -c lake build`; harness: `nix develop -c lake exe controls` (the scheduler spike that

@@ -23,41 +23,33 @@
       perSystem =
         { config, pkgs, ... }:
         let
-          # Lean `v4.35.0-rc3` is the nixpkgs `lean4` derivation with its source
-          # and version moved to the pre-release tag, rather than elan: elan
-          # resolves `lean-toolchain` by downloading from the network, which an
-          # offline run may not do.
+          # Lean `v4.35.0` is the official binary release, not a source build: the nixpkgs
+          # derivation along this line is a release candidate, and overriding it to the final
+          # tag would compile Lean from source on first use (an hour or more). This tarball is
+          # the exact build `lean-toolchain` names, so an offline run needs no elan download
+          # once it is in the store.
           #
-          # The 4.35 line (still pre-release) is deliberate rather than
-          # incidental: `Std.WP` — the weakest-precondition framework this
-          # project's proof strategy leans on — does not exist in v4.34.1 or
-          # earlier. Downgrading the toolchain removes the program logic, not
-          # just a version number.
-          lean4 = pkgs.lean4.overrideAttrs (prev: {
-            version = "4.35.0-rc3";
-            src = pkgs.fetchFromGitHub {
-              owner = "leanprover";
-              repo = "lean4";
-              tag = "v4.35.0-rc3";
-              hash = "sha256-gVqvQ9fdyCFxMiplNl5fQsw3uc3fPrkO2N3RymVAi7Y=";
+          # The 4.35 line is deliberate: `Std.WP` — the weakest-precondition framework this
+          # project's proof strategy leans on — does not exist in v4.34.1 or earlier.
+          lean4 = pkgs.stdenv.mkDerivation {
+            pname = "lean4";
+            version = "4.35.0";
+            src = pkgs.fetchurl {
+              url = "https://releases.lean-lang.org/lean4/v4.35.0/lean-4.35.0-linux.tar.zst";
+              hash = "sha256-colZekRUMkbJInuMrlAXZ+CVzhf21Ei5X8So3Jcmj20=";
             };
-
-            # The tag's own `LEAN_SPECIAL_VERSION_DESC` is empty, so a source build would
-            # self-report `4.35.0`; upstream builds the RC tarball with `rc3`. The untyped
-            # `-D` is deliberate: the tag's top-level CMakeLists forwards command-line
-            # variables to the stage builds only while their cache type is still
-            # UNINITIALIZED (its own comment: "does not catch `-DFOO:BAR=` typed uses"),
-            # and the installed binaries are stage1's `make install`. The version string is
-            # also part of the .olean format, so every stage must agree on it.
-            cmakeFlags = prev.cmakeFlags ++ [ "-DLEAN_SPECIAL_VERSION_DESC=rc3" ];
-
-            # 4.35 declares three ExternalProjects that clone over the network
-            # (`lean4lean`, `nanoda`, `con-leche`); CMake probes for the download tool
-            # during configure, so a source build now needs git present. All three are
-            # `EXCLUDE_FROM_ALL`, so the default target never clones them and the
-            # sandbox's lack of network is not reached. 4.34.1 declared none of them.
-            nativeBuildInputs = prev.nativeBuildInputs ++ [ pkgs.gitMinimal ];
-          });
+            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.zstd ];
+            buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.zlib ];
+            sourceRoot = "lean-4.35.0-linux";
+            unpackPhase = ''
+              tar --zstd -xf $src
+            '';
+            dontStrip = true;
+            installPhase = ''
+              mkdir -p $out
+              cp -a ./. $out/
+            '';
+          };
 
           # `nice -n 19` cannot be spelled as a PATH entry, so each pinned tool is
           # wrapped by its own store package. `nix develop` puts the shell's own
