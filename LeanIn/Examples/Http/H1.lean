@@ -64,7 +64,12 @@ head was parsed from, which rides along so the head is self-contained: `targetSt
 view without the caller having to keep the buffer. -/
 structure Head where
   buf     : ByteArray := .empty
+  /-- The method as the parser classifies it. `Method.other` carries no token, so the raw token is kept in
+  `methodToken`: an adapter that must preserve the request method (LeanIO does) reads the token instead of
+  collapsing distinct methods into `other`. -/
   method  : Method := .get
+  /-- The method token exactly as sent, a view into `buf`. -/
+  methodToken : Slice := default
   version : Version := .v11
   target  : Slice := default
   headers : Array (Slice × Slice) := #[]
@@ -78,6 +83,10 @@ def targetString (h : Head) : String := (h.targetString?).getD ""
 /-- The value view of the first header whose name matches `name` (ASCII case-insensitive). -/
 def headerSlice? (h : Head) (name : ByteArray) : Option Slice :=
   h.headers.findSome? fun (n, v) => if Slice.eqBytesCI h.buf n name then some v else none
+/-- The method token exactly as sent, `none` if it is not valid UTF-8. -/
+def methodTokenString? (h : Head) : Option String := Slice.toString? h.buf h.methodToken
+/-- The method token exactly as sent (empty if it is not valid UTF-8). -/
+def methodTokenString (h : Head) : String := (h.methodTokenString?).getD ""
 /-- The value of the first header matching `name` as a `String`. -/
 def headerValue? (h : Head) (name : ByteArray) : Option String :=
   (h.headerSlice? name).bind (fun v => Slice.toString? h.buf v)
@@ -155,7 +164,7 @@ def trimOWS (buf : ByteArray) (start stop : Nat) : Slice := Id.run do
   return { start := i, stop := j }
 
 /-- Parse the request line `METHOD SP target SP HTTP/<major>.<minor>` from `[start, stop)`. -/
-def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Slice × Version) := Id.run do
+def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Slice × Slice × Version) := Id.run do
   let mut i := start
   while i < stop && buf.get! i != 0x20 do i := i + 1
   if i >= stop then return none
@@ -175,7 +184,7 @@ def parseRequestLine (buf : ByteArray) (start stop : Nat) : Option (Method × Sl
   if vb != 0x31 && vb != 0x30 then return none
   let v := if vb == 0x31 then Version.v11 else Version.v10
   match methodOf buf start mStop with
-  | some m => return some (m, { start := tStart, stop := tStop }, v)
+  | some m => return some (m, { start := start, stop := mStop }, { start := tStart, stop := tStop }, v)
   | none => return none
 
 /-- The result of scanning the header section. -/
@@ -212,11 +221,11 @@ def parseHead (buf : ByteArray) (pos : Nat) (limits : Limits) : HeadResult :=
     let afterLine := nl + 1
     match parseRequestLine buf pos lineStop with
     | none => .failed .badRequest
-    | some (method, target, version) =>
+    | some (method, methodToken, target, version) =>
       match parseHeaders buf afterLine 0 limits.maxHeaders #[] with
       | .incomplete => .incomplete
       | .failed e => .failed e
-      | .ok headers bodyStart => .ok { buf, method, version, target, headers } bodyStart
+      | .ok headers bodyStart => .ok { buf, method, methodToken, version, target, headers } bodyStart
 
 /-! ## The connection machine
 
