@@ -138,16 +138,43 @@ static size_t g_raw_live_count = 0;
 static uv_mutex_t g_raw_lock;
 static int g_raw_up = 0;
 
+/* Contract: `k` is an owned Lean reference (extern arguments are owned; the compiler inserts an increment when a
+   value is used again), so this function either stores it or decrements it -- never both, never neither. A
+   refusal is reported as 0 so the Lean caller fails loudly rather than leaving the operation stranded. */
 LEAN_EXPORT lean_object *np_raw_register(uint32_t idx, uint32_t op, lean_object *k) {
   size_t i = (size_t)idx * 4 + op;
-  if (i >= MAX_RAW || !g_raw_up) { lean_dec(k); return lean_io_result_mk_ok(lean_box(0)); }
+  if (i >= MAX_RAW || !g_raw_up) {
+    if (getenv("NETUV_RAW_CHECK")) fprintf(stderr, "raw_register refused: idx=%u op=%u i=%zu up=%d max=%d\n", idx, op, i, g_raw_up, MAX_RAW);
+    lean_dec(k); return lean_io_result_mk_ok(lean_box_uint32(0));
+  }
+  if (getenv("NETUV_RAW_CHECK")) {
+    if (lean_is_scalar(k)) { lean_dec(k); return lean_io_result_mk_ok(lean_box_uint32(0)); }
+  }
   uv_mutex_lock(&g_raw_lock);
   lean_object *old = g_raw[i];
   if (old == NULL) g_raw_live_count++;
   g_raw[i] = k;
   uv_mutex_unlock(&g_raw_lock);
-  if (old) lean_dec(old);
-  return lean_io_result_mk_ok(lean_box(0));
+  if (old) lean_dec(old);   /* `old == k` is legal: the second use of one closure carries its own increment */
+  return lean_io_result_mk_ok(lean_box_uint32(1));
+}
+
+LEAN_EXPORT lean_object *np_raw_count(void) {
+  size_t n = 0;
+  if (g_raw_up) { uv_mutex_lock(&g_raw_lock); n = g_raw_live_count; uv_mutex_unlock(&g_raw_lock); }
+  return lean_io_result_mk_ok(lean_box_uint32((uint32_t)n));
+}
+
+/* Release every registration still held at loop teardown: those continuations can never run, and dropping
+   them here is what keeps a stop/restart from leaking them. */
+static void raw_drain(void) {
+  if (!g_raw_up) return;
+  uv_mutex_lock(&g_raw_lock);
+  for (size_t i = 0; i < MAX_RAW; i++) {
+    if (g_raw[i] != NULL) { lean_dec(g_raw[i]); g_raw[i] = NULL; }
+  }
+  g_raw_live_count = 0;
+  uv_mutex_unlock(&g_raw_lock);
 }
 
 LEAN_EXPORT lean_object *np_raw_take(uint32_t idx, uint32_t op) {
@@ -584,6 +611,7 @@ static void close_all(void) {
 }
 
 static void destroy_loop(void) {
+  raw_drain();
   if (uv_loop_close(g_loop) == 0) free(g_loop);   /* a loop that will not close is leaked rather than freed */
   g_loop = NULL;
   g_stopping = 0;

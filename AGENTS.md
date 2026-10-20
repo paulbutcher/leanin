@@ -160,3 +160,9 @@
   shape but not support a ratio.
 - The README carries the short table and cites the commit its numbers came
   from; method, ranges and rejected attempts stay in `docs/PERFORMANCE.md`.
+- After touching the shim's raw completion registry (`c/netuv.c`,
+  `LeanIn/Runtime/Io.lean`), run `nix develop -c lake exe controls
+  --raw-registry` with `NETUV_RAW_CHECK=1`. It checks register/take,
+  no double take, replace, withdraw and that the live count returns to zero.
+  The ownership, threading and marking argument is
+  `docs/notes/LeanIn_RawRegistry_Theory.md`.

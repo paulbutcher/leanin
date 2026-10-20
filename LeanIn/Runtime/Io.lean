@@ -273,7 +273,9 @@ private def opIdx : Op → UInt32
   | .shutdown => 3
 
 @[extern "np_raw_register"] opaque npRawRegister (conn : UInt32) (op : UInt32)
-  (k : Except IO.Error Result → IO Unit) : IO Unit
+  (k : Except IO.Error Result → IO Unit) : IO UInt32
+
+@[extern "np_raw_count"] opaque npRawCount : IO UInt32
 
 @[extern "np_raw_take"] opaque npRawTake (conn : UInt32) (op : UInt32) :
   IO (Option (Except IO.Error Result → IO Unit))
@@ -281,8 +283,9 @@ private def opIdx : Op → UInt32
 @[extern "np_raw_live"] opaque npRawLive : IO Bool
 
 /-- **Park a raw completion** for the loop to run on completion (experiment path). -/
-def registerRaw (conn : UInt32) (op : Op) (resume : Except IO.Error Result → IO Unit) : IO Unit :=
-  npRawRegister conn (opIdx op) resume
+def registerRaw (conn : UInt32) (op : Op) (resume : Except IO.Error Result → IO Unit) : IO Unit := do
+  unless (← npRawRegister conn (opIdx op) resume) != 0 do
+    throw (IO.userError s!"Io: raw registration refused for connection {conn} (registry uninitialised or index out of range)")
 
 /-- Take and run the raw completion for `conn`/`op`, if one is parked. -/
 private def rawResume (conn : UInt32) (op : Op) (res : Except IO.Error Result) : IO Unit := do
@@ -296,6 +299,29 @@ def withdrawRaw (conn : UInt32) (op : Op) : IO Unit := do
   match ← npRawTake conn (opIdx op) with
   | some _ => pure ()
   | none   => pure ()
+
+/-- Executable checks of the raw registry's ownership protocol: take-once, no take-twice, replace keeps one
+entry, withdraw leaves none, and the live count returns to zero. Fails loudly on the first violation. -/
+def rawRegistrySelfTest : IO Unit := do
+  let _ ← npUvRunOnceTimeout 0   -- create the loop, which initialises the registry's lock
+  let k : Except IO.Error Result → IO Unit := fun _ => pure ()
+  registerRaw 4000 .read k
+  unless (← npRawTake 4000 (opIdx .read)).isSome do
+    throw (IO.userError "raw registry: take after register returned none")
+  unless (← npRawTake 4000 (opIdx .read)).isNone do
+    throw (IO.userError "raw registry: an entry was taken twice")
+  registerRaw 4000 .write k
+  registerRaw 4000 .write k
+  unless (← npRawTake 4000 (opIdx .write)).isSome do
+    throw (IO.userError "raw registry: replace left no entry")
+  registerRaw 4001 .shutdown k
+  withdrawRaw 4001 .shutdown
+  unless (← npRawTake 4001 (opIdx .shutdown)).isNone do
+    throw (IO.userError "raw registry: withdraw left an entry")
+  let n ← npRawCount
+  unless n == 0 do
+    throw (IO.userError s!"raw registry: {n} entries survive the protocol")
+  npUvStop
 
 /-- Hand an accepted connection to the oldest parked accept, or hold it until one registers. -/
 private def arrive (loop : Std.Mutex Table) (idx : UInt32) : IO Unit := do

@@ -5157,6 +5157,10 @@ The stop is the process's own bookkeeping rather than a mode's: a mode that boun
 parked in the shim's `uv_run`, and the Lean task manager waits for every dedicated task at shutdown, so without
 this the process would print its record and then never exit. It is a no-op in a mode that bound no listener. -/
 def main (args : List String) : IO UInt32 := do
+  if args.contains "--raw-registry" then
+    LeanIn.Runtime.Io.rawRegistrySelfTest
+    IO.println "raw registry: register/take/no-double-take/replace/withdraw, live count 0 -- ok"
+    return 0
   let code ← runMode args
   Runtime.Io.stop
   return code
