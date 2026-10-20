@@ -923,16 +923,22 @@ end ServerHandle
 
 /-- Start serving without blocking: the accept loop runs on a dedicated thread, and the returned handle stops
 and joins it. Uses `serveUntilStopped`, so `stop` is a drain rather than an abort. -/
-def serveWithHandle (hooks : LeanIn.Runtime.Hooks) (handler : CoreHandler) (port : UInt16) :
-    IO ServerHandle := do
+def serveWithHandleH1 (hooks : LeanIn.Runtime.Hooks) (h1 : LeanIn.Examples.Http.H1.Limits)
+    (handler : CoreHandler) (port : UInt16) : IO ServerHandle := do
   let l ← LeanIn.Runtime.Listener.bind (LeanIn.Runtime.loopback port)
   let e ← LeanIn.Sched.Executor.new LeanIn.Task.Item 256 1
-  let cfg : LeanIn.Examples.Http.Server.Config := { clock := LeanIn.Runtime.Clock.live hooks }
+  let cfg : LeanIn.Examples.Http.Server.Config := { h1, clock := LeanIn.Runtime.Clock.live hooks }
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
     LeanIn.Runtime.serveUntilStopped hooks e l 20
       (LeanIn.Examples.Http.Server.serveConnStream cfg · handler) []
   let task ← IO.asTask (LeanIn.Runtime.run e prog) .dedicated
   return { executor := e, task }
+
+/-- `serveWithHandle` with the protocol's limits chosen by the caller. The default drops keep-alive after 100
+messages; a benchmark or a long-lived service can raise that. -/
+def serveWithHandle (hooks : LeanIn.Runtime.Hooks) (handler : CoreHandler) (port : UInt16) :
+    IO ServerHandle :=
+  serveWithHandleH1 hooks {} handler port
 
 /-- Serve `handler` on `port`, creating the hooks. -/
 def serve (handler : CoreHandler) (port : UInt16) : IO UInt32 := do

@@ -305,6 +305,9 @@ def echo : Handler :=
 def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :=
   LeanIO.Backend.LeanIn.NativeRouter.empty
     |>.add (nativeRoute GET "/ping" ping)
+    |>.route .get "/bench" (fun _ w =>
+      LeanIO.Backend.LeanIn.respond w 200 "OK"
+        "hello from std\nmethod=GET path=/bench version=HTTP/1.1\n".toUTF8)
     |>.route .get "/slow" (slow clock)
     |>.route .get "/user/{id}" (tag "users" userById)
     |>.route .post "/echo" echo
@@ -351,4 +354,8 @@ def main (args : List String) : IO UInt32 := do
   let port : UInt16 := ((args.headD "8787").toNat?.getD 8787).toUInt16
   let hooks ← LeanIn.Runtime.Hooks.new
   let clock := LeanIn.Runtime.Clock.live hooks
-  LeanIO.Backend.LeanIn.serveWith hooks (LeanIO.Backend.LeanIn.dispatch (routes clock).toTrie) port
+  let h ← LeanIO.Backend.LeanIn.serveWithHandleH1 hooks { maxMessages := 1000000000 }
+    (LeanIO.Backend.LeanIn.dispatch (routes clock).toTrie) port
+  match ← h.join with
+  | .ok _ => return 0
+  | .error e => IO.eprintln s!"the accept loop ended: {e}"; return 1
