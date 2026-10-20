@@ -881,11 +881,18 @@ raw registry's resume closure, which is where the rest of the 7.3 % marking term
 `Std.Mutex` with an `IO.Ref` (same `HashMap`, no lock) saves **1 810 Ir/request (3.1 %)**, which locates the
 marking cost at the mutex publication rather than at the hash operation. It is not shippable as written:
 `recvRaw`/`sendRaw` are public, and an unsynchronized `IO.Ref` is a data race the moment a raw operation is
-submitted off the driver thread — the cross-thread-state rule this repository states elsewhere. The safe shape
-with the same effect is a per-connection **trampoline** registered in the synchronized table once at accept
-(it captures only a per-connection cell), with each request's continuation written into that cell and resumed by
-the trampoline; per-request publication then disappears while the synchronized registry stays for genuine
-cross-thread registration. That refactor is the concrete next step for the marking term.
+submitted off the driver thread — the cross-thread-state rule this repository states elsewhere. The shape proposed as the safe substitute — a per-connection trampoline capturing a cell and registered once —
+was then tested and **withdrawn**: publishing a cell into a persistent global reference, and then writing fresh
+16 k-`UInt32` state into it, makes the identical update cost **22 984 ns/iter against 277 ns/iter** for the same
+cell never published (same `modifyGet` + `set!`, 2000 iterations). The runtime sources confirm why
+(v4.35.0-rc3): `lean_mark_mt` traverses closure environments and ref contents, and `lean_st_ref_put`/`swap` mark
+the stored value whenever `ref_maybe_mt(ref)` — when the reference is itself multi-threaded *or persistent*.
+Indirection through an ordinary cell is not an ownership boundary, so the trampoline cannot take the marking
+term; the driver-private context (variants C/D of the ownership handoff) is the remaining design.
+
+**Cumulative effect of the handoff's changes** — current server code (`f2dbf02`) against the pre-handoff
+revision (`5b74698`), paired, nine rounds: **1.009 at C=1, 1.021 at C=8, 1.024 at C=32** (measured on `729d9e2`;
+the C=1 interval straddles 1.0, so no gain is claimed there).
 
 
 **What the remaining gap is made of (C=1, pinned, `/proc` CPU per request).** The compiled driver costs
