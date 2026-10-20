@@ -1,3 +1,5 @@
+module
+
 import Lean
 import Lean.Parser.Term
 import LeanIn.Async.Attr
@@ -5,6 +7,8 @@ import LeanIn.Runtime.Net
 import LeanIn.Runtime.Io
 import LeanIn.Runtime.VM
 
+
+public section
 /-!
 # `async` — split-at-`await`, liveness-driven state machines, with control flow
 
@@ -878,3 +882,5 @@ elab "async " n:ident " (" c:ident " : " cty:term " )" params:bracketedBinder* "
   modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
 
 end LeanIn.Async
+
+end

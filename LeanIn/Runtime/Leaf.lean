@@ -1,9 +1,13 @@
+module
+
 import Std
 import Std.Async.Signal
 import LeanIn.Runtime.Basic
 import LeanIn.Runtime.Io
 import LeanIn.Task.Error
 
+
+public section
 /-!
 # The leaf seam
 
@@ -278,3 +282,5 @@ def race {α : Type} (hooks : Hooks) (v : α) (h : Task.Task α) (hs : List (Tas
   return r
 
 end LeanIn.Runtime
+
+end

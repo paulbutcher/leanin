@@ -1,9 +1,14 @@
+module
+
 import Std
-import LeanIn.Data.Deque
-import LeanIn.Sched.Pool
-import LeanIn.Model.Multi
+public import LeanIn.Data.Deque
+public import LeanIn.Sched.Pool
+public import LeanIn.Model.Multi
 import LeanIn.Sched.Scheduler
 
+
+public import Std.Sync.Mutex
+public section
 -- `Pool` is built on `Ring`, whose operations need `Inhabited α` (`toList` falls back to `default`), so
 -- anything holding a `Pool` needs the instance in scope. Carried once here rather than at each mention.
 set_option linter.unusedSectionVars false
@@ -518,7 +523,7 @@ def Executor.workerLoop (e : Executor α cap) (fire : Nat → α → IO Unit) (i
 
 /-- **Submit into worker `0`'s queue**: the driver's spelling, with the calling thread standing in for
 worker `0`. -/
-def Executor.submit (e : Executor α cap) (x : α) : IO Unit := do e.submitLocalRaw 0 x
+@[expose] def Executor.submit (e : Executor α cap) (x : α) : IO Unit := do e.submitLocalRaw 0 x
 
 /-- The `BaseIO` spelling a waker needs: enqueuing is the one thing a continuation registered on a stock
 `Task` does, and a waker cannot call `IO`. -/
@@ -561,7 +566,7 @@ def Executor.takeReport (e : Executor α cap) : IO (TakeReport α cap) := do
     | none   => return rep
 
 /-- Take one item of work: the decision without its report. -/
-def Executor.take (e : Executor α cap) : IO (Option α) := do
+@[expose] def Executor.take (e : Executor α cap) : IO (Option α) := do
   return (← e.takeReport).item
 
 /-- Wait for work and take one, or report that the executor is stopping with nothing left. -/
@@ -615,3 +620,5 @@ def Executor.metrics (e : Executor α cap) : IO (Option (List CarrierCounters)) 
   else return none
 
 end LeanIn.Sched
+
+end

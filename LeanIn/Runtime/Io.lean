@@ -1,7 +1,13 @@
+module
+
 import Std
 import LeanIn.Task.Basic
 import LeanIn.Task.Error
 
+
+public import Std.Net.Addr
+public import Std.Time.Time.Unit.Millisecond
+public section
 /-!
 # The I/O path on our own libuv loop
 
@@ -121,7 +127,7 @@ private inductive Op where
   deriving DecidableEq, BEq, Hashable
 
 /-- What the loop delivers to a parked operation. -/
-private inductive Result where
+inductive Result where
   /-- A connection libuv accepted, by its index. -/
   | accepted (idx : UInt32)
   /-- A read's outcome: the bytes it returned, or `none` for end of stream. A *failed* read is delivered as an
@@ -629,7 +635,7 @@ def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO U
 /-- **Stop the running loop**: fail everything parked, drop the queued and wheeled timers, ask the shim to stop,
 and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
 (and has finished) or nothing did, the stop-drain is run here, because no other thread will. -/
-def stop : IO Unit := do
+@[expose] def stop : IO Unit := do
   match ← loopRef.get with
   | none => pure ()
   | some table => do
@@ -925,3 +931,5 @@ caller can do but hear it. -/
 def close (c : Conn) : IO Unit := do
   if (← npUvClose c.idx) == 0 then
     throw (IO.userError "Io.close: the shim refused to close the connection")
+
+end

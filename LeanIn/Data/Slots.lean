@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 -- `toList` is the only declaration that needs `Inhabited`; the index arithmetic and `slot_ne` do not, so the
 -- section variable is unused in those. Kept as a section variable for readability.
 set_option linter.unusedSectionVars false
@@ -39,7 +43,7 @@ variable {α : Type} [Inhabited α]
 
 /-- **The ghost view**, under an index function: the live elements, oldest first. All reasoning about a
 container happens here, through the `List` its index function reads. -/
-def Slots.toList (s : Slots α) (idx : Nat → Nat) : List α :=
+@[expose] def Slots.toList (s : Slots α) (idx : Nat → Nat) : List α :=
   (List.range s.size).map fun i => ((s.slots[idx i]?).join).getD default
 
 /-- **The ghost view has as many elements as the store reports.** Not conditional on density: the view maps
@@ -49,7 +53,7 @@ theorem Slots.toList_length (s : Slots α) (idx : Nat → Nat) : (s.toList idx).
   simp [Slots.toList]
 
 /-- **Density**: every index the view reads holds an element rather than an empty slot. -/
-def Slots.Dense (s : Slots α) (idx : Nat → Nat) : Prop :=
+@[expose] def Slots.Dense (s : Slots α) (idx : Nat → Nat) : Prop :=
   ∀ i, i < s.size → ((s.slots[idx i]?).join).isSome
 
 /-- Write one slot, leaving the live range alone. The one store mutation both containers perform; a
@@ -101,3 +105,5 @@ theorem slot_ne {cap head i j : Nat} (hcap : 0 < cap) (hij : i < j) (hj : j < ca
 #print axioms LeanIn.slot_ne
 
 end LeanIn
+
+end

@@ -1,5 +1,10 @@
+module
+
 import Std
 
+
+public import Std.Sync.Mutex
+public section
 /-!
 # The single-carrier scheduler
 
@@ -57,13 +62,13 @@ def new : IO Queue := do
 /-- Push and notify **under the same lock**. The model proves the notification can be lost
 (`notifyOne_no_waiters`); the discipline here is what stops it being lost *while a carrier is parking*,
 which is the case no model theorem can rule out for us. -/
-def push (q : Queue) (j : Job) : IO Unit :=
+@[expose] def push (q : Queue) (j : Job) : IO Unit :=
   q.lock.atomically do
     set ((← get) ++ [j])
     q.cv.notifyOne
 
 /-- Take, parking until a job arrives or the queue is stopping. -/
-def take (q : Queue) : IO (Option Job) :=
+@[expose] def take (q : Queue) : IO (Option Job) :=
   q.lock.atomicallyOnce q.cv
     (pred := do return !(← get).isEmpty || (← q.stopping.get))
     (k := do
@@ -73,7 +78,7 @@ def take (q : Queue) : IO (Option Job) :=
       | j :: js' => set js'; return (some j))
 
 /-- Stop: further takes return nothing once the queue drains. -/
-def stop (q : Queue) : IO Unit := do
+@[expose] def stop (q : Queue) : IO Unit := do
   q.stopping.set true
   q.lock.atomically do q.cv.notifyAll
 
@@ -100,3 +105,5 @@ def blockOn (q : Queue) (finished : IO Bool) : IO Unit := do
       | none   => go := false
 
 end LeanIn.Sched
+
+end

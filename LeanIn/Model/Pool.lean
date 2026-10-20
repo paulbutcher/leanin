@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 /-!
 # The pool model
 
@@ -65,17 +69,17 @@ deriving Inhabited, Repr
 
 /-- The all-empty pool, written out field by field so that examples reduce — `default` does not
 unfold, which silently turns a vacuity check into an unprovable goal. -/
-def emptyPool (α : Type) : Pool α :=
+@[expose] def emptyPool (α : Type) : Pool α :=
   { ring := [], lifo := none, lifoPolls := 0,
     pushed := 0, taken := 0, cap := 256, lifoCap := 3 }
 
 /-- **Everything this pool holds, as one list**: the ring, then the slot. The count is its length, so every
 count law below is a list-length law — which is also why the count is a *function* of the pool rather than a
 stored counter: two counters that move together by coincidence are not the same quantity. -/
-def Pool.contents (p : Pool α) : List α := p.ring ++ p.lifo.toList
+@[expose] def Pool.contents (p : Pool α) : List α := p.ring ++ p.lifo.toList
 
 /-- Work this pool holds: its ring and its LIFO slot. The inject is not this pool's. -/
-def Pool.inFlight (p : Pool α) : Nat := p.contents.length
+@[expose] def Pool.inFlight (p : Pool α) : Nat := p.contents.length
 
 /-- **No lost work, with the shared inject the pool threads through.** Everything ever submitted to this
 pool is still held here or in the shared list, or was taken. This is Tokio's runtime assertion, as an
@@ -93,7 +97,7 @@ def Pool.Bounded (p : Pool α) : Prop := p.ring.length ≤ p.cap
 /-- The ring's own take: its front element. A thief uses this too, which is where "the LIFO slot is never
 stolen" is expressed — this function cannot see `p.lifo`. The shared inject is not a fallback here: the
 layer owning the shared lock serves it, after this pool's own queue is empty. -/
-def Pool.takeFromRing (p : Pool α) : Option α × Pool α :=
+@[expose] def Pool.takeFromRing (p : Pool α) : Option α × Pool α :=
   match p.ring with
   | x :: rest => (some x, { p with ring := rest, taken := p.taken + 1 })
   | []        => (none, p)
@@ -111,7 +115,7 @@ append and the count that follows it — `flushSlot_conserves` states the accoun
 
 Unconditional, because the caller is the one that knows the tick's allowance is spent; the take below is
 what refuses to clear a slot it may still serve. -/
-def Pool.flushSlot (p : Pool α) : Option α × Pool α :=
+@[expose] def Pool.flushSlot (p : Pool α) : Option α × Pool α :=
   match p.lifo with
   | some x => (some x, { p with lifo := none })
   | none   => (none, p)
@@ -124,7 +128,7 @@ otherwise the allowance could strand it, which is the same hazard `worker.rs:479
 up its core. That clear is not this function's, because its destination is shared: the pool says which slot
 is occupied (`takeSlot` reports `none` once the allowance is spent), and the executor's decision is the one
 `LeanIn.Sched.Pool.takeReport` records. -/
-def Pool.take (p : Pool α) : Option α × Pool α :=
+@[expose] def Pool.take (p : Pool α) : Option α × Pool α :=
   if p.lifoPolls < p.lifoCap then
     match p.lifo with
     | some x => (some x, { p with lifo := none, lifoPolls := p.lifoPolls + 1, taken := p.taken + 1 })
@@ -136,7 +140,7 @@ def Pool.take (p : Pool α) : Option α × Pool α :=
 def Pool.steal (victim : Pool α) : Option α × Pool α := victim.takeFromRing
 
 /-- A tick: the LIFO allowance refreshes. -/
-def Pool.tick (p : Pool α) : Pool α := { p with lifoPolls := 0 }
+@[expose] def Pool.tick (p : Pool α) : Pool α := { p with lifoPolls := 0 }
 
 /-! ### Submitting -/
 
@@ -152,7 +156,7 @@ that owns the shared lock, so the eviction is returned rather than written.
 Factored out because `spawn` needs the *same* rule for the task its LIFO slot displaces, and there should be
 one definition of the overflow rather than two that can drift. It does not count: the displaced task is
 already in the pool. -/
-def Pool.toRing (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
+@[expose] def Pool.toRing (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
   if p.ring.length < p.cap then
     (inj, { p with ring := p.ring ++ [x] })
   else
@@ -160,7 +164,7 @@ def Pool.toRing (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
      { p with ring := p.ring.take (p.ring.length / 2) ++ [x] })
 
 /-- Submit, with overflow: the placement rule, and the count. -/
-def Pool.submit (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
+@[expose] def Pool.submit (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
   let r := p.toRing inj x
   (r.1, { r.2 with pushed := p.pushed + 1 })
 
@@ -171,7 +175,7 @@ the same rule a submit uses, overflow included, so displacing it cannot silently
 This is the write side of `next_local_task` in the model's `take`, and it is placed *before* the ring rather
 than in `inject` because the slot's whole purpose is to keep a message pass on one core. It is also why the
 slot is never stolen: a thief reaches the ring and nothing else. -/
-def Pool.spawn (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
+@[expose] def Pool.spawn (p : Pool α) (inj : List α) (x : α) : List α × Pool α :=
   match p.lifo with
   | none   => (inj, { p with lifo := some x, pushed := p.pushed + 1 })
   | some y => let r := p.toRing inj y; (r.1, { r.2 with lifo := some x, pushed := p.pushed + 1 })
@@ -639,3 +643,5 @@ a proof that depended on one would be circular. `#print axioms` is the check. -/
 end Model
 
 end LeanIn
+
+end

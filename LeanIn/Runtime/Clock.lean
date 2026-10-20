@@ -1,9 +1,13 @@
+module
+
 import Std
 import Std.Async.Timer
 import LeanIn.Runtime.Basic
 import LeanIn.Runtime.Leaf
 import LeanIn.Runtime.Io
 
+
+public section
 /-!
 # The clock seam
 
@@ -166,3 +170,5 @@ def runVirtual (hc : HarnessClock) (e : Executor cap) (a : Task.Async Î±) : IO Î
   runWith e hc.now hc.advance a
 
 end LeanIn.Runtime
+
+end

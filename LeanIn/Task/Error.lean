@@ -1,5 +1,9 @@
-import LeanIn.Task.Basic
+module
 
+public import LeanIn.Task.Basic
+
+
+public section
 /-!
 # Failures as values
 
@@ -63,3 +67,5 @@ instance : MonadAsync (EAsync ε) where
 end EAsync
 
 end LeanIn.Task
+
+end

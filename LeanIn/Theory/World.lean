@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 /-!
 # The abstract machine
 
@@ -96,7 +100,7 @@ it. A call that spans stages — `wait` — deliberately does not: environment s
 another carrier's `tick` among them, and requiring equality across the whole interval would exclude them.
 Preserving the clock in an *effect* is also not the same claim as the *call* taking no time. What replaces
 it for a call is a property of the call's trace; see `Bridge.CallExec` and `wait_spec`. -/
-def World.SameClock (w w' : World) : Prop := w'.clock = w.clock ∧ w'.lastSample = w.lastSample
+@[expose] def World.SameClock (w w' : World) : Prop := w'.clock = w.clock ∧ w'.lastSample = w.lastSample
 
 /-- **Only the named lock may differ.** Every *other* lock keeps its owner and every condvar keeps its
 waiters: the frame of one isolated effect on `l`, which is to say what the primitive claims to do to the
@@ -483,3 +487,5 @@ example : ∃ w : World, w.clock = 1 :=
   ⟨{ (default : World) with clock := 1 }, rfl⟩
 
 end LeanIn
+
+end

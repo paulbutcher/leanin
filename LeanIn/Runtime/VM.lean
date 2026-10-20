@@ -1,7 +1,11 @@
+module
+
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Io
 import LeanIn.Runtime.Clock
 
+
+public section
 /-!
 # A defunctionalizing task monad (experiment)
 
@@ -215,3 +219,5 @@ def runAsync (m : VM α) (resume : α → IO Unit) : IO Unit :=
 end VM
 
 end LeanIn.Runtime
+
+end

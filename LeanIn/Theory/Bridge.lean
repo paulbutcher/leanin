@@ -1,6 +1,11 @@
-import Std
-import LeanIn.Theory.World
+module
 
+import Std
+public import LeanIn.Theory.World
+
+
+public import Std.Sync.Mutex
+public section
 /-!
 # The bridge: the only axioms
 
@@ -469,3 +474,5 @@ outside them -- and none of them says anything about a *runtime-facing* theorem 
 #print axioms LeanIn.notifyAll_no_additions
 
 end LeanIn
+
+end

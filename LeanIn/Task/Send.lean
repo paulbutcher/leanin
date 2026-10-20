@@ -1,6 +1,10 @@
-import Std
-import LeanIn.Task.Basic
+module
 
+import Std
+public import LeanIn.Task.Basic
+
+
+public section
 /-!
 # The carrier boundary: what may cross it, and where that is enforced
 
@@ -84,3 +88,5 @@ def Executor.route (e : Executor α cap) (i : Nat) [Send α] : Route α :=
 end Sched
 
 end LeanIn
+
+end

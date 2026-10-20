@@ -1,6 +1,11 @@
-import Std
-import LeanIn.Task.Basic
+module
 
+import Std
+public import LeanIn.Task.Basic
+
+
+public import Std.Sync.Mutex
+public section
 /-!
 # Async synchronisation: a mutex, a semaphore and a bounded channel
 
@@ -426,3 +431,5 @@ def tryRecv (c : Channel α) (push : Item → BaseIO Unit) : IO (Option α) := d
 end Channel
 
 end LeanIn.Task.Sync
+
+end

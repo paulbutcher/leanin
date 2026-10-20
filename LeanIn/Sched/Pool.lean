@@ -1,8 +1,12 @@
-import Std
-import LeanIn.Data.Ring
-import LeanIn.Data.Deque
-import LeanIn.Model.Pool
+module
 
+import Std
+public import LeanIn.Data.Ring
+import LeanIn.Data.Deque
+public import LeanIn.Model.Pool
+
+
+public section
 /-!
 # The pool, as the implementation keeps it
 
@@ -53,13 +57,13 @@ structure Pool (α : Type) (cap : Nat) where
 deriving Inhabited, Repr
 
 /-- A fresh pool: an empty ring of `cap` slots and nothing held. -/
-def emptyPool (α : Type) (cap : Nat) : Pool α cap :=
+@[expose] def emptyPool (α : Type) (cap : Nat) : Pool α cap :=
   { ring := emptyRing α cap }
 
 /-- The LIFO slot's contribution to a worker's own count: one when the slot is occupied. A named quantity
 rather than a `Bool`-valued `if` at each use, both because the model's list says the same thing and because
 two `if`s that print identically are two different terms when their `Decidable` instances differ. -/
-def Pool.slotCount (o : Option α) : Nat := if o.isSome then 1 else 0
+@[expose] def Pool.slotCount (o : Option α) : Nat := if o.isSome then 1 else 0
 
 omit [Inhabited α] in
 theorem Pool.slotCount_none : Pool.slotCount (none : Option α) = 0 := rfl
@@ -69,7 +73,7 @@ theorem Pool.slotCount_some (x : α) : Pool.slotCount (some x) = 1 := rfl
 
 /-- Work held in this pool's own queue: the ring and the LIFO slot. The inject is not part of a worker's
 count; the composition's count is `Snapshot.held`. -/
-def Pool.inFlight (p : Pool α cap) : Nat :=
+@[expose] def Pool.inFlight (p : Pool α cap) : Nat :=
   p.ring.size + Pool.slotCount p.lifo
 
 /-- **The projection.** The implementation's state as the specification describes it. "`Impl.push ⊑
@@ -86,7 +90,7 @@ def Pool.toModel (p : Pool α cap) : Model.Pool α :=
 /-- The owner's take off the ring: no allowance, no slot, no inject — the ring's front element. A thief
 uses this too, which is where "the LIFO slot is never stolen" comes from: this function cannot see
 `p.lifo`. -/
-def Pool.takeFromRing (p : Pool α cap) : Option α × Pool α cap :=
+@[expose] def Pool.takeFromRing (p : Pool α cap) : Option α × Pool α cap :=
   match p.ring.pop with
   | (some x, r) => (some x, { p with ring := r, taken := p.taken + 1 })
   | (none, _)   => (none, p)
@@ -127,7 +131,7 @@ structure TakeReport (α : Type) (cap : Nat) where
 
 /-- A tick: the LIFO allowance refreshes. This is the executor's T4 operation and SC5's explicit refresh; the
 take's own refresh is folded into `takeReport` below, which uses this. -/
-def Pool.tick (p : Pool α cap) : Pool α cap := { p with lifoPolls := 0 }
+@[expose] def Pool.tick (p : Pool α cap) : Pool α cap := { p with lifoPolls := 0 }
 
 /-- The owner's take, with the decision it made — **and the allowance's refresh, which the decision
 carries**.
@@ -181,7 +185,7 @@ def Pool.flushSlot (p : Pool α cap) : Option α × Pool α cap :=
 drift — the report is what the record reads, and this is what the worker uses. It is `takeReport`'s pool that
 is kept, so this take carries the allowance's refresh too: a caller of `Pool.take` gets the same bounded
 transaction as the executor's spellings, and there is no take that escapes the bound. -/
-def Pool.take (p : Pool α cap) : Option α × Pool α cap :=
+@[expose] def Pool.take (p : Pool α cap) : Option α × Pool α cap :=
   let r := p.takeReport
   (r.item, r.pool)
 
@@ -194,7 +198,7 @@ intaken.
 structure's, which is why the eviction is returned rather than written. Factored out so `spawn` places the
 task its LIFO slot displaces by the same rule, and there is one overflow rather than two that can drift. It
 does not count: the task was counted when it entered the pool. -/
-def Pool.toRing (p : Pool α cap) (x : α) : List α × Pool α cap :=
+@[expose] def Pool.toRing (p : Pool α cap) (x : α) : List α × Pool α cap :=
   if p.ring.size < cap then
     ([], { p with ring := p.ring.push x })
   else
@@ -207,14 +211,14 @@ def Pool.toRing (p : Pool α cap) (x : α) : List α × Pool α cap :=
     (live.drop half, { p with ring := (p.ring.keepFirst half).push x })
 
 /-- **Submit, with overflow**: the placement rule, and the count. -/
-def Pool.submit (p : Pool α cap) (x : α) : List α × Pool α cap :=
+@[expose] def Pool.submit (p : Pool α cap) (x : α) : List α × Pool α cap :=
   let r := p.toRing x
   (r.1, { r.2 with pushed := p.pushed + 1 })
 
 /-- **Spawn, owner-local.** The new task takes the LIFO slot; the task it displaces goes to the run queue by
 the same rule a submit uses, overflow included, so displacing it cannot silently drop it —
 `schedule_local`, `worker.rs:1398`. -/
-def Pool.spawn (p : Pool α cap) (x : α) : List α × Pool α cap :=
+@[expose] def Pool.spawn (p : Pool α cap) (x : α) : List α × Pool α cap :=
   match p.lifo with
   | none   => ([], { p with lifo := some x, pushed := p.pushed + 1 })
   | some y => let r := p.toRing y; (r.1, { r.2 with lifo := some x, pushed := p.pushed + 1 })
@@ -475,3 +479,5 @@ the pool is *about* the primitives, so a proof that depended on a bridge axiom w
 #print axioms LeanIn.Sched.takeReport_bounded
 
 end LeanIn.Sched
+
+end

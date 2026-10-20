@@ -1,6 +1,11 @@
-import Std
-import LeanIn.Task.Basic
+module
 
+import Std
+public import LeanIn.Task.Basic
+
+
+public import Std.Sync.Mutex
+public section
 /-!
 # A `JoinSet`-shaped set of handles
 
@@ -106,3 +111,5 @@ def Registry.drain (r : Registry α) : Async Unit := do
   return ()
 
 end LeanIn.Task
+
+end

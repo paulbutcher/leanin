@@ -1,5 +1,9 @@
-import LeanIn.Model.Scheduler
+module
 
+public import LeanIn.Model.Scheduler
+
+
+public section
 /-!
 # The wake protocol, as the implementation keeps it
 
@@ -34,13 +38,13 @@ structure Scheduler where
 deriving Inhabited, Repr
 
 /-- Well-formedness: at least one worker, and not more parked than exist. -/
-def Scheduler.WF (s : Scheduler) : Prop := 0 < s.total ∧ s.parked ≤ s.total
+@[expose] def Scheduler.WF (s : Scheduler) : Prop := 0 < s.total ∧ s.parked ≤ s.total
 
 /-- **No lost wakeup.** If there is work, at least one worker is not parked. -/
-def Scheduler.Live (s : Scheduler) : Prop := s.work = 0 ∨ s.parked < s.total
+@[expose] def Scheduler.Live (s : Scheduler) : Prop := s.work = 0 ∨ s.parked < s.total
 
 /-- A fresh scheduler: `n` workers, none parked, no work. -/
-def Scheduler.initial (n : Nat) : Scheduler := { work := 0, parked := 0, total := n }
+@[expose] def Scheduler.initial (n : Nat) : Scheduler := { work := 0, parked := 0, total := n }
 
 /-- **The projection.** The same four fields, read as the specification describes them. -/
 def Scheduler.toModel (s : Scheduler) : Model.Sched :=
@@ -53,12 +57,12 @@ def Scheduler.toModel (s : Scheduler) : Model.Sched :=
 The two halves are not separable — that is `reachable_live` — and in an executor it is one critical
 section: check-and-park under the same lock that an enqueue wakes under, or the wakeup is lost between the
 check and the park. -/
-def Scheduler.enqueue (s : Scheduler) : Scheduler :=
+@[expose] def Scheduler.enqueue (s : Scheduler) : Scheduler :=
   { s with work := s.work + 1, parked := if 0 < s.parked then s.parked - 1 else 0 }
 
 /-- A worker parks. **No transition unless there is no work and a worker is still running** — the encoding
 of checking the work state and parking under the same lock. `none` is a refused park, not a failed one. -/
-def Scheduler.park (s : Scheduler) : Option Scheduler :=
+@[expose] def Scheduler.park (s : Scheduler) : Option Scheduler :=
   if s.work = 0 ∧ s.parked < s.total then some { s with parked := s.parked + 1 } else none
 
 /-- **A granted park leaves the work count alone.** Only `parked` moves, which is why parking cannot
@@ -70,11 +74,11 @@ theorem Scheduler.park_work (s s' : Scheduler) (h : s.park = some s') : s'.work 
   · exact absurd h (by simp)
 
 /-- A worker completes one item of work. -/
-def Scheduler.take (s : Scheduler) : Option Scheduler :=
+@[expose] def Scheduler.take (s : Scheduler) : Option Scheduler :=
   if 0 < s.work then some { s with work := s.work - 1 } else none
 
 /-- Shutdown. -/
-def Scheduler.stop (s : Scheduler) : Scheduler := { s with stopping := true }
+@[expose] def Scheduler.stop (s : Scheduler) : Scheduler := { s with stopping := true }
 
 /-! ### Agreement with the specification
 
@@ -113,3 +117,5 @@ theorem toModel_Live (s : Scheduler) (h : s.Live) : s.toModel.Live := by
   exact h
 
 end LeanIn.Sched
+
+end

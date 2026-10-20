@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 /-!
 # The scheduler, and no lost wakeup
 
@@ -51,20 +55,20 @@ structure Sched where
 deriving Inhabited, Repr
 
 /-- Well-formedness: there is at least one worker, and not more parked than exist. -/
-def Sched.WF (s : Sched) : Prop := 0 < s.total ∧ s.parked ≤ s.total
+@[expose] def Sched.WF (s : Sched) : Prop := 0 < s.total ∧ s.parked ≤ s.total
 
 /-- **No lost wakeup.** If there is work, at least one worker is not parked. -/
-def Sched.Live (s : Sched) : Prop := s.work = 0 ∨ s.parked < s.total
+@[expose] def Sched.Live (s : Sched) : Prop := s.work = 0 ∨ s.parked < s.total
 
 /-- A fresh scheduler: `n` workers, none parked, no work. -/
-def Sched.initial (n : Nat) : Sched := { work := 0, parked := 0, total := n }
+@[expose] def Sched.initial (n : Nat) : Sched := { work := 0, parked := 0, total := n }
 
 /-! ### The protocol -/
 
 /-- **Enqueue, correctly.** Work is added *and* a parked worker is unparked, as one step.
 
 The two halves are not separable: that is the whole content of `reachable_live`. -/
-def Sched.enqueue (s : Sched) : Sched :=
+@[expose] def Sched.enqueue (s : Sched) : Sched :=
   { s with work := s.work + 1, parked := if 0 < s.parked then s.parked - 1 else 0 }
 
 /-- **Enqueue, naively.** Adds the work and leaves the waking to some later step. Plausible, and
@@ -73,15 +77,15 @@ def Sched.enqueueWithoutWaking (s : Sched) : Sched := { s with work := s.work + 
 
 /-- A worker parks. **No transition unless there is no work and a worker is still running** — the
 encoding of checking the work state and parking under the same lock. -/
-def Sched.park (s : Sched) : Option Sched :=
+@[expose] def Sched.park (s : Sched) : Option Sched :=
   if s.work = 0 ∧ s.parked < s.total then some { s with parked := s.parked + 1 } else none
 
 /-- A worker completes one item of work. -/
-def Sched.take (s : Sched) : Option Sched :=
+@[expose] def Sched.take (s : Sched) : Option Sched :=
   if 0 < s.work then some { s with work := s.work - 1 } else none
 
 /-- Shutdown. -/
-def Sched.stop (s : Sched) : Sched := { s with stopping := true }
+@[expose] def Sched.stop (s : Sched) : Sched := { s with stopping := true }
 
 /-! ### The invariant is preserved -/
 
@@ -236,3 +240,5 @@ example : ({(default : Sched) with work := 0}).take = none := by simp [Sched.tak
 end Model
 
 end LeanIn
+
+end

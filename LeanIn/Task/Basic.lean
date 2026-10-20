@@ -1,6 +1,11 @@
+module
+
 import Std
 import LeanIn.Sched.Executor
 
+
+public import Std.Sync.Mutex
+public section
 /-!
 # The task layer
 
@@ -348,7 +353,7 @@ def Async.«local» : Async Local := ⟨fun k ctx => k ctx.«local» ctx⟩
 `Task.cancel`) and a sync release or probe that hands a wake to a parked waiter all take the *delivering* step's
 own route, and this is where a step running inside a computation gets it. The route is read here, at the step
 that is running, never captured earlier. -/
-def Async.push : Async (Item → BaseIO Unit) := ⟨fun k ctx => k ctx.resume ctx⟩
+@[expose] def Async.push : Async (Item → BaseIO Unit) := ⟨fun k ctx => k ctx.resume ctx⟩
 
 /-- **The shared route**, for a resolution made by a thread that owns no queue — the loop thread firing a timer
 being the standing case. `Async.push` is the firing worker's *local* route, which only a step re-enqueuing
@@ -495,3 +500,5 @@ def background [Monad m] [MonadAsync m] (a : m α) : m Unit := do
   return ()
 
 end LeanIn.Task
+
+end

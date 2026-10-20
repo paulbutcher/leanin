@@ -1,6 +1,10 @@
-import Std
-import LeanIn.Data.Slots
+module
 
+import Std
+public import LeanIn.Data.Slots
+
+
+public section
 -- `toList` and the build lemmas need `Inhabited`; the index arithmetic does not.
 set_option linter.unusedSectionVars false
 
@@ -38,12 +42,12 @@ variable {α : Type} [Inhabited α]
 
 /-- **The ghost view.** The live elements, oldest first, read through the store's index function: absolute, so
 nothing below this line sees a modulus. -/
-def Deque.toList (d : Deque α) : List α :=
+@[expose] def Deque.toList (d : Deque α) : List α :=
   d.toSlots.toList (fun i => d.head + i)
 
 /-- Well-formedness: the live range is inside the store, and it is **dense** — every index the view reads
 holds an element, not an empty slot. -/
-def Deque.WF (d : Deque α) : Prop :=
+@[expose] def Deque.WF (d : Deque α) : Prop :=
   d.head + d.size ≤ d.slots.size ∧
   ∀ i, i < d.size → ((d.slots[d.head + i]?).join).isSome
 
@@ -121,24 +125,24 @@ theorem Slots.dense_ofList (live : List α) (room : Nat) :
 
 /-- Write one element at the free position and grow the live count. The caller has established that the
 position is inside the store. -/
-def Deque.write (d : Deque α) (x : α) : Deque α :=
+@[expose] def Deque.write (d : Deque α) (x : α) : Deque α :=
   { d with slots := d.slots.setIfInBounds (d.head + d.size) (some x), size := d.size + 1 }
 
 /-- **Rebuild the store**: the live range copied to a fresh array with `room` empty slots after it, and the
 head reset. This is the one move both the compaction and the growth cost, and `Slots.toList_ofList` is what
 says it does not change what the deque holds. -/
-def Deque.rebuild (d : Deque α) (room : Nat) : Deque α :=
+@[expose] def Deque.rebuild (d : Deque α) (room : Nat) : Deque α :=
   { toSlots := Slots.ofList d.toList room }
 
 /-- **Push at the back.** Write in place when the tail has room; compact the consumed prefix when it does not
 and the head has advanced; grow the store when the head is already at zero. -/
-def Deque.push (d : Deque α) (x : α) : Deque α :=
+@[expose] def Deque.push (d : Deque α) (x : α) : Deque α :=
   if d.head + d.size < d.slots.size then d.write x
   else if 0 < d.head then (d.rebuild (max 1 (d.slots.size - d.size))).write x
   else (d.rebuild (max 1 (2 * d.size))).write x
 
 /-- **Pop from the front.** No element moves; the head advances. -/
-def Deque.pop (d : Deque α) : Option α × Deque α :=
+@[expose] def Deque.pop (d : Deque α) : Option α × Deque α :=
   if 0 < d.size then
     match d.slots[d.head]? with
     | some (some x) =>
@@ -369,3 +373,5 @@ example : (let d : Deque Nat := { slots := #[some 1, some 2], head := 0, size :=
 #print axioms LeanIn.Slots.toList_ofList
 
 end LeanIn
+
+end

@@ -1,5 +1,10 @@
+module
+
 import Lean
 
+
+public import Lean.Attributes
+public section
 /-!
 # The `async` runner tag
 
@@ -27,3 +32,5 @@ initialize spawnAttr : Lean.TagAttribute ←
       "`leaninAsyncMachineSpawn` is applied by `async` to the `spawn` it generates; it may not be applied by hand")
 
 end LeanIn.Async
+
+end

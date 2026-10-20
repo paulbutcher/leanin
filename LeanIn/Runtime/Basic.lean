@@ -1,7 +1,11 @@
+module
+
 import Std
 import LeanIn.Task.Send
 import LeanIn.Runtime.Io
 
+
+public section
 /-!
 # The runtime: P carriers, and the driver on the calling thread
 
@@ -138,7 +142,7 @@ def Handle.spawn (h : Handle Task.Item cap) (_prio : Priority) (a : Task.Async �
   return ⟨cell, cancel⟩
 
 /-- Stop the executor: `Executor.stop`, so a later iteration of a serving loop sees the flag. -/
-def Handle.stop (h : Handle α cap) [Inhabited α] : IO Unit := h.e.stop
+@[expose] def Handle.stop (h : Handle α cap) [Inhabited α] : IO Unit := h.e.stop
 
 /-- The two counts and the per-carrier counters, read without mutating or notifying anything. -/
 def Handle.metrics (h : Handle α cap) [Inhabited α] : IO Metrics := do
@@ -181,7 +185,7 @@ def startCarriers (e : Executor cap) (p : Nat) : IO (Carriers cap) :=
 
 /-- Stop the carriers: the flag, and every parked carrier woken. A stop is a drain rather than a cut — a
 worker's loop leaves only when the flag is set and it has nothing left to take. -/
-def Carriers.stop (c : Carriers cap) : IO Unit := c.e.stop
+@[expose] def Carriers.stop (c : Carriers cap) : IO Unit := c.e.stop
 
 /-- Wait for every carrier thread to exit. A worker that never returns makes this wait unbounded, which is
 stated rather than promised away — `BlockingPool.shutdownAndWait`'s existing wording. -/
@@ -364,3 +368,5 @@ def runCarriers (e : Executor cap) (p : Nat) (a : Task.Async α) : IO (Carriers 
   | none   => throw (IO.userError "Runtime.runCarriers: the carriers stopped before the computation finished")
 
 end LeanIn.Runtime
+
+end

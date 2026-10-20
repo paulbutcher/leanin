@@ -1,7 +1,11 @@
-import LeanIn.Model.Inject
-import LeanIn.Model.Pool
-import LeanIn.Model.Scheduler
+module
 
+public import LeanIn.Model.Inject
+public import LeanIn.Model.Pool
+public import LeanIn.Model.Scheduler
+
+
+public section
 /-!
 # The model at P carriers
 
@@ -274,7 +278,7 @@ def Multi.parkedAt (m : Multi α cap) (i : Nat) : Bool := (m.parked[i]?).getD fa
 def Multi.parkedCount (m : Multi α cap) : Nat := (m.parked.filter id).length
 
 /-- Everything held: every carrier's own queue, plus the shared list. -/
-def Multi.held (m : Multi α cap) : Nat :=
+@[expose] def Multi.held (m : Multi α cap) : Nat :=
   (m.workers.map Pool.inFlight).sum + m.inject.items.length
 
 /-- **The projection onto the abstract protocol.** `work` is the composition's `held`, `parked` is how
@@ -288,12 +292,12 @@ def Multi.toSched (m : Multi α cap) : Sched :=
 
 /-- Well-formedness: at least one carrier, one flag per carrier, and every carrier's capacity is the
 type parameter's. The flags' alignment is what lets a position mean the same carrier in both lists. -/
-def Multi.WF (m : Multi α cap) : Prop :=
+@[expose] def Multi.WF (m : Multi α cap) : Prop :=
   0 < m.workers.length ∧ m.parked.length = m.workers.length ∧ ∀ p ∈ m.workers, p.cap = cap
 
 /-- **No lost wakeup**, in the shape the single-carrier obligation has: either nothing is held, or some
 carrier is not parked. -/
-def Multi.Live (m : Multi α cap) : Prop :=
+@[expose] def Multi.Live (m : Multi α cap) : Prop :=
   m.held = 0 ∨ m.parkedCount < m.workers.length
 
 /-- **No lost work**: everything submitted is held or was taken. -/
@@ -313,7 +317,7 @@ def Multi.Bounded (m : Multi α cap) : Prop := ∀ p ∈ m.workers, p.lifoPolls 
 
 /-- A fresh composition: `n` carriers, all empty, none parked, nothing held, every carrier's own
 capacity the type parameter's. -/
-def Multi.initial (α : Type) (cap : Nat) (n : Nat) : Multi α cap :=
+@[expose] def Multi.initial (α : Type) (cap : Nat) (n : Nat) : Multi α cap :=
   { workers := List.replicate n { emptyPool α with cap := cap }
     inject := { items := [] }
     parked := List.replicate n false }
@@ -480,7 +484,7 @@ def Multi.stealInto (m : Multi α cap) (i j : Nat) : Option (Multi α cap) :=
 
 /-- **A carrier parks.** Only from its own empty queue *and* an empty shared list, so the check and the
 park are one step and nothing can arrive between them. -/
-def Multi.park (m : Multi α cap) (i : Nat) : Option (Multi α cap) :=
+@[expose] def Multi.park (m : Multi α cap) (i : Nat) : Option (Multi α cap) :=
   match m.workers[i]? with
   | none => none
   | some p =>
@@ -499,7 +503,7 @@ def Multi.tick (m : Multi α cap) (i : Nat) : Multi α cap :=
   | some p => { m with workers := setAt m.workers i p.tick }
 
 /-- Shutdown. -/
-def Multi.stop (m : Multi α cap) : Multi α cap := { m with stopping := true }
+@[expose] def Multi.stop (m : Multi α cap) : Multi α cap := { m with stopping := true }
 
 /-! ### The generic invariant steps
 
@@ -1520,3 +1524,5 @@ do: the inject is a list and the carriers are lists, so nothing here reaches a p
 end Model
 
 end LeanIn
+
+end

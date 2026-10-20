@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 /-!
 # The service, and its three obligations
 
@@ -97,7 +101,7 @@ def Service.PendingWithinLive (s : Service) : Prop := ∀ i ∈ s.pending, i ∈
 
 /-- Well-formedness: a nonzero bound, no connection owing two responses, every listed connection
 below the admitted count (so a fresh id is always available), and the counts agreeing. -/
-def Service.WF (s : Service) : Prop :=
+@[expose] def Service.WF (s : Service) : Prop :=
   0 < s.bound ∧ s.pending.Nodup ∧
   (∀ i ∈ s.live ++ s.completed ++ s.closed, i < s.admitted) ∧
   s.live.length + s.completed.length + s.closed.length = s.admitted
@@ -107,7 +111,7 @@ def Service.Inv (s : Service) : Prop :=
   s.WF ∧ s.NoDrop ∧ s.Bounded ∧ s.RequestsResolved ∧ s.PendingWithinLive
 
 /-- A fresh service: no connections, no requests. -/
-def Service.initial (bound cap : Nat) : Service :=
+@[expose] def Service.initial (bound cap : Nat) : Service :=
   { bound := bound, cap := cap }
 
 /-! ### The transitions
@@ -848,3 +852,5 @@ theorem closeDropping_breaks_requests :
 end Model
 
 end LeanIn
+
+end

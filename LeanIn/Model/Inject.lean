@@ -1,5 +1,9 @@
+module
+
 import Std
 
+
+public section
 /-!
 # The shared inject queue
 
@@ -29,10 +33,10 @@ structure Inject (α : Type) where
 deriving Inhabited, Repr
 
 /-- Append at the back — the specification's own `++ [x]`. -/
-def Inject.push (j : Inject α) (x : α) : Inject α := { items := j.items ++ [x] }
+@[expose] def Inject.push (j : Inject α) (x : α) : Inject α := { items := j.items ++ [x] }
 
 /-- Take from the front. -/
-def Inject.pop (j : Inject α) : Option α × Inject α :=
+@[expose] def Inject.pop (j : Inject α) : Option α × Inject α :=
   match j.items with
   | x :: rest => (some x, { items := rest })
   | []        => (none, j)
@@ -65,3 +69,5 @@ theorem pop_returns_if_present (j : Inject α) (h : j.items ≠ []) : (j.pop).1.
 end Model
 
 end LeanIn
+
+end

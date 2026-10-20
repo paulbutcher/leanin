@@ -1,9 +1,13 @@
+module
+
 import Std
 import Std.Async.Timer
 import LeanIn.Runtime.Clock
 import LeanIn.Runtime.Leaf
 import LeanIn.Task.Basic
 
+
+public section
 /-!
 # Time on our carriers
 
@@ -64,3 +68,5 @@ def withTimeout (c : Clock) (d : Std.Time.Millisecond.Offset) (a : Task.Async α
   Task.Async.await (show Task.Task (Option α) from ⟨cell, token⟩)
 
 end LeanIn.Runtime
+
+end

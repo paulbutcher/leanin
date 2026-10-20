@@ -1,3 +1,5 @@
+module
+
 import Std
 import Std.Async.TCP
 import LeanIn.Runtime.Io
@@ -7,6 +9,8 @@ import LeanIn.Task.Error
 import LeanIn.Task.Registry
 import LeanIn.Task.Sync
 
+
+public section
 /-!
 # Sockets on our carriers
 
@@ -304,3 +308,5 @@ def loopback (port : UInt16 := 0) : Std.Net.SocketAddress :=
   .v4 ⟨⟨#v[127, 0, 0, 1]⟩, port⟩
 
 end LeanIn.Runtime
+
+end

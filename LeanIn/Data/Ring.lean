@@ -1,6 +1,10 @@
-import Std
-import LeanIn.Data.Slots
+module
 
+import Std
+public import LeanIn.Data.Slots
+
+
+public section
 -- `toList` is the only declaration that needs `Inhabited`; the laws about `WF` and the operations do
 -- not, so the section variable is unused in those. Kept as a section variable for readability.
 set_option linter.unusedSectionVars false
@@ -57,7 +61,7 @@ variable {α : Type} [Inhabited α]
 
 /-- **The ghost view.** The live elements, oldest first. All reasoning happens here: the shared store's
 view at the ring's index function, which wraps at `cap` and is the only place a modulus appears. -/
-def Ring.toList (r : Ring α cap) : List α :=
+@[expose] def Ring.toList (r : Ring α cap) : List α :=
   r.toSlots.toList (fun i => (r.head + i) % cap)
 
 /-- Well-formedness.
@@ -65,16 +69,16 @@ def Ring.toList (r : Ring α cap) : List α :=
 `slots_size` says the store is exactly `cap` slots and `size_le` that the live range fits; `dense` says the
 live slots hold **elements**, not merely that the slots exist — note the `join`, without which a slot
 containing `none` would satisfy the conjunct while `toList` quietly fell back to a default. -/
-def Ring.WF (r : Ring α cap) : Prop :=
+@[expose] def Ring.WF (r : Ring α cap) : Prop :=
   r.slots.size = cap ∧ r.size ≤ cap ∧
   ∀ i, i < r.size → ((r.slots[(r.head + i) % cap]?).join).isSome
 
 /-- Push at the free end. No element moves. -/
-def Ring.push (r : Ring α cap) (x : α) : Ring α cap :=
+@[expose] def Ring.push (r : Ring α cap) (x : α) : Ring α cap :=
   { r with slots := r.slots.setIfInBounds ((r.head + r.size) % cap) (some x), size := r.size + 1 }
 
 /-- Pop the oldest. No element moves. -/
-def Ring.pop (r : Ring α cap) : Option α × Ring α cap :=
+@[expose] def Ring.pop (r : Ring α cap) : Option α × Ring α cap :=
   if 0 < r.size then
     match r.slots[r.head % cap]? with
     | some (some x) =>
@@ -239,7 +243,7 @@ are read exactly once by whoever needs them. -/
 the live count, so only the caller's read of what it still holds costs anything.
 
 `min k r.size` rather than `k`, so a caller cannot demand more than is there. -/
-def Ring.keepFirst (r : Ring α cap) (k : Nat) : Ring α cap :=
+@[expose] def Ring.keepFirst (r : Ring α cap) (k : Nat) : Ring α cap :=
   { r with size := min k r.size }
 
 /-- `map` commutes with `take`, in the direction the next lemma needs. Proved here rather than cited: the core
@@ -311,3 +315,5 @@ example : (Ring.pop (Ring.push (emptyRing Nat 4) 7)).1.isSome := by
 #print axioms LeanIn.pop_wf
 
 end LeanIn
+
+end

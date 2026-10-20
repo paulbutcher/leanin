@@ -1,7 +1,11 @@
+module
+
 import Std
 import LeanIn.Runtime.Leaf
 import LeanIn.Task.Error
 
+
+public section
 /-!
 # The blocking pool
 
@@ -68,7 +72,7 @@ namespace BlockingPool
 notification is made under, so a worker that finds nothing parks *inside* this critical section and a
 submitter cannot slip between the check and the park. `none` means the queue is empty *and* the pool is
 stopping — a stopping pool still serves what it holds, so this is a drain rather than an abrupt exit. -/
-def take (p : BlockingPool) : IO (Option (IO Unit)) :=
+@[expose] def take (p : BlockingPool) : IO (Option (IO Unit)) :=
   p.state.atomicallyOnce p.cv
     (pred := do
       let st ← get
@@ -120,7 +124,7 @@ def new (workers : Nat) : IO BlockingPool := do
 because a job no worker will take would hang whoever awaits it. The notify is unconditional: there is no
 parked counter to consult, and a notification with no waiter is lost but harmless, since a worker that
 parks afterwards re-checks the predicate under this same lock. -/
-def submit (p : BlockingPool) (j : IO Unit) : IO Unit :=
+@[expose] def submit (p : BlockingPool) (j : IO Unit) : IO Unit :=
   p.state.atomically do
     let st ← get
     if st.stopping then
@@ -190,3 +194,5 @@ def spawnBlocking (p : BlockingPool) (hooks : Hooks) (act : IO α) : Task.Async 
        | .error e => panic! s!"spawnBlocking: the blocking job failed: {e}") ctx⟩
 
 end LeanIn.Runtime
+
+end
