@@ -1021,6 +1021,26 @@ Depth-1 is at parity at C=1, **1.16× at C=8 and 1.44× at C=32**; pipelining is
 0.53× at C=1 and 1.02–1.06× by C=8/C=32. The C=32 depth-1 figure is the one to re-check on a settled box: Node's
 rows were taken before the load rose, so the ordering is conservative rather than flattering.
 
+**Second screen, on the hardened build (`554e3b0`).** Same command and method; load rose from ~2.5 to 8.1
+during the run and Node's rows were taken first, into the lighter load. Requests per second:
+
+| shape | arm | C=1 | C=8 | C=32 |
+|---|---|---|---|---|
+| d1 | Node | 64 100 | 140 011 | 144 473 |
+| d1 | leanin | 62 568 | 147 791 | 126 481 |
+| d1 | shipped | 5 323 | 5 584 | 7 626 |
+| p16 | Node | 164 090 | 168 179 | 177 930 |
+| p16 | leanin | 424 573 | 512 451 | 411 417 |
+| p16 | shipped | 7 472 | 11 436 | 12 462 |
+| churn | Node | 26 067 | 46 106 | 48 686 |
+| churn | leanin | 16 128 | 42 115 | 39 992 |
+| churn | shipped | 2 815 | 1 923 | 1 438 |
+
+Against the earlier `e55b7db` run this is 0.98 / 1.06 / 0.88 at depth 1, 2.59 / 3.05 / 2.31 pipelined and
+0.62 / 0.91 / 0.82 under churn: the pipelined lead reproduces, depth-1 C=32 and churn move with the load, and the
+honest reading is that the screen is an illustration, not a ratio claim — `bench/paired.sh` remains the instrument
+for that. Depth-1 C=32 is the figure most sensitive to a busy box and is the one to re-check settled.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always
