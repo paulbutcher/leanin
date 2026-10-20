@@ -4,7 +4,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 port="${DRAIN_PORT:-8823}"
 lake build leanioDrain >/dev/null || { echo "drain: build failed" >&2; exit 1; }
-./.lake/build/bin/leanioDrain "$port" 1500 >/tmp/leanio-drain.log 2>&1 &
+./.lake/build/bin/leanioDrain "$port" 200 >/tmp/leanio-drain.log 2>&1 &
 srv=$!
 trap 'kill $srv 2>/dev/null; wait $srv 2>/dev/null' EXIT
 for _ in $(seq 1 200); do ss -ltn 2>/dev/null | grep -q ":${port} " && break; sleep 0.05; done
