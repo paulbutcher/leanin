@@ -485,6 +485,43 @@ read with `--inclusive=yes` for the instruction split. Server rows, the binary n
 `LD_LIBRARY_PATH="$(nix develop -c printenv LD_LIBRARY_PATH)" ./.lake/build/bin/server <port> static quiet`
 driven by `node bench/load.mjs <port> <C> 5 /bench`.
 
+### 3.7 The LeanIO native backend against the shipped server: 11–15×
+
+Upstream LeanIO is router-only: it has no server adapter of its own, and the serving path it was used with is the
+shipped `Std.Http.Server` (`LeanIn/Exe/StdServer.lean`). That is the comparison here — the fork's LeanIn-backed
+backend at `LeanIO.Examples.Native`, against `Std.Http.Server` — because there is no in-tree stock LeanIO server
+to run as the original. Both arms answer `GET /bench` with the same 59 bytes in keep-alive, on distinct pinned
+cores, and the native arm raises `H1.Limits.maxMessages` so neither side closes keep-alive mid-run.
+
+Measured on commit `1f6b302`, 2026-10-20, with
+
+```
+PAIRS=7 DURATION=5 nix develop -c bash bench/leanio-pair.sh 1 8 32
+```
+
+on the 8-core box, server on CPU 1, client on CPU 2, both `energy_performance_preference=performance`, load
+average 5.05 4.06 2.79 before and 5.53 4.55 3.23 after (rising during the run). Each round drives one arm then
+the other in alternating order; the ratio is the median of the seven paired ratios, with the interquartile range,
+and the per-arm medians are context only.
+
+| C | shipped `Std.Http.Server` rps | `leanioNative` rps | native / shipped (median, IQR) |
+|---|---|---|---|
+| 1 | 5 095 | 56 285 | **11.02×** (10.83–11.60) |
+| 8 | 6 003 | 84 414 | **14.11×** (14.00–14.17) |
+| 32 | 6 037 | 90 392 | **14.80×** (14.72–15.08) |
+
+The shipped server spreads work over the stock task pool; the native arm is one carrier driving LeanIn's own
+connection machine, so the comparison is architectural as well as per-request. These are single-handler,
+keep-alive, no-body rows: they say nothing about streaming or disconnect paths beyond what
+`tests/leanio-native.sh` checks.
+
+**Withdrawn readings.** An earlier run of this instrument reported native/std of 0.004, 0.034 and 0.108. It was
+not a server result: `H1.Limits.maxMessages` defaults to 100, the native arm closed each keep-alive connection
+after 100 requests, and `bench/load.mjs` does not reconnect, so throughput was capped at `100 × C / duration`.
+A second run repeated the cap because a backgrounded `pin` subshell had left the old server holding the port and
+the new one failed to bind. Both are fixed — the native example raises the limit, and `pin` now `exec`s while
+startup refuses a busy port — and the rows above are the same-session paired reading after those fixes.
+
 ## 4. 🔴 Where we are worse
 
 Stated before anything above it, because it is the honest part of this document. The section holds one
@@ -1262,6 +1299,7 @@ record is not updated for it.
 | `LEAN_NUM_THREADS=1 nix develop -c lake exe controls --runtime-registry` | the same `registrybench\|`/`registryhand\|`/`registryheld\|` rows at one pool thread — the invocation §3.2's one-thread figures come from, since the registry is single-carrier code and the figure is not a scaling claim |
 | `nix develop -c lake exe controls --runtime-select` | selection, racing and priority (§3.3): 2 000 rounds of `select` against a plain await, 2 000 rounds of `race` (each round spawning, awaiting and cancelling a parked loser) against a plain await, the served label order for a `.normal`-then-`.high` issue and the reverse with the preloaded-ring counts, and enqueue-to-first-step for both lanes; plus SC16's `select\|`, `race\|` and `priority\|` records and its checker's `selectctl\|` readings |
 | `LEAN_NUM_THREADS=1 nix develop -c lake exe controls --runtime-select` | the same `selectbench\|`/`racebench\|`/`priorityorder\|`/`prioritybench\|` rows at one pool thread — the invocation §3.3's one-thread figures come from, since the runtime is single-carrier code and the figures are not scaling claims |
+| `PAIRS=7 DURATION=5 nix develop -c bash bench/leanio-pair.sh 1 8 32` | the LeanIO native backend against the shipped `Std.Http.Server` over `GET /bench` (§3.7): paired, interleaved keep-alive throughput at three connection levels, with the per-round ratios and their median/IQR |
 | `nix develop -c lake exe controls --runtime-handle --ready-file PATH` | the runtime handle, the counters and a signal-driven drain (§3.4): 200 non-carrier `Handle.spawn`s against a parked carrier beside 200 carrier-side spawns; the metered and unmetered accumulators over 5 alternated rounds (minima and band) on the same program; and the signal-to-drain return. Started as a background executable and sent `SIGTERM` at the pid it writes to `PATH`, like `tests/executor-contract.sh SC17`; it also prints SC17's `handle\|`, `clock\|`, `signal\|`, `tokens\|` records and its checker's `handlectl\|` readings, and no timing for the harness clock (a virtual instant is not a duration) |
 
 ## 7. What these numbers are not
