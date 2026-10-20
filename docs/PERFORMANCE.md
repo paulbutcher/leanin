@@ -959,6 +959,29 @@ the empty poll but collapsed the server to ~1.5 k req/s: the wake is load-bearin
 table's earliest deadline (one lock and no per-iteration traversal) measured 0.990 against the current build — the
 2.3 % that removing the scan calls had shown did not come from the traversal. Neither is in the tree.
 
+**Load shapes** (`bench/screen.sh`: d1 = keep-alive depth 1, p16 = 16 requests in flight per connection,
+churn = one connection per request), one server per arm, 5 s per point, load 2.5 rising to 6.6 through the run.
+Requests per second:
+
+| shape | arm | C=1 | C=8 | C=32 |
+|---|---|---|---|---|
+| d1 | Node | 70 593 | 146 038 | 147 049 |
+| d1 | leanin | 66 040 | 150 736 | 132 916 |
+| d1 | shipped | 5 463 | 5 851 | 7 733 |
+| p16 | Node | 173 792 | 181 052 | 181 153 |
+| p16 | leanin | **419 596** | **521 336** | **508 627** |
+| p16 | shipped | 7 636 | 11 572 | 12 649 |
+| churn | Node | 29 988 | 48 526 | 51 064 |
+| churn | leanin | 15 430 | 43 486 | 50 762 |
+| churn | shipped | 2 808 | 2 044 | 1 546 |
+
+Pipelining is where the runtime pulls ahead: **2.4×, 2.9× and 2.8× Node** at the three levels, with p50 35 vs
+82 µs, 232 vs 639 µs and 972 vs 2583 µs. At depth 1 the two are within 10 % either way. Connection churn is the
+shape we lose: at C=1 we serve 15 430 against Node's 29 988 (p50 29 µs, p99 879 µs), recovering to parity by
+C=32; the close path drains the peer's end of stream before closing rather than resetting, which is the
+behaviour that removed the reset storm, and its cost shows here. Against the shipped server we are 5–12× ahead
+in d1, 22–40× in p16, and 5–33× in churn.
+
 **The close path is where the resets were, and it was worth more than everything else here together.** The first
 version closed the handle from the shutdown callback. Closing a socket whose receive buffer still holds unread
 data makes the kernel send RST instead of a clean FIN, and in `close` mode the receive side is nearly always

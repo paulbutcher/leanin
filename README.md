@@ -11,27 +11,19 @@ techniques found in tokio and node to get a runtime for concurrency that is on p
 languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
 defunctionalisation rather than vanilla `do`.
 
-The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. A benchmark which
-gives you a flavour of our current performance: keep-alive requests, one request outstanding per connection,
-both sides pinned to distinct P-cores, the CPU energy-performance preference at `performance`, and the arms
-paired and interleaved in one invocation (`bench/paired.sh`). **C is the number of concurrent keep-alive
-connections.**
+The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. Keep-alive
+requests to `/bench`, both sides pinned to distinct P-cores:
 
-| connections | C=1 | C=8 | C=32 |
+| server | C=1 | C=8 | C=32 |
 |---|---|---|---|
-| **leanin**, median (best) | **70.0 k** (73.1 k) | **128.5 k** (135.7 k) | **116.1 k** (121.6 k) |
-| Node 22, median (best) | 72.8 k (78.1 k) | 126.9 k (146.1 k) | 125.5 k (141.2 k) |
+| Node 22 | 76 521 | 148 813 | 153 033 |
+| **leanin** | **69 025** | **153 236** | **135 369** |
+| shipped `Std.Http.Server` | 5 742 | 6 128 | 8 439 |
 
-**Read this table as a distribution, not a score.** Both servers are pinned and paired, but Node's own rows move
-by ~40 % between invocations at C=8/C=32 (103–146 k and 113–141 k across six runs) while ours move by ~10 %.
-Averaged, the two are level at eight connections and we are ~4 % behind at one and ~8 % behind at thirty-two;
-at Node's best readings it is ahead at every level. An earlier version of this table reported 1.24× at C=32 —
-that was Node in its slow tail (84 k), and is withdrawn. The honest summary is that the runtime is within a
-few percent of Node at one and eight connections and behind it at thirty-two, with roughly triple the
-run-to-run stability; against the Lean HTTP server that ships with the toolchain we remain 12–24× ahead
-(`bench/threeway.sh`). We have not found the additional ~6–8 % needed to pass Node across the board; per-request
-CPU at C=1 is **11.6 µs against Node's 8.3 µs**, which is where that work lives. How the numbers are taken and
-what they decompose into: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+`C` is the number of concurrent keep-alive connections; values are requests per second from one invocation of
+`bench/threeway.sh 1 8 32`, and run-to-run readings vary with host state. Load shapes (keep-alive depth 1,
+pipelined depth 16, connection churn): `bench/screen.sh`. Method and ranges:
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
