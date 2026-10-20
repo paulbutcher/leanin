@@ -11,18 +11,24 @@ techniques found in tokio and node to get a runtime for concurrency that is on p
 languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
 defunctionalisation rather than vanilla `do`.
 
-The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. Keep-alive
-requests to `/bench`, both sides pinned to distinct P-cores:
+The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. Requests to
+`/bench`, both sides pinned to distinct P-cores:
 
-| server | C=1 | C=8 | C=32 |
-|---|---|---|---|
-| Node 22 | 76 521 | 148 813 | 153 033 |
-| **leanin** | **69 025** | **153 236** | **135 369** |
-| shipped `Std.Http.Server` | 5 742 | 6 128 | 8 439 |
+| shape | server | C=1 | C=8 | C=32 |
+|---|---|---|---|---|
+| depth 1 | Node 22 | 70 593 | 146 038 | 147 049 |
+| depth 1 | **leanin** | **66 040** | **150 736** | **132 916** |
+| depth 1 | shipped `Std.Http.Server` | 5 463 | 5 851 | 7 733 |
+| pipe 16 | Node 22 | 173 792 | 181 052 | 181 153 |
+| pipe 16 | **leanin** | **419 596** | **521 336** | **508 627** |
+| pipe 16 | shipped `Std.Http.Server` | 7 636 | 11 572 | 12 649 |
+| churn | Node 22 | 29 988 | 48 526 | 51 064 |
+| churn | **leanin** | 15 430 | 43 486 | 50 762 |
+| churn | shipped `Std.Http.Server` | 2 808 | 2 044 | 1 546 |
 
-`C` is the number of concurrent keep-alive connections; values are requests per second from one invocation of
-`bench/threeway.sh 1 8 32`, and run-to-run readings vary with host state. Load shapes (keep-alive depth 1,
-pipelined depth 16, connection churn): `bench/screen.sh`. Method and ranges:
+`C` is the number of concurrent connections; values are requests per second. Shapes: **depth 1** keeps one
+request in flight per connection, **pipe 16** keeps sixteen in flight, **churn** opens one connection per
+request. One invocation of `bench/screen.sh`; readings vary with host state. Method and ranges:
 [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
