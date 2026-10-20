@@ -28,21 +28,21 @@ def helloKeepResponse : ByteArray :=
 -- One connection's work: read the request, answer, close, and report the close. The write is deliberately
 -- unbound: the compiler's policy for an unbound send is to close the connection when it fails, which is this
 -- example's boundary handling — a failed write ends that connection and reaches no other connection.
-asyncMachine helloConn (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+async helloConn (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[helloResponse])
   let closed := await (LeanIn.Runtime.Io.closeRaw c)
   onDone (if closed then .ok () else .error (IO.userError "helloConn: the loop refused the close"))
 
 -- A keep-alive connection loop, for the benchmark arm: request, answer, request again on the same connection.
-asyncMachine helloKeep (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+async helloKeep (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[helloKeepResponse])
   recurse
 
 -- The accept loop: one connection at a time, its handler spawned as an executor item, then recurse. The
 -- listener, the inject and the mode are the loop's carried state; an accept failure ends the loop loudly.
-asyncMachine helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item → BaseIO Unit)
+async helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item → BaseIO Unit)
     (keep : Bool) (onDone : Except IO.Error Unit → IO Unit) := do
   let c : Except IO.Error LeanIn.Runtime.Conn := await (LeanIn.Runtime.Io.acceptRaw l push)
   match c with

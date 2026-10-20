@@ -6,7 +6,7 @@
 #   nix develop -c bash bench/threeway.sh 1 4 16    # chosen levels
 #
 # Every arm runs on this box inside one invocation, in the same mode: a keep-alive handler answering `/bench`
-# (leanin's own `reply`, the shipped server's, `bench/node-server.mjs`, and the compiled `asyncMachine` example
+# (leanin's own `reply`, the shipped server's, `bench/node-server.mjs`, and the compiled `async` example
 # `lake exe hello … keep`), driven by `bench/load.mjs`
 # in keep-alive for 5 s per level at path `/bench`. One row per (arm, level) — the client reports
 # `rps`/`completed`/`errors`/`p50us`/`p99us`.

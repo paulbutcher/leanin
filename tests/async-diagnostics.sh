@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# asyncmachine-diagnostics.sh — the macro's named diagnostics, and the shapes they reject or accept.
-# Run: nix develop -c bash tests/asyncmachine-diagnostics.sh
+# async-diagnostics.sh — the macro's named diagnostics, and the shapes they reject or accept.
+# Run: nix develop -c bash tests/async-diagnostics.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export LEAN_PATH=.lake/build/lib/lean
@@ -11,7 +11,7 @@ expect_error() { # <file> <phrase>... — each phrase must appear contiguously i
   # binds an actual type to its expected type must match as one run of text, not as scattered tokens.
   local file="$1"; shift
   local out flat frag
-  out="$(lean "tests/asyncmachine-diagnostics/$file" 2>&1)" && {
+  out="$(lean "tests/async-diagnostics/$file" 2>&1)" && {
     echo "diag: $file elaborated; expected rejection mentioning [$*]" >&2; ok=0; return; }
   flat="$(tr '\n' ' ' <<<"$out" | tr -s ' ')"
   for frag in "$@"; do
@@ -22,7 +22,7 @@ expect_error() { # <file> <phrase>... — each phrase must appear contiguously i
 
 expect_ok() { # <file>
   local out
-  out="$(lean "tests/asyncmachine-diagnostics/$1" 2>&1)" || {
+  out="$(lean "tests/async-diagnostics/$1" 2>&1)" || {
     echo "diag: $1 rejected; expected it to elaborate:" >&2; echo "$out" >&2; ok=0; }
 }
 
@@ -34,5 +34,5 @@ expect_error sleep-bound-dead-mismatch.lean 'has type Unit but is expected to ha
 expect_error send-bound-dead-mismatch.lean 'has type Nat → IO Unit but is expected to have type Except IO.Error Unit → IO Unit'
 expect_ok    sleep-bound-ok.lean
 
-[ "$ok" = 1 ] && echo "asyncmachine-diagnostics: all checks passed" || echo "asyncmachine-diagnostics: FAILED" >&2
+[ "$ok" = 1 ] && echo "async-diagnostics: all checks passed" || echo "async-diagnostics: FAILED" >&2
 [ "$ok" = 1 ]

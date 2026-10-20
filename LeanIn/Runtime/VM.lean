@@ -201,7 +201,7 @@ def runToCell (m : VM α) (cell : RawCell α) : IO Unit :=
   runK m (fun v => RawCell.resolve cell v) (fun e => throw e)
 
 /-- **Spawn a machine and await its result** (run it to a fresh cell, park `resume` on it). This is the effect
-an `asyncMachine` uses to await a sub-computation — a handler that itself suspends: `runToCell` starts the
+an `async` uses to await a sub-computation — a handler that itself suspends: `runToCell` starts the
 machine (its effects resume on the loop thread) and `RawCell.await` parks the caller's continuation, which the
 machine's final `resolve` fires. -/
 def runAsync (m : VM α) (resume : α → IO Unit) : IO Unit :=

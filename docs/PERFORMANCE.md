@@ -754,7 +754,7 @@ connections queue on a single thread while Node's one event loop stays ahead by 
 `e2b2988` row above is left as history and not re-read — it is a superseded commit, and re-reading it costs a
 build of that commit for a path nothing runs now.
 
-**The compiled `asyncMachine` driver, four arms** — `nix develop -c bash bench/threeway.sh 1 8 32`, which now
+**The compiled `async` driver, four arms** — `nix develop -c bash bench/threeway.sh 1 8 32`, which now
 builds `hello` too; one invocation, 5 s per point. Both sides are pinned to distinct P-cores (server core 1,
 client core 2; `THREEWAY_SERVER_CPU`/`THREEWAY_CLIENT_CPU` override) and the host's energy-performance
 preference is `performance`. Those two conditions are not optional: this host is an Intel Ultra 7 268V with

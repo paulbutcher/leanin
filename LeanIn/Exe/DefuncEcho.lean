@@ -6,7 +6,7 @@ import LeanIn.Test.Machines
 open LeanIn
 
 /-!
-# `asyncMachine` exercise harness
+# `async` exercise harness
 
 Small machines that compile the shapes the connection driver relies on — a suspension per iteration, loops and
 their carried fields, `break`/`continue`, a close that ends the path — plus the two hand-written echo baselines
@@ -16,7 +16,7 @@ Run with `lake exe defuncEcho [port] [mode]`: `async`, `loop`, `for`, `brk`, `co
 (SC26), default `cps`.
 -/
 
-asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
+async amEcho (c : LeanIn.Runtime.Conn) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[req])
   recurse
@@ -24,13 +24,13 @@ asyncMachine amEcho (c : LeanIn.Runtime.Conn) := do
 -- Composition: a callable child (reads one request, echoes it, and answers its `onDone` with the bytes) and
 -- a parent that awaits it twice per exchange — a machine awaiting a machine, with the parent's continuation
 -- as the child's `onDone`, no cell.
-asyncMachine amChunk (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
+async amChunk (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
   onDone bs
   halt
 
-asyncMachine amParent (c : LeanIn.Runtime.Conn) := do
+async amParent (c : LeanIn.Runtime.Conn) := do
   let first : ByteArray := await (amChunk.run c)
   let second : ByteArray := await (amChunk.run c)
   await (LeanIn.Runtime.Io.sendAllRaw c #[first, second])
@@ -39,14 +39,14 @@ asyncMachine amParent (c : LeanIn.Runtime.Conn) := do
 -- The tid-recording pair for SC23: the child reports the thread its terminal step runs on, the parent reports
 -- the thread each call resumes it on — the resume thread being the child's own completion thread (a raw
 -- resume, no carrier hop), never the accept loop's.
-asyncMachine amChunkT (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
+async amChunkT (c : LeanIn.Runtime.Conn) (onDone : ByteArray → IO Unit) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
   (do let tid ← IO.getTID; IO.println s!"sc23|childStepTid={tid}"; (← IO.getStdout).flush)
   onDone bs
   halt
 
-asyncMachine amParentT (c : LeanIn.Runtime.Conn) := do
+async amParentT (c : LeanIn.Runtime.Conn) := do
   let first : ByteArray := await (amChunkT.run c)
   (do let tid ← IO.getTID; IO.println s!"sc23|resumeTid={tid}"; (← IO.getStdout).flush)
   let second : ByteArray := await (amChunkT.run c)
@@ -57,19 +57,19 @@ asyncMachine amParentT (c : LeanIn.Runtime.Conn) := do
 -- A child that only writes and returns, and a caller that awaits exactly one call per request — the
 -- machine-call cost isolated against `amEcho` (the same loop with the write inline) and `vmEcho` (the
 -- interpreted `VM`).
-asyncMachine amWrite (c : LeanIn.Runtime.Conn) (bs : ByteArray) (onDone : ByteArray → IO Unit) := do
+async amWrite (c : LeanIn.Runtime.Conn) (bs : ByteArray) (onDone : ByteArray → IO Unit) := do
   await (LeanIn.Runtime.Io.sendAllRaw c #[bs])
   onDone bs
   halt
 
-asyncMachine amCall (c : LeanIn.Runtime.Conn) := do
+async amCall (c : LeanIn.Runtime.Conn) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   let _r : ByteArray := await (amWrite.run c bs)
   recurse
 
 -- A loop as a state machine: send `msg0..msg2` (each an `await`), then close — the loop counter `i` is the
--- loop state's field, threaded across iterations. Exercises `while` in `asyncMachine`.
-asyncMachine amLoop (c : LeanIn.Runtime.Conn) := do
+-- loop state's field, threaded across iterations. Exercises `while` in `async`.
+async amLoop (c : LeanIn.Runtime.Conn) := do
   let i : Nat := 0
   while i < 3 do
     await (LeanIn.Runtime.Io.sendAllRaw c #[s!"msg{i}\n".toUTF8])
@@ -77,13 +77,13 @@ asyncMachine amLoop (c : LeanIn.Runtime.Conn) := do
   await (LeanIn.Runtime.Io.closeRaw c)
 
 -- `for` over an array: send each element (an await per element), then close.
-asyncMachine amFor (c : LeanIn.Runtime.Conn) := do
+async amFor (c : LeanIn.Runtime.Conn) := do
   for x in (#[s!"a\n".toUTF8, s!"b\n".toUTF8, s!"c\n".toUTF8] : Array ByteArray) do
     await (LeanIn.Runtime.Io.sendAllRaw c #[x])
   await (LeanIn.Runtime.Io.closeRaw c)
 
 -- `while` with `break`: send 0, 1, then break out and close.
-asyncMachine amBreak (c : LeanIn.Runtime.Conn) := do
+async amBreak (c : LeanIn.Runtime.Conn) := do
   let i : Nat := 0
   while i < 10 do
     if i == 2 then break
@@ -93,14 +93,14 @@ asyncMachine amBreak (c : LeanIn.Runtime.Conn) := do
 
 -- `for` with `continue`: send a, c, skipping b by `continue` — the increment is owed on the skipped
 -- iteration too, or c is never reached.
-asyncMachine amForCont (c : LeanIn.Runtime.Conn) := do
+async amForCont (c : LeanIn.Runtime.Conn) := do
   for x in (#[s!"a\n".toUTF8, s!"b\n".toUTF8, s!"c\n".toUTF8] : Array ByteArray) do
     if x == s!"b\n".toUTF8 then continue
     await (LeanIn.Runtime.Io.sendAllRaw c #[x])
   await (LeanIn.Runtime.Io.closeRaw c)
 
 -- `while` with `continue`: send the odd numbers 1,3,5, skipping even by `continue`.
-asyncMachine amContinue (c : LeanIn.Runtime.Conn) := do
+async amContinue (c : LeanIn.Runtime.Conn) := do
   let i : Nat := 0
   while i < 5 do
     let i := i + 1

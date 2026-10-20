@@ -1,6 +1,6 @@
-# Writing a server with `asyncMachine`
+# Writing a server with `async`
 
-`asyncMachine` compiles a `do`-notation body into a state machine that runs on the runtime's carriers and
+`async` compiles a `do`-notation body into a state machine that runs on the runtime's carriers and
 event loop. Every `await` on a classified effect becomes a suspension: the machine's state is a constructor
 holding its live values, the effect parks, and the completion resumes the state on a carrier. Nothing here
 needs a stock `Task`, a `Std.Http.Server` connection loop, or a continuation-passing rewrite by hand.
@@ -10,7 +10,7 @@ This page names what compiles, what fails loudly, and what the limits are. Every
 ## The shape
 
 ```lean
-asyncMachine hello (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+async hello (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[response])
   let closed := await (LeanIn.Runtime.Io.closeRaw c)
@@ -29,7 +29,7 @@ asyncMachine hello (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → 
 ## The effect set
 
 These are the forms that compile. Anything else in `await` position is rejected with
-`asyncMachine: unsupported effect`.
+`async: unsupported effect`.
 
 | form | resumes with |
 |---|---|
@@ -58,7 +58,7 @@ Every name the body binds is a field of the next state. A field carries a type i
 2. the binding is ascribed — `let n : Nat := await (…)` — and the ascription is **checked on the binder**, so
    a mismatch fails at elaboration whether the value is used later or not;
 3. the type cannot be inferred, in which case compilation fails with
-   `asyncMachine: cannot determine the type of state field …` rather than guessing `Unit`.
+   `async: cannot determine the type of state field …` rather than guessing `Unit`.
 
 Values that live across a suspension need (1) or (2). A `let` that is dead before the next suspension is
 dropped, but its ascription is still elaborated against the bound value.
@@ -111,18 +111,18 @@ An unbound effect's error arm therefore does nothing: its failure is already own
 
 ## What fails loudly
 
-- An `await` on an unserialized form: `asyncMachine: unsupported effect`.
+- An `await` on an unserialized form: `async: unsupported effect`.
 - A machine call whose name is not a compiled machine's tagged `run`, or whose arity is wrong.
 - A spawn whose target is not the generated spawner of a tagged run.
-- A `let` pattern: `asyncMachine: destructuring let is not supported` — bind a name and project.
-- A path that can fall off the end: `asyncMachine: a path does not end in recurse, a close, or halt`.
+- A `let` pattern: `async: destructuring let is not supported` — bind a name and project.
+- A path that can fall off the end: `async: a path does not end in recurse, a close, or halt`.
 - A field whose type cannot be determined, or whose ascription mismatches:
   `has type Unit but is expected to have type Nat`.
 
 The diagnostics fixture checks these rejections as compile failures:
 
 ```bash
-nix develop -c bash tests/asyncmachine-diagnostics.sh
+nix develop -c bash tests/async-diagnostics.sh
 ```
 
 ## Limits, stated

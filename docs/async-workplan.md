@@ -1,4 +1,4 @@
-# `asyncMachine` as the basis: workplan
+# `async` as the basis: workplan
 
 Status: draft, 2026-10-18. Grounding: milestone 3 of `docs/tokio-workplan.md` (the compiled driver, landed and
 measured); `docs/async-vm.md` (the experiment arc and its deleted modules); the review record of the driver
@@ -14,7 +14,7 @@ Three models are visible in the tree, and a user can see the seams:
 - **`VM`** — the interpreted free machine (`runK`, two-continuation). General — any `IO` via `ioE`, raise/catch
   that spans suspensions — but interpreted: `bind` rebuilds the tree and the interpreter walks it. This is the
   *escape hatch* for code the compiler cannot express, not the fast path.
-- **`asyncMachine`** — the compiler: a do-body becomes a per-function state machine resumed by raw delivery.
+- **`async`** — the compiler: a do-body becomes a per-function state machine resumed by raw delivery.
   Proven on the production HTTP driver (`×1.42–1.57` over the CPS driver, SC19/SC20 byte-identical), but a
   **closed per-connection DSL**: six socket effects plus `VM.runAsync`, no spawn, no select, no first-class
   timer. (M1, landed: field types are inferred or rejected with the field named — the `Unit` fallback is
@@ -58,7 +58,7 @@ rather than multiplying the silent-wrongness surface.
   statements execute as actions (the driver's `onClose` path, exercised by SC19/SC20); destructuring `let`
   is rejected with the construct named. `DefuncEcho`'s machines and the driver compile unchanged, and
   SC19/SC20 stay byte-identical.
-- **Evidence**: `tests/asyncmachine-diagnostics.sh` (two rejections grepped for their named diagnostics, one
+- **Evidence**: `tests/async-diagnostics.sh` (two rejections grepped for their named diagnostics, one
   positive machine whose generated signatures are asserted in the file); `nix develop -c lake build` green;
   SC19/SC20 green; the paired measurement above.
 
@@ -170,7 +170,7 @@ rather than multiplying the silent-wrongness surface.
   it over loopback: two sequential connections each read the pinned HTTP response byte-exactly (`cmp`
   against a byte file), with no socket bound on the read, the invocation's 20 s watchdog as the completion
   detector, and a silent connection under a 1 s client bound as the detector's control.
-- **Guide**: `docs/asyncmachine-guide.md` names the effect set, the threading and ascription rules, the loud
+- **Guide**: `docs/async-guide.md` names the effect set, the threading and ascription rules, the loud
   failures, the runtime you need, and the limits; every command it displays names its own inputs.
 - **CI**: the scenario job's list runs through `SC27`, and the same job runs `bench/threeway.sh` (one level)
   after the scenario loop, because the comparison needs the `server`/`stdServer` binaries and libuv, not a
@@ -179,7 +179,7 @@ rather than multiplying the silent-wrongness surface.
 ## 3. What each model is for, after this lands
 
 - **Executor / `Sched` / `Runtime`** — the engine. Unchanged by this plan; machines compile onto it.
-- **`asyncMachine`** — the advertised authoring surface for concurrent code.
+- **`async`** — the advertised authoring surface for concurrent code.
 - **`VM`** — the interpreted escape hatch: dynamic effects, code the compiler cannot express, and the
   handler shape for suspension-heavy user logic until M2/M4 cover it.
 - **`EAsync`/`Task`** — the reference semantics, the controls' harness, and the CPS baseline in the

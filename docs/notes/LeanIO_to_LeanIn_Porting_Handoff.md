@@ -23,7 +23,7 @@ Distinguish three goals:
 | Native LeanIn backend | Handler effects, body streams, and child work use LeanIn | Recommended initial destination |
 | Compiled handlers | Selected handler and middleware logic lowers to explicit machines | Subsequent optimisation and compiler-generalisation work |
 
-Do not claim a native port merely because `Router.serve` was replaced. Do not require all higher-order framework code to compile to `asyncMachine` before the native port can be useful.
+Do not claim a native port merely because `Router.serve` was replaced. Do not require all higher-order framework code to compile to `async` before the native port can be useful.
 
 ## Reusable framework components
 

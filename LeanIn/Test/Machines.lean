@@ -15,7 +15,7 @@ suspension.
 open LeanIn
 
 -- Read a request, sleep `d` on the injected clock, answer, close, and report the close.
-asyncMachine amDelayed (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) (d : Std.Time.Millisecond.Offset)
+async amDelayed (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) (d : Std.Time.Millisecond.Offset)
     (onDone : Except IO.Error Unit → IO Unit) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sleepRaw clock.schedule d)
@@ -25,7 +25,7 @@ asyncMachine amDelayed (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) 
 
 -- Race a read against the stated instant: answer an arrived request, close with nothing written on the
 -- deadline or on end of stream, and report the close (the transport error is reported too).
-asyncMachine amStall (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) (d : Std.Time.Millisecond.Offset)
+async amStall (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) (d : Std.Time.Millisecond.Offset)
     (onDone : Except IO.Error Unit → IO Unit) := do
   let rt := await (LeanIn.Runtime.Io.recvTimeoutRaw c clock.schedule d 65536)
   match rt with
@@ -45,14 +45,14 @@ asyncMachine amStall (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) (d
 
 -- A spawned child: deliver a threaded payload on its continuation and halt. The connection is carried
 -- (the spawn surface takes one) but unused, so the child's only executor work is its boot.
-asyncMachine amChunkOf (c : LeanIn.Runtime.Conn) (payload : ByteArray) (onDone : ByteArray → IO Unit) := do
+async amChunkOf (c : LeanIn.Runtime.Conn) (payload : ByteArray) (onDone : ByteArray → IO Unit) := do
   onDone payload
   halt
 
 -- Spawn two children — always the first carrying `b`, the second `a` — and join them in the order the
 -- request byte names: `0` joins the first-spawned handle then the second, `1` the reverse. Identical spawns
 -- with swapped join orders are what distinguishes a join-order collector from a completion-order one.
-asyncMachine amSpawn (c : LeanIn.Runtime.Conn) (push : LeanIn.Task.Item → BaseIO Unit)
+async amSpawn (c : LeanIn.Runtime.Conn) (push : LeanIn.Task.Item → BaseIO Unit)
     (a : ByteArray) (b : ByteArray) (onDone : Except IO.Error Unit → IO Unit) := do
   let sel := await (LeanIn.Runtime.Io.recvRaw c 65536)
   let h0 : LeanIn.Runtime.RawCell ByteArray := await (amChunkOf.spawn push c b)
@@ -75,7 +75,7 @@ asyncMachine amSpawn (c : LeanIn.Runtime.Conn) (push : LeanIn.Task.Item → Base
 -- resolution is ignored.
 -- `B`: both resolve before the select — registration order is the tie rule (index 0).
 -- The answer is `A<i>`/`B<i>` carrying the winning index.
-asyncMachine amSelect (c : LeanIn.Runtime.Conn)
+async amSelect (c : LeanIn.Runtime.Conn)
     (onDone : Except IO.Error Unit → IO Unit) := do
   let sel := await (LeanIn.Runtime.Io.recvRaw c 65536)
   let h0 : LeanIn.Runtime.RawCell ByteArray := await (LeanIn.Runtime.RawCell.new)

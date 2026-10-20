@@ -10,7 +10,7 @@ import LeanIn.Task.Error
 /-!
 # The HTTP/1.1 service driver, compiled
 
-The per-connection loop below (`drive`) is an `asyncMachine`: every suspension in it is a **state of a compiled
+The per-connection loop below (`drive`) is an `async`: every suspension in it is a **state of a compiled
 machine**, not a closure, so a request costs a step and a raw resume rather than a `bind`, a cell and an item.
 The protocol is `LeanIn.Examples.Http.H1` — our own parser and machine, in `LeanIn/Examples/Http/H1.lean` — so nothing here scans
 bytes and there is no framer. The accept loops in `LeanIn.Runtime.Net` are the callers.
@@ -72,7 +72,7 @@ deriving Inhabited, BEq, Repr
 `needHandler` -- the head to hand the handler.
 
 A structure rather than an inductive with arguments, because every field the loop reads then carries its type
-from the declaration. The `asyncMachine` compiler infers a state field's type from its uses and errors with
+from the declaration. The `async` compiler infers a state field's type from its uses and errors with
 the field named where uses alone cannot say, which a `match`-bound pattern hits; reading named fields
 sidesteps that. -/
 structure Pump where
@@ -109,9 +109,9 @@ def pump (handler : Handler) (m : H1.Machine) : Pump := pumpGo handler m #[]
 -- place the handler runs, and the loop then branches on what it answered. The loop ends when the machine halts,
 -- and otherwise **reads**, so the read is the default branch and the deadline covers it.
 --
--- A docstring here would not parse: `asyncMachine` is a command syntax registered by `elab`, and that form does
+-- A docstring here would not parse: `async` is a command syntax registered by `elab`, and that form does
 -- not take one.
-asyncMachine drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : LeanIn.Examples.Http.H1.Machine)
+async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : LeanIn.Examples.Http.H1.Machine)
     (onClose : Except IO.Error Unit → IO Unit) := do
   let r : Pump := pump handler m
   let machine : H1.Machine := r.machine

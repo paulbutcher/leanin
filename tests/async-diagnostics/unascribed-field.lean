@@ -4,7 +4,7 @@ open LeanIn
 
 -- A pure-bound variable with no ascription, live across a suspension, in a shape the compiler cannot infer:
 -- it must be rejected with the variable named.
-asyncMachine trapUnascribed (c : LeanIn.Runtime.Conn) := do
+async trapUnascribed (c : LeanIn.Runtime.Conn) := do
   let mystery := ByteArray.empty
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   let bs2 := mystery ++ bs

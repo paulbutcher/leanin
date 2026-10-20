@@ -2020,7 +2020,7 @@ records.
 ### SC23 — composition: a parent machine awaits a child machine over a real socket
 
 **Actor.** A Lean executable server (`./.lake/build/bin/defuncEcho 8390 parentT`): `amParentT`, an
-`asyncMachine` state machine that awaits `amChunkT` — another compiled machine — twice on one accepted
+`async` state machine that awaits `amChunkT` — another compiled machine — twice on one accepted
 connection, each call suspending the parent until the child's terminal `halt` fires the parent's own
 continuation as the child's `onDone`. Both machines report thread ids as they run, and the harness reports its
 own and a dedicated task's. The peer is a shell pipeline writing two chunks with pauses — deliberately not
@@ -2065,7 +2065,7 @@ thread (a `Join` plus inject would read the same driver thread here), and the mu
 serve this shape (the `runCarriers` serving defect recorded beside `LeanIn/Exe/Server.lean`), so O3/O4 read
 resumption and driver-unity, not the absence of a cell: the no-cell fact is structural (the generator passes
 the caller's continuation as the callee's last parameter, and the expansion names no cell) and is costed by
-the M2 benchmark in `docs/asyncmachine-workplan.md`. The port is fixed (`8390`) inside the invocation's own
+the M2 benchmark in `docs/async-workplan.md`. The port is fixed (`8390`) inside the invocation's own
 loopback; the readiness probe's connection is an ordinary parked read and changes no record. Nothing here
 measures the call's cost; this scenario asserts order, completion, and resumption.
 

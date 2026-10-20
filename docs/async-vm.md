@@ -5,15 +5,15 @@
 >
 > **Status note (2026-10-16).** The modules this page documents — `LeanIn/Examples/Http/Server.lean`,
 > `LeanIn/Runtime/VMHttp.lean`, `LeanIn/Runtime/SmEcho.lean` — are **deleted**, superseded by
-> `LeanIn/Examples/Http/Server.lean`'s `drive`: the same `asyncMachine` engine, on the repo's own `LeanIn.Examples.Http.H1`
+> `LeanIn/Examples/Http/Server.lean`'s `drive`: the same `async` engine, on the repo's own `LeanIn.Examples.Http.H1`
 > machine, as the production driver (`lake exe server`, SC19/SC20, `bench/threeway.sh`'s leanin arm). The
 > measurements below stand as taken when the modules lived; the current driver and its numbers are milestone 3
 > in `docs/tokio-workplan.md`.
 
 Status: **a working `Std.Http` replacement.** `LeanIn/Examples/Http/Server.lean` is an HTTP/1.1 server on the
-`asyncMachine` engine — each connection's `serveConn` compiles the full H1 drive (the `vmDrive` shape: `pump`
+`async` engine — each connection's `serveConn` compiles the full H1 drive (the `vmDrive` shape: `pump`
 the machine, write, then `halted`? close : `recvTimeout` → EOF/stalled/feed) to a per-function state machine.
-`asyncMachine` lowers `await`-suspensions, inlines pure code, and lowers `if`/`match` control flow to state
+`async` lowers `await`-suspensions, inlines pure code, and lowers `if`/`match` control flow to state
 transitions, threads the H1 machine across requests as a field, and routes constant parameters (the clock, the
 deadline, the handler) to **step parameters** like the connection. Validated end-to-end (GET, keep-alive, POST
 bodies, concurrent connections, **partial-read reassembly**, the **stall deadline**) and benchmarked: **~20×
@@ -22,7 +22,7 @@ delivery, the `VM`) validated earlier. The handler is now a **`VM` computation**
 ByteArray)`), so it may suspend — read a backend, wait — and its suspension joins the connection's machine
 through `VM.runAsync` (a fresh `RawCell` the sub-computation resolves); a handler that is pure is answered
 inside `pump` with no cell and no state hop, so the common case pays nothing for the async machinery being
-available. `asyncMachine` also lowers **`while`**: the loop head is a state, the body's suspension chain ends in
+available. `async` also lowers **`while`**: the loop head is a state, the body's suspension chain ends in
 a back-edge to it, and the loop variables thread across iterations as that state's fields (a pure binding may
 carry a type ascription — `let i : Nat := 0` — to give a field its type when use alone can't). `for x in xs do …`
 desugars to a counted `while` (`xs[i]!` / `xs.size`, so it wants an `Array`/indexable collection), and `break` /
@@ -78,9 +78,9 @@ Lean obstacles hit and cleared: free-monad `bind` won't compile as `partial` (Le
 for the fallback), and a `bind`-constructor GADT hits a universe error on the indexed type. Working form:
 parameterized `VM` + `partial` bind + a default `.empty` constructor for the `Inhabited` the fallback needs.
 
-### 3. The `async!` elaborator (`asyncMachine`) — done, with control flow, on the real drive
+### 3. The `async!` elaborator (`async`) — done, with control flow, on the real drive
 
-`LeanIn/Async.lean`: `asyncMachine name (c : Conn) (x : T) … := do …` compiles a `do` block to a **flat state
+`LeanIn/Async.lean`: `async name (c : Conn) (x : T) … := do …` compiles a `do` block to a **flat state
 machine** — one inductive constructor per suspension point, carrying the live variables, plus a `step` function
 the driver matches on — resumed through the same raw delivery. Suspensions are marked `await (e)`; the body is
 lowered **recursively**: pure code is inlined into the current state's step, each `await` suspends, and

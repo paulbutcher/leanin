@@ -1,4 +1,4 @@
-# LeanIn: evolve the asyncMachine interface for general concurrency
+# LeanIn: evolve the async interface for general concurrency
 
 Date: 2026-10-20.
 
@@ -161,11 +161,11 @@ Follow repository `AGENTS.md` and existing executable-contract idioms. Measure p
 4. Introduce typed extensibility and move field analysis toward elaborated bindings.
 5. Add the shorter authoring name as a compatibility alias, then migrate examples.
 
-Do not rename generated namespaces, proof artifacts, and user syntax in one unreviewable change. Preserve `asyncMachine` during migration and avoid conflating a naming-only patch with lifecycle changes.
+Do not rename generated namespaces, proof artifacts, and user syntax in one unreviewable change. Preserve `async` during migration and avoid conflating a naming-only patch with lifecycle changes.
 
 ## Naming recommendation and collision check
 
-Recommend `proc` as the short authoring declaration, retaining `asyncMachine` as the implementation/backend description and a compatibility alias. It suggests a suspendable procedure or process without exposing the generated state-machine representation. Document that declaring a procedure does not spawn it: calling, spawning, and joining remain separate operations.
+Recommend `proc` as the short authoring declaration, retaining `async` as the implementation/backend description and a compatibility alias. It suggests a suspendable procedure or process without exposing the generated state-machine representation. Document that declaring a procedure does not spawn it: calling, spawning, and joining remain separate operations.
 
 `async def` is the strongest alternative for familiarity. It describes the programming model clearly and resembles an ordinary function declaration, but the word `async` already appears as methods in `Std.Async`. That is a naming overlap, not proof of a command-parser conflict.
 
@@ -194,7 +194,7 @@ No name can be guaranteed collision-free against arbitrary future imports. The c
 ## References
 
 - [Reviewed LeanIn revision](https://github.com/scidonia/leanin/tree/4b93289).
-- [Current authoring guide](https://github.com/scidonia/leanin/blob/4b93289/docs/asyncmachine-guide.md).
+- [Current authoring guide](https://github.com/scidonia/leanin/blob/4b93289/docs/async-guide.md).
 - [Compiler and effect classifier](https://github.com/scidonia/leanin/blob/4b93289/LeanIn/Async.lean).
 - [Machine scenarios](https://github.com/scidonia/leanin/blob/4b93289/LeanIn/Test/Machines.lean).
 - [Raw completion cells](https://github.com/scidonia/leanin/blob/4b93289/LeanIn/Runtime/VM.lean).

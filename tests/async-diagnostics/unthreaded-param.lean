@@ -6,7 +6,7 @@ open LeanIn
 -- The formerly trapping shape: a parameter the body uses but never rebinds. Thread-by-default carries it
 -- across `recurse` — this must ELABORATE (it was silently a constant before, which is how the driver's
 -- protocol machine was once discarded).
-asyncMachine carried (c : LeanIn.Runtime.Conn) (tag : ByteArray) := do
+async carried (c : LeanIn.Runtime.Conn) (tag : ByteArray) := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[tag, bs])
   recurse

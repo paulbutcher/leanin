@@ -40,7 +40,7 @@ paired instrument is `bench/paired.sh`. Method and ranges: [`docs/PERFORMANCE.md
 
 ## Development Status
 
-**The `asyncMachine` workplan is closed (M1–M5)** ([`docs/asyncmachine-workplan.md`](docs/asyncmachine-workplan.md)):
+**The `async` workplan is closed (M1–M5)** ([`docs/async-workplan.md`](docs/async-workplan.md)):
 sound authoring, composition, time as an effect, spawn and select, and accept — with the compiled server
 example and the authoring guide. The roadmap's own status is in [`PLAN.md`](docs/PLAN.md) §0. The pure model
 is implemented and machine-checked (`LeanIn/Model/`, `LeanIn/Theory/World.lean`) with an executable probe for
@@ -65,7 +65,7 @@ from the following:
 Our client code reads like a monadic async similar to what ships with Lean — `do`, with `←` for a suspension — but
 our version is **compiled** and not threaded through closures with `bind`.
 
-`asyncMachine` (`LeanIn/Async.lean`) lowers a `do` block to a **flat state machine**: with one constructor per
+`async` (`LeanIn/Async.lean`) lowers a `do` block to a **flat state machine**: with one constructor per
 suspension point, carrying the variables which live across invocations as *data* (after a liveness analysis); a `step`
 function the driver matches on; pure code inlined into the current state; and `if`, `while`, `for`, `break` and
 `continue` lowered to transitions between states. Suspensions are marked `await`. Parameters are **threaded
@@ -127,7 +127,7 @@ nix develop -c lake exe server          # the HTTP server on our runtime, port 8
 nix develop -c lake exe stdServer       # the same response via the shipped Std.Http.Server, port 8090
 nix develop -c lake exe h1bench         # the head-parse microbenchmark
 nix develop -c lake exe defuncEcho      # the same echo: CPS closures against the compiled state machine
-nix develop -c lake exe hello           # the compiled `asyncMachine` server example, port 8085
+nix develop -c lake exe hello           # the compiled `async` server example, port 8085
 
 nix develop -c bash tests/executor-contract.sh SC1    # one scenario (SC1..SC27)
 nix develop -c bash tests/bridge-contract.sh BT1      # one native trace scenario (BT1..BT3)
@@ -180,8 +180,8 @@ and §4 carries the settled re-run beside it.
 | [`docs/proof-strategy.md`](docs/proof-strategy.md) | Property ladder, three-layer architecture, trusted base, the hard parts |
 | [`docs/primitive-theory.md`](docs/primitive-theory.md) | What the externs guarantee: axioms, discharge, control tests |
 | [`docs/tokio-map.md`](docs/tokio-map.md) | What we are taking from Tokio, component by component, with line anchors |
-| [`docs/async-vm.md`](docs/async-vm.md) | The defunctionalization approach: raw delivery, `VM`, `asyncMachine` |
-| [`docs/asyncmachine-guide.md`](docs/asyncmachine-guide.md) | Writing a server with `asyncMachine`: the effect set, the rules, the loud failures, the limits |
+| [`docs/async-vm.md`](docs/async-vm.md) | The defunctionalization approach: raw delivery, `VM`, `async` |
+| [`docs/async-guide.md`](docs/async-guide.md) | Writing a server with `async`: the effect set, the rules, the loud failures, the limits |
 | [`docs/lean-scheduler.md`](docs/lean-scheduler.md) | The scheduler Lean actually uses today, read out of the runtime source |
 | [`docs/lean-concurrency-today.md`](docs/lean-concurrency-today.md) | What Lean 4.35 already gives you, and the measured gaps |
 | [`docs/reading-list.md`](docs/reading-list.md) | Annotated primary sources for proving scheduler facts, with verification status |

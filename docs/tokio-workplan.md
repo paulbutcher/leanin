@@ -703,7 +703,7 @@ and a peer that never sends a byte, whose connection ends at the harness clock's
 read (`at == stall`, `stall = 30`, `clientGot` empty and `bounded == no`). Each clause's detector is exercised
 against its own near misses in the same invocation, and SC19, SC7 and SC14 remain green.
 
-**Milestone 3, landed: the driver, compiled.** The connection loop above is now an `asyncMachine`: `drive`
+**Milestone 3, landed: the driver, compiled.** The connection loop above is now an `async`: `drive`
 compiles the read → feed → step → dispatch → write cycle to a per-function state machine, so a request costs a
 state step and a raw resume rather than a `bind`, a cell and an item. The protocol is `LeanIn.Http.H1` — our own
 parser and machine — not the stdlib's; the milestones above describe the stdlib machine this one replaces. The

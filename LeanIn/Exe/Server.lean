@@ -9,7 +9,7 @@ import LeanIn.Examples.Http.Server
 
 Run it with `lake exe server [port]` — the port defaults to 8080. It binds the loopback address, prints the
 address it took, and serves every connection on an executor of our own, driving `LeanIn.Examples.Http.H1`'s pure machine
-through `LeanIn.Examples.Http.Server.serveConn` — a per-connection state machine compiled by `asyncMachine`. The protocol is
+through `LeanIn.Examples.Http.Server.serveConn` — a per-connection state machine compiled by `async`. The protocol is
 ours as well (parsing, framing, keep-alive and the limits live in `LeanIn.Examples.Http.H1`), and the driver, the accept
 loop and every await are ours, so a handler runs on one of our carriers rather than on the stock `Task` pool.
 
