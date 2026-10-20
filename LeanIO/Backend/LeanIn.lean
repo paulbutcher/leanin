@@ -191,6 +191,25 @@ def reasonFor : Nat → String
   | 501 => "Not Implemented"
   | _   => "Internal Server Error"
 
+/-- Error scope as a handler: `VM.attempt` carries the catch through every suspension, so a handler that
+parks and then raises is caught here exactly as one that raises at once. The failure becomes a 500 rather than
+escaping the connection. -/
+def catchErrors : Middleware :=
+  fun handler req => do
+    match ← LeanIn.Runtime.VM.attempt (handler req) with
+    | .ok resp => pure resp
+    | .error e => pure (response 500 "Internal Server Error" (toString e).toUTF8)
+
+/-- Observing middleware: logs method, path and status through `IO` lifted into the machine, then returns the
+response unchanged. -/
+def requestLogger (label : String) : Middleware :=
+  fun handler req => do
+    let resp ← handler req
+    let status : Nat := resp.1.status
+    let line := label ++ " " ++ req.head.methodTokenString ++ " " ++ req.path ++ " -> " ++ toString status
+    monadLift (do IO.println line; IO.getStdout >>= fun s => s.flush)
+    pure resp
+
 /-- Compose an extractor with a handler: an extraction failure becomes the response, so applications compose
 `withExtract (jsonBody T) fun t => …` the way the stock extractor classes compose. -/
 def withExtract (extract : Request → Except (Nat × String) α) (f : α → Handler) : Handler :=

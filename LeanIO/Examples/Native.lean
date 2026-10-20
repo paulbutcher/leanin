@@ -62,6 +62,12 @@ def userById : Handler :=
     let name := (req.queryParam? "name").getD ""
     pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"id={id} name={name}\n".toUTF8)
 
+/-- Raises *after* a suspension, to exercise an error scope across a park. -/
+def boom (clock : LeanIn.Runtime.Clock) : Handler :=
+  fun _ => do
+    let _ ← LeanIn.Runtime.VM.sleep clock 100
+    throw (IO.userError "boom after a park")
+
 /-- Middleware demonstration: adds a header to every response it wraps. -/
 def tag (value : String) : LeanIO.Backend.LeanIn.Middleware :=
   fun handler req => do
@@ -91,6 +97,8 @@ def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
     |>.addRoute .post [Segment.lit "text"] postText
     |>.addRoute .post [Segment.lit "form"] postForm
     |>.addRoute .get [Segment.lit "user", Segment.param "id"] (tag "users" userById)
+    |>.addRoute .get [Segment.lit "boom"] (LeanIO.Backend.LeanIn.catchErrors (boom clock))
+    |>.addRoute .get [Segment.lit "logged"] (LeanIO.Backend.LeanIn.requestLogger "req" ping)
 
 end LeanIO.Examples.Native
 

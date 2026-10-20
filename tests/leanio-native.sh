@@ -116,6 +116,20 @@ check("unknown method token", st.endswith("501 Not Implemented"), st)
 st, _, _ = get("/nope")
 check("miss", st.endswith("404 Not Found"), st)
 
+# Error scope across a suspension: /boom sleeps then raises; the catch is around the park, and the
+# connection still serves afterwards.
+t0 = time.time()
+st, _, body = get("/boom")
+boom_dt = time.time() - t0
+check("error scope across park", st.endswith("500 Internal Server Error") and boom_dt >= 0.09,
+      f"{st} {boom_dt:.3f}s {body!r}")
+st, _, body = get("/ping")
+check("alive after caught error", st.endswith("200 OK") and body == b"pong\n", f"{st} {body!r}")
+
+# Observing middleware logs the request and returns the response unchanged.
+st, _, body = get("/logged")
+check("logger passthrough", st.endswith("200 OK") and body == b"pong\n", f"{st} {body!r}")
+
 # Framing rejection.
 st, _, _ = request(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 2097152\r\n\r\n")
 check("oversized body", st.endswith("413 Payload Too Large"), st)
@@ -133,6 +147,12 @@ st, _, body = post("/text", "text/plain", b"hello")
 check("text ok", st.endswith("200 OK") and body == b"text: hello\n", f"{st} {body!r}")
 st, _, body = post("/form", "application/x-www-form-urlencoded", b"user=alice&x=1")
 check("form ok", st.endswith("200 OK") and body == b"user=alice\n", f"{st} {body!r}")
+
+try:
+    log = open("/tmp/leanio-native.log", encoding="utf-8", errors="replace").read()
+    check("logger line", "req GET /logged -> 200" in log, log[-200:])
+except OSError as e:
+    check("logger line", False, str(e))
 
 if failures:
     print("leanio-native: FAILED")

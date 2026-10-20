@@ -24,6 +24,7 @@ The fork's backend has been moved onto LeanIn for the native path:
 | extraction | JSON, plain text and URL-encoded form over the buffered body (415/400/422), reusing LeanIO's MIME declarations, query parser and `FromForm` |
 | request | path parameters captured by the trie, query string/parameter decoding, headers, media type; `withExtract` composes an extractor with a handler; `Middleware := Handler → Handler` |
 | suspension | handlers are `VM` values; `GET /slow` parks 200 ms while a sibling request completes |
+| middleware | `Handler → Handler`; `catchErrors` uses `VM.attempt`, whose catch survives a suspension (`/boom` parks then raises, answered 500), and `requestLogger` observes and passes through |
 | checks | `tests/leanio-native.sh` asserts all of the above at the public socket |
 
 Not yet ported: the route macros and `FromRequestBody`/`FromRequestParts` classes still ascribe
