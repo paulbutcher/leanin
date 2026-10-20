@@ -1,10 +1,10 @@
-import LeanIn.Http.H1
+import LeanIn.Examples.Http.H1
 import Std.Http.Protocol.H1
 
 /-!
 # `h1bench` — the head-parse microbenchmark
 
-Drives one HTTP/1.1 request through `Std.Http.Protocol.H1`'s machine and through `LeanIn.Http.H1`'s, in memory,
+Drives one HTTP/1.1 request through `Std.Http.Protocol.H1`'s machine and through `LeanIn.Examples.Http.H1`'s, in memory,
 once per iteration — no sockets, no timers, no response — so the two parsers are compared on the work each does
 for the same bytes, and nothing else. `main` takes the iteration count (default 100000) and prints ns/parse per
 arm, alternating arms twice so a run-to-run drift is visible rather than averaged away.
@@ -14,7 +14,7 @@ arm, alternating arms twice so a run-to-run drift is visible rather than average
 nanoseconds — see §3.6 of `docs/PERFORMANCE.md` for the recorded figures and how to read them.
 -/
 
-open LeanIn.Http
+open LeanIn.Examples.Http
 
 def req := "GET /bench HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n".toUTF8
 

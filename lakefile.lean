@@ -12,7 +12,22 @@ package leanin where
   toolchain the library cannot build on. -/
   fixedToolchain := true
 
-@[default_target] lean_lib LeanIn
+/-- The **library**: the concurrency toolkit — runtime, scheduler, task/async, data structures, and the model and
+theory that verify them. It imports nothing from `LeanIn/Examples/` or `LeanIn/Exe/`. -/
+@[default_target] lean_lib LeanIn where
+  globs := #[.one `LeanIn,
+             .one `LeanIn.Async, .submodules `LeanIn.Async,
+             .submodules `LeanIn.Data,
+             .submodules `LeanIn.Model,
+             .submodules `LeanIn.Runtime,
+             .submodules `LeanIn.Sched,
+             .submodules `LeanIn.Task,
+             .submodules `LeanIn.Theory]
+
+/-- The **example**: the HTTP/1.1 protocol and server, built on the toolkit and published separately so the
+library's surface stays the concurrency toolkit. -/
+lean_lib LeanInExamples where
+  globs := #[.one `LeanIn.Examples, .submodules `LeanIn.Examples]
 
 /-- The socket shim: `c/netuv.c` compiled and archived by Lake rather than by the dev shell, so that a plain
 `lake build` produces it and no store path appears in any build flag. Lake traces the source, so editing the C

@@ -441,7 +441,7 @@ thread), and both readings are recorded rather than one chosen.
 
 `Std.Http.Protocol.H1`'s parser is a `Parsec` combinator parser: it converts every token it scans back into a
 `ByteArray` and then a `String`, tries the method against ~40 `attempt`-wrapped alternatives, and re-allocates a
-`"\r\n".toUTF8` literal on every line. `LeanIn.Http.H1` replaces it. The method is dispatched on its first byte;
+`"\r\n".toUTF8` literal on every line. `LeanIn.Examples.Http.H1` replaces it. The method is dispatched on its first byte;
 the request target and every header name/value stay a `Slice` — a pair of indices **into the read buffer that was
 already allocated** — so the head parse copies nothing per token, and only the response is built.
 
@@ -451,7 +451,7 @@ The parse, isolated and driven in-memory for the same request by `h1bench` (comp
 | arm | instructions/parse | ns/parse |
 |---|---|---|
 | `Std.Http.Protocol.H1` | 70 837 | 6 679 / 6 712 |
-| `LeanIn.Http.H1` | **9 040** | **633 / 613** |
+| `LeanIn.Examples.Http.H1` | **9 040** | **633 / 613** |
 
 **7.8× fewer instructions, 10.8× faster** on the parse itself. `callgrind` puts Std's `scanWhileUpTo` at only
 4.3 %, but the parse's real cost is the memory-management column it drives — `lean_dec_ref_cold` 13.2 %,
@@ -463,7 +463,7 @@ same box and session, `maxMessages` bumped on both arms so neither closes mid-ru
 | arm | C=1 rps | C=1 p50 | C=4 rps | C=4 p50 |
 |---|---|---|---|---|
 | `Std.Http.Protocol.H1` | 31 182 / 29 106 | 27 / 31 µs | 28 893 / 30 016 | 132 / 131 µs |
-| `LeanIn.Http.H1` | 26 704 / 27 815 | 29 / 30 µs | **45 004 / 53 172** | **81 / 67 µs** |
+| `LeanIn.Examples.Http.H1` | 26 704 / 27 815 | 29 / 30 µs | **45 004 / 53 172** | **81 / 67 µs** |
 
 At C=1 the two are a wash, and that is the reading the runtime's own finding predicts rather than a surprise:
 §4.7 already established that a keep-alive request at one connection is **orchestration, not work**, so a parse
@@ -473,7 +473,7 @@ seven times cheaper is seven times cheaper on the slice of the path the handoffs
 row is recorded as a wash, not claimed as a win.
 
 The behaviour is gated, not measured: `tests/executor-contract.sh SC20` drives the connection through
-`Runtime.Http.serveConn` and compares the wire bytes against a `Std.Http.Protocol.H1.Machine` driven in memory
+`LeanIn.Examples.Http.Server.serveConn` and compares the wire bytes against a `Std.Http.Protocol.H1.Machine` driven in memory
 as an independent oracle — one connection serving two exchanges, a handler failure answered as
 `500 Connection: close`, and a stalled peer — so the bytes are checked against the protocol it replaces, not only
 against a pinned literal.

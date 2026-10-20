@@ -1,5 +1,5 @@
 import Std.Http.Data
-import LeanIn.Http.H1
+import LeanIn.Examples.Http.H1
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Clock
 import LeanIn.Runtime.Time
@@ -12,7 +12,7 @@ import LeanIn.Task.Error
 
 The per-connection loop below (`drive`) is an `asyncMachine`: every suspension in it is a **state of a compiled
 machine**, not a closure, so a request costs a step and a raw resume rather than a `bind`, a cell and an item.
-The protocol is `LeanIn.Http.H1` — our own parser and machine, in `LeanIn/Http/H1.lean` — so nothing here scans
+The protocol is `LeanIn.Examples.Http.H1` — our own parser and machine, in `LeanIn/Examples/Http/H1.lean` — so nothing here scans
 bytes and there is no framer. The accept loops in `LeanIn.Runtime.Net` are the callers.
 
 **The handler is a `VM`.** It may suspend — read a backend, wait on a timer — and its suspension joins this
@@ -28,9 +28,10 @@ never have arrived. What it does not bound is a handler that never returns, `Lis
 to a complete head — a peer that sends one byte before each deadline keeps the connection alive.
 -/
 
-namespace LeanIn.Runtime.Http
+namespace LeanIn.Examples.Http.Server
 
-open LeanIn.Http
+open LeanIn.Runtime
+open LeanIn.Examples.Http
 
 /-- A request handler of ours: the parsed request head to the response head and its fully buffered body, in the
 `VM`. It may suspend, and its suspension is a suspension of the connection's machine. -/
@@ -110,7 +111,7 @@ def pump (handler : Handler) (m : H1.Machine) : Pump := pumpGo handler m #[]
 --
 -- A docstring here would not parse: `asyncMachine` is a command syntax registered by `elab`, and that form does
 -- not take one.
-asyncMachine drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : LeanIn.Http.H1.Machine)
+asyncMachine drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : LeanIn.Examples.Http.H1.Machine)
     (onClose : Except IO.Error Unit → IO Unit) := do
   let r : Pump := pump handler m
   let machine : H1.Machine := r.machine
@@ -199,4 +200,4 @@ def serveConn (cfg : Config) (c : Conn) (handler : Handler) : Task.EAsync IO.Err
     (Task.Async.await (show Task.Task (Except IO.Error Unit) from ⟨cell, ctx.cancel⟩)).step
       (fun r ctx' => k r ctx') ctx⟩
 
-end LeanIn.Runtime.Http
+end LeanIn.Examples.Http.Server

@@ -1,13 +1,16 @@
 # The defunctionalization approach (`async!` / the `VM`)
 
-> **Status note (2026-10-16).** The modules this page documents — `LeanIn/Runtime/HttpServer.lean`,
+> **Status note (2026-10-20).** The HTTP modules named below moved to `LeanIn/Examples/Http/` and are the
+> `LeanInExamples` target; they are an application of the toolkit, not part of the library.
+>
+> **Status note (2026-10-16).** The modules this page documents — `LeanIn/Examples/Http/Server.lean`,
 > `LeanIn/Runtime/VMHttp.lean`, `LeanIn/Runtime/SmEcho.lean` — are **deleted**, superseded by
-> `LeanIn/Runtime/Http.lean`'s `drive`: the same `asyncMachine` engine, on the repo's own `LeanIn.Http.H1`
+> `LeanIn/Examples/Http/Server.lean`'s `drive`: the same `asyncMachine` engine, on the repo's own `LeanIn.Examples.Http.H1`
 > machine, as the production driver (`lake exe server`, SC19/SC20, `bench/threeway.sh`'s leanin arm). The
 > measurements below stand as taken when the modules lived; the current driver and its numbers are milestone 3
 > in `docs/tokio-workplan.md`.
 
-Status: **a working `Std.Http` replacement.** `LeanIn/Runtime/HttpServer.lean` is an HTTP/1.1 server on the
+Status: **a working `Std.Http` replacement.** `LeanIn/Examples/Http/Server.lean` is an HTTP/1.1 server on the
 `asyncMachine` engine — each connection's `serveConn` compiles the full H1 drive (the `vmDrive` shape: `pump`
 the machine, write, then `halted`? close : `recvTimeout` → EOF/stalled/feed) to a per-function state machine.
 `asyncMachine` lowers `await`-suspensions, inlines pure code, and lowers `if`/`match` control flow to state
@@ -100,7 +103,7 @@ binding's type rather than reset it to the inference fallback. `match` and `recv
 
 *Measurement* (`bench/load.mjs`, keep-alive, sequential request-response, 5 s runs, `maxMessages`/`maxRequests`
 raised past the H1 default of 100 on both Lean servers — see below). The replacement
-(`LeanIn/Runtime/HttpServer.serveConn`) against the shipped **`Std.Http.Server`** (`LeanIn/Exe/StdServer.lean`) and Node
+(`LeanIn.Examples.Http.Server.serveConn`) against the shipped **`Std.Http.Server`** (`LeanIn/Exe/StdServer.lean`) and Node
 (`bench/node-server.mjs`):
 
 | C | leanin `HttpServer` | shipped `Std.Http.Server` | Node |

@@ -38,7 +38,7 @@ unbound write failure closes), `Io.closeRaw`, `VM.runAsync` (a sub-computation's
 bind), and **machine calls**: any `*.run` application suspends on the callee, whose `run` must declare its
 continuation last — an `onDone`-style parameter the callee invokes with its result; the generator fills that
 slot with the caller's continuation, so a machine awaiting a machine is a raw resume and **no cell**, exactly
-as `Runtime.Http.drive`'s `onClose` works. Field types are inferred without a general elaboration pass: a
+as `LeanIn.Examples.Http.Server.drive`'s `onClose` works. Field types are inferred without a general elaboration pass: a
 threaded parameter keeps its signature
 type, a `recvRaw`-bound variable is `ByteArray`, a `recvTimeoutRaw`-bound one is
 `Option (Except IO.Error (Option ByteArray))`, a `sendRaw`/`sendAllRaw`-bound one is `Except IO.Error Unit`,

@@ -1,7 +1,7 @@
 import Std
 
 /-!
-# `LeanIn.Http.H1` — a byte-oriented HTTP/1.1 head parser and connection machine
+# `LeanIn.Examples.Http.H1` — a byte-oriented HTTP/1.1 head parser and connection machine
 
 A replacement for `Std.Http.Protocol.H1`'s request path. Where Std's parser is a `Parsec` combinator parser that
 converts each scanned token back into a `ByteArray` then a `String` (and re-allocates `"\r\n".toUTF8` literals on
@@ -13,7 +13,7 @@ Body framing is **Content-Length only** here; chunked transfer and `Expect: 100-
 header limits are not yet enforced.
 -/
 
-namespace LeanIn.Http.H1
+namespace LeanIn.Examples.Http.H1
 
 /-- A half-open range of indices into a `ByteArray` — a view, not a copy. -/
 structure Slice where
@@ -376,4 +376,4 @@ def noMoreInput (m : Machine) : Machine :=
 
 end Machine
 
-end LeanIn.Http.H1
+end LeanIn.Examples.Http.H1

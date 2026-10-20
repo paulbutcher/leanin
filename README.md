@@ -11,7 +11,10 @@ techniques found in tokio and node to get a runtime for concurrency that is on p
 languages but which lives in a proof assistant. The basic trick is to use **data, not closures** — i.e.
 defunctionalisation rather than vanilla `do`.
 
-The concurrency engine is quite general but we have demonstrated it with an HTTP/1.1 server. Requests to
+The library is the concurrency toolkit: `import LeanIn` brings in the runtime, scheduler, task and async
+interfaces, data structures and their model. The HTTP/1.1 implementation is an **example**, published separately
+as the `LeanInExamples` target under `LeanIn/Examples/`; the library does not import it. We have demonstrated the
+toolkit with that server. Requests to
 `/bench`, both sides pinned to distinct P-cores:
 
 | shape | server | C=1 | C=8 | C=32 |
