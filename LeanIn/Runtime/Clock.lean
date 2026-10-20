@@ -1,10 +1,10 @@
 module
 
-import Std
-import Std.Async.Timer
-import LeanIn.Runtime.Basic
-import LeanIn.Runtime.Leaf
-import LeanIn.Runtime.Io
+public import Std
+public import Std.Async.Timer
+public import LeanIn.Runtime.Basic
+public import LeanIn.Runtime.Leaf
+public import LeanIn.Runtime.Io
 
 
 public section

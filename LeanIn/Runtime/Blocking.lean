@@ -1,8 +1,8 @@
 module
 
-import Std
-import LeanIn.Runtime.Leaf
-import LeanIn.Task.Error
+public import Std
+public import LeanIn.Runtime.Leaf
+public import LeanIn.Task.Error
 
 
 public section

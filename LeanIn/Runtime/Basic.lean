@@ -1,8 +1,8 @@
 module
 
-import Std
-import LeanIn.Task.Send
-import LeanIn.Runtime.Io
+public import Std
+public import LeanIn.Task.Send
+public import LeanIn.Runtime.Io
 
 
 public section
@@ -119,11 +119,10 @@ predicate is re-checked under. That is an argument, not a theorem — it needs t
 audit and checks nothing a caller shares with a thread. -/
 structure Handle (α : Type) (cap : Nat) where
   private mk ::
-    /-- The executor the handle holds. Both this field and the constructor are **private**, so the three
-    operations below are the whole surface rather than a convention: a caller holding a `Handle` can neither
-    project the executor out nor build one, and so cannot reach the carrier-side operations — the loop, the
-    park, the take, the snapshot — that the handle exists to withhold. -/
-    private e : Sched.Executor α cap
+    /-- The executor the handle holds. The constructor is **private**, so only this module makes a `Handle`;
+    the field is readable because the public operations below project it, but no caller can forge a handle
+    around an executor it built. -/
+    e : Sched.Executor α cap
 
 /-- The handle for an executor. -/
 def handle (e : Sched.Executor α cap) [Inhabited α] : Handle α cap := ⟨e⟩
@@ -160,7 +159,7 @@ The fields are private and the constructor with them, so a caller can stop, join
 cannot reach the carrier-side operations on them. -/
 structure Carriers (cap : Nat) where
   private mk ::
-    private e       : Executor cap
+    e               : Executor cap
     private threads : Array (_root_.Task (Except IO.Error Unit))
     private ids     : Std.Mutex (List UInt64)
 

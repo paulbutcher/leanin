@@ -1,11 +1,11 @@
 module
 
-import Lean
-import Lean.Parser.Term
-import LeanIn.Async.Attr
-import LeanIn.Runtime.Net
-import LeanIn.Runtime.Io
-import LeanIn.Runtime.VM
+public import Lean
+public import Lean.Parser.Term
+public meta import LeanIn.Async.Attr
+public import LeanIn.Runtime.Net
+public import LeanIn.Runtime.Io
+public import LeanIn.Runtime.VM
 
 
 public section
@@ -73,7 +73,7 @@ private inductive Item where
   deriving Inhabited
 
 /-- Recursively unwrap `doSeqIndent`/`doSeq`/`doSeqItem`/`doNested`/`null` down to the doElems. -/
-private partial def doElemsOf (s : Syntax) : List Syntax :=
+private meta partial def doElemsOf (s : Syntax) : List Syntax :=
   match s.getKind with
   | `Lean.Parser.Term.doSeqIndent => s.getArgs.toList.flatMap doElemsOf
   | `Lean.Parser.Term.doSeq => s.getArgs.toList.flatMap doElemsOf
@@ -83,7 +83,7 @@ private partial def doElemsOf (s : Syntax) : List Syntax :=
   | _ => if s.isAtom then [] else [s]
 
 /-- Collect the `matchAlt` nodes from a `matchAlts` node. -/
-private partial def matchAltNodesOf (s : Syntax) : List Syntax :=
+private meta partial def matchAltNodesOf (s : Syntax) : List Syntax :=
   if s.isOfKind `Lean.Parser.Term.matchAlt then [s]
   else
     match s with
@@ -91,11 +91,11 @@ private partial def matchAltNodesOf (s : Syntax) : List Syntax :=
     | _ => []
 
 mutual
-private partial def parseItems (stx : Syntax) : MacroM (List Item) :=
+private meta partial def parseItems (stx : Syntax) : MacroM (List Item) :=
   (doElemsOf stx).mapM parseItem
 
 /-- Parse one do-item, recursing into `if` branches. -/
-private partial def parseItem (d : Syntax) : MacroM Item := do
+private meta partial def parseItem (d : Syntax) : MacroM Item := do
   match d with
   | `(doElem| let $x:ident : $ty:term := await $e) => return .await (some x.getId) (some ⟨ty⟩) e
   | `(doElem| let $x:ident := await $e) => return .await (some x.getId) none e
@@ -126,7 +126,7 @@ end
 /-- The names used anywhere in a term (free variables a state might need). Dot-notation like `m.feed` is a
 single compound identifier, so we collect each identifier's **root** as well as its full form — the root is the
 local variable a state must carry, the full form never matches one. -/
-private partial def usedNames (stx : Syntax) (acc : List Name := []) : List Name :=
+private meta partial def usedNames (stx : Syntax) (acc : List Name := []) : List Name :=
   match stx with
   | .ident _ _ n _ => n :: n.getRoot :: acc
   -- A receiver-less dot head (`.ok`, `.error`, `.2`) is a constructor or projection, never a variable a
@@ -143,7 +143,7 @@ or a nullary constructor — the syntax cannot tell those apart (`none` and `tru
 expected type), so they are taken as bindings, which is inert unless the same name is also used as a bare term
 after a suspension, where the field-type inference then fails loudly with the name. A preresolved identifier
 is a constructor and is skipped as well, where the caller's syntax carries resolution. -/
-private partial def patBoundNames (stx : Syntax) (acc : List Name := []) : List Name :=
+private meta partial def patBoundNames (stx : Syntax) (acc : List Name := []) : List Name :=
   match stx with
   | .ident _ _ n pre => if n.isAnonymous || n == `_ || !pre.isEmpty then acc else n :: acc
   -- The head of an application is the constructor (`some x`, `.ok x`); only the arguments bind.
@@ -155,7 +155,7 @@ private partial def patBoundNames (stx : Syntax) (acc : List Name := []) : List 
   | _ => acc
 
 /-- All names used in a list of items (for liveness). -/
-private partial def usedInItems (items : List Item) : List Name :=
+private meta partial def usedInItems (items : List Item) : List Name :=
   items.flatMap go
 where
   go : Item → List Name
@@ -175,7 +175,7 @@ where
   | .contStmt t => usedNames t
 
 /-- Whether a list of items suspends anywhere (decides inline-vs-new-state for a continuation). -/
-private partial def hasAwait (items : List Item) : Bool :=
+private meta partial def hasAwait (items : List Item) : Bool :=
   items.any fun
     | .await .. => true
     | .if_ _ t e => hasAwait t || hasAwait e
@@ -217,7 +217,7 @@ private structure Ctx where
   ns : Name                     -- the current namespace (relative machine names resolve against it)
   loops : List LoopCtx := []    -- the enclosing `while` loops, innermost first
 /-- The leading parameter count of a `run`'s type, and whether its last parameter is a function. -/
-private partial def piShape (e : Lean.Expr) : Nat × Bool :=
+private meta partial def piShape (e : Lean.Expr) : Nat × Bool :=
   go e 0 where
   go : Lean.Expr → Nat → Nat × Bool
     | .forallE _ t b _, n =>
@@ -244,10 +244,10 @@ private inductive Eff where
   | unknown
 
 /-- Strip a `Term.paren` wrapper: `(e)` becomes `e`. -/
-private partial def unparen (s : Syntax) : Syntax :=
+private meta partial def unparen (s : Syntax) : Syntax :=
   if s.getKind == `Lean.Parser.Term.paren && s.getArgs.size ≥ 2 then unparen s[1]! else s
 
-private def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
+private meta def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   match unparen e with
   | `(LeanIn.Runtime.Io.recvStallRaw $_ $d $z) => pure (.stallRead ⟨d⟩ ⟨z⟩)
   | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => pure (.recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩)
@@ -311,32 +311,32 @@ private abbrev CompileM := StateT (Nat × List GenState) MacroM
 
 /-- Extend the scope with freshly bound names. A name already in scope (a shadowing pure bind) keeps its
 existing binding — and its type; a genuinely new name is `.pureB` (its type inferred from use). -/
-private def extendScope (scope : List (Name × Bind)) (names : List Name) : List (Name × Bind) :=
+private meta def extendScope (scope : List (Name × Bind)) (names : List Name) : List (Name × Bind) :=
   names.foldl (fun sc x => if sc.any (fun (n, _) => n == x) then sc else sc ++ [(x, .pureB)]) scope
 
 /-- As `extendScope`, but a genuinely new name takes binding `b` (an ascribed pure bind). -/
-private def extendScopeB (scope : List (Name × Bind)) (names : List Name) (b : Bind) : List (Name × Bind) :=
+private meta def extendScopeB (scope : List (Name × Bind)) (names : List Name) (b : Bind) : List (Name × Bind) :=
   names.foldl (fun sc x => if sc.any (fun (n, _) => n == x) then sc else sc ++ [(x, b)]) scope
 
-private def freshIdx : CompileM Nat := do
+private meta def freshIdx : CompileM Nat := do
   let (n, ss) ← get
   set (n + 1, ss)
   pure n
 
-private def addState (s : GenState) : CompileM Unit := do
+private meta def addState (s : GenState) : CompileM Unit := do
   let (n, ss) ← get
   set (n, s :: ss)
 
 /-- The *reference* name for state `i` (`name.St.s{i}`). -/
-private def stIdent (name : Name) (i : Nat) : Ident :=
+private meta def stIdent (name : Name) (i : Nat) : Ident :=
   mkIdent ((Name.mkStr (name ++ `St) s!"s{i}").eraseMacroScopes)
 
 /-- The *declaration* name for state `i` (just `s{i}`). -/
-private def stLocalName (i : Nat) : Ident :=
+private meta def stLocalName (i : Nat) : Ident :=
   mkIdent ((Name.mkSimple s!"s{i}").eraseMacroScopes)
 
 /-- Whether a pure-bound variable is used as a `sendAllRaw`/`sendRaw` data argument in the items. -/
-private partial def usesSendArg (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
+private meta partial def usesSendArg (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
   items.anyM go
 where
   go : Item → MacroM Bool := fun
@@ -353,7 +353,7 @@ where
   | _ => pure false
 
 /-- Whether a pure-bound variable is used as an `if`-condition in the items. -/
-private partial def usedAsCond (f : Name) (items : List Item) : Bool :=
+private meta partial def usedAsCond (f : Name) (items : List Item) : Bool :=
   items.any go
 where
   go : Item → Bool
@@ -365,7 +365,7 @@ where
 
 /-- Whether a syntax subtree contains a reference to `f`. Application arguments are nested syntax nodes in
 Lean's parser, so a direct-identifier check misses `handler head`'s `head` operand. -/
-private partial def containsName (f : Name) (s : Syntax) : Bool :=
+private meta partial def containsName (f : Name) (s : Syntax) : Bool :=
   match s with
   | .ident _ _ n _ => n.eraseMacroScopes == f.eraseMacroScopes || n.getRoot.eraseMacroScopes == f.eraseMacroScopes
   | .node _ _ args => args.any (containsName f)
@@ -373,7 +373,7 @@ private partial def containsName (f : Name) (s : Syntax) : Bool :=
 
 /-- Whether a pure-bound variable appears inside an **array-literal** `sendAllRaw`/`sendRaw` argument
 (`#[x]` ⇒ the element, a `ByteArray`). -/
-private partial def usesSendElem (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
+private meta partial def usesSendElem (ctx : Ctx) (f : Name) (items : List Item) : MacroM Bool :=
   items.anyM go
 where
   go : Item → MacroM Bool := fun
@@ -395,7 +395,7 @@ where
 /-- A field's type when it is used as the argument of a parameter function: the function's domain. For
 example `handler head` ⇒ `Request.Head`, the handler's argument type — a field whose only use is passing it to
 a typed function, with no `sendAll`/`if` use to read its type off. -/
-private partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Option Term :=
+private meta partial def findFnArg (ctx : Ctx) (f : Name) (items : List Item) : Option Term :=
   items.foldl (fun acc it => acc.orElse (fun _ => goItem it)) none
 where
   sameName (a b : Name) : Bool := a.eraseMacroScopes == b.eraseMacroScopes
@@ -427,7 +427,7 @@ where
     | _ => none
 
 /-- The type of one state field, from its binding and (for pure-bound) how the continuation uses it. -/
-private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : MacroM Term := do
+private meta def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : MacroM Term := do
   match b with
   | .threaded ty => pure ty
   | .recvRes => `($(mkIdent `ByteArray))
@@ -447,7 +447,7 @@ private def fieldTypeFor (ctx : Ctx) (f : Name) (b : Bind) (rest : List Item) : 
         Ascribe it: `let {f} : T := …`"
 
 /-- A jump `name.step c (name.St.s{idx} args…)`, passing the state's live fields `args`. -/
-private def jumpTerm (ctx : Ctx) (idx : Nat) (args : List Name) : MacroM Term := do
+private meta def jumpTerm (ctx : Ctx) (idx : Nat) (args : List Name) : MacroM Term := do
   let step := mkIdent (ctx.name ++ `step)
   let cn := stIdent ctx.name idx
   let c := mkIdent ctx.conn
@@ -455,11 +455,11 @@ private def jumpTerm (ctx : Ctx) (idx : Nat) (args : List Name) : MacroM Term :=
   if argTs.isEmpty then `($step $c $cn) else `($step $c ($cn $argTs*))
 
 /-- The `recurse` jump: back to state 0 with the threaded parameters' current values. -/
-private def recurseTerm (ctx : Ctx) : MacroM Term :=
+private meta def recurseTerm (ctx : Ctx) : MacroM Term :=
   jumpTerm ctx 0 ctx.threaded
 
 /-- The binding an effect's result variable gets. -/
-private def resultBind (eff : Eff) : Bind :=
+private meta def resultBind (eff : Eff) : Bind :=
   match eff with
   | .recv => .recvRes
   | .recvTimeout .. => .recvTimeoutRes
@@ -471,7 +471,7 @@ private def resultBind (eff : Eff) : Bind :=
 /-- The suspension for one effect, with continuation `cont`. A source ascription (`let x : T := await …`)
 applies to the binder itself, so a mismatched ascription fails at elaboration whether the value is live into a
 later state or not — the alternative is that a dead binding's ascription silently disappears. -/
-private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Option Term)
+private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Option Term)
     (cont : Term) : MacroM Term := do
   let c := mkIdent ctx.conn
   -- A binder carrying the source ascription when there is one.
@@ -586,7 +586,7 @@ private def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Optio
 /-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, `halt`, or a close — so
 appending a continuation after it (the code following an `if`/loop body) would be unreachable and must be
 skipped. -/
-private partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM Bool :=
+private meta partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM Bool :=
   match items.getLast? with
   | some .recurse => pure true
   | some .break_ => pure true
@@ -602,7 +602,7 @@ private partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM Bool :
 /-- Rewrite `continue` items at a `for` body's own level to take the loop's increment first — a skipped
 iteration owes the counter too, or the loop never advances. A `continue` inside a nested loop belongs to that
 loop and is left alone (the recursion enters `if`/`match` but never `while`/`for`). -/
-private partial def incContinues (i : Ident) (inc : Term) : List Item → List Item
+private meta partial def incContinues (i : Ident) (inc : Term) : List Item → List Item
   | [] => []
   | .continue_ :: rest => .pureBind i none inc :: .continue_ :: incContinues i inc rest
   | .if_ c t e :: rest => .if_ c (incContinues i inc t) (incContinues i inc e) :: incContinues i inc rest
@@ -611,7 +611,7 @@ private partial def incContinues (i : Ident) (inc : Term) : List Item → List I
 
 /-- The pure tail a close may be followed by: every statement runs after the socket goes, so nothing that
 suspends is allowed -- a completion signal (the `onClose` of a served connection) is the use. -/
-private def closeTail : List Item → MacroM Term
+private meta def closeTail : List Item → MacroM Term
   | [] => `(pure ())
   | .pureStmt s :: rs => do
     let t ← closeTail rs
@@ -627,7 +627,7 @@ private def closeTail : List Item → MacroM Term
 mutual
 /-- Compile a list of items into the body Term of a state (or an inline continuation). Generates any
 continuation states as a side effect. `scope` is the in-scope variables with their bindings. -/
-private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (Name × Bind)) : CompileM Term := do
+private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (Name × Bind)) : CompileM Term := do
   match items with
   | [] => Macro.throwError "async: a path does not end in `recurse`, a close, or `halt`"
   | .halt :: rest => do
@@ -750,7 +750,7 @@ private partial def compileBody (ctx : Ctx) (items : List Item) (scope : List (N
     jumpTerm ctx idx args
 
 /-- The continuation after an `await`: inline pures+`recurse`/a hoisted marker; otherwise a new state. -/
-private partial def genCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Term := do
+private meta partial def genCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Term := do
   match rest with
   | [] => Macro.throwError "async: an `await` has no continuation"
   | [.contStmt t] => pure t
@@ -764,7 +764,7 @@ private partial def genCont (ctx : Ctx) (rest : List Item) (scope : List (Name �
 
 /-- Hoist the items after a control-flow item into a shared continuation state (so converging paths compile
 once). Returns a `.contStmt` marker naming it, or `none` when there is no rest. -/
-private partial def hoistCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM (Option Item) := do
+private meta partial def hoistCont (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM (Option Item) := do
   match rest with
   | [] => pure none
   | _ =>
@@ -776,7 +776,7 @@ private partial def hoistCont (ctx : Ctx) (rest : List Item) (scope : List (Name
 
 /-- Generate a new state for `rest` (a continuation that suspends), returning its index. The state's fields
 are the in-scope variables used in `rest`. -/
-private partial def genState (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Nat := do
+private meta partial def genState (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : CompileM Nat := do
   let idx ← freshIdx
   let fieldTys ← liveNames ctx rest scope |>.mapM (fun f => do
     let b := scope.lookup f |>.getD .pureB
@@ -788,14 +788,14 @@ private partial def genState (ctx : Ctx) (rest : List Item) (scope : List (Name 
 /-- The in-scope variables used in `rest` (the live fields). Compared scope-free: the threaded parameter
 declared in the signature and the same name used in the body can carry different macro scopes, which would
 otherwise drop a genuinely live variable from a state's fields. -/
-private partial def liveNames (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List Name :=
+private meta partial def liveNames (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List Name :=
   let used := (usedInItems rest).map (·.eraseMacroScopes)
   -- Threaded parameters are always live: a `recurse` from any state must be able to pass them all back to
   -- state 0, so every state carries them whether or not its own body uses them.
   scope.filter (fun (n, _) => ctx.threaded.contains n || used.contains n.eraseMacroScopes) |>.map (·.1)
 
 /-- The scope restricted to the variables live into `rest`. -/
-private partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List (Name × Bind) :=
+private meta partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List (Name × Bind)) : List (Name × Bind) :=
   let live := liveNames ctx rest scope
   scope.filter (fun (n, _) => live.contains n)
 end

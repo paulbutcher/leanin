@@ -1,6 +1,6 @@
 module
 
-import Std
+public import Std
 public import LeanIn.Data.Slots
 
 

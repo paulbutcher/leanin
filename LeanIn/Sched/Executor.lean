@@ -1,10 +1,10 @@
 module
 
-import Std
+public import Std
 public import LeanIn.Data.Deque
 public import LeanIn.Sched.Pool
 public import LeanIn.Model.Multi
-import LeanIn.Sched.Scheduler
+public import LeanIn.Sched.Scheduler
 
 
 public import Std.Sync.Mutex

@@ -1,8 +1,8 @@
 module
 
-import Std
+public import Std
 public import LeanIn.Data.Ring
-import LeanIn.Data.Deque
+public import LeanIn.Data.Deque
 public import LeanIn.Model.Pool
 
 

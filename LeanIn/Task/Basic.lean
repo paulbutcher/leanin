@@ -1,7 +1,7 @@
 module
 
-import Std
-import LeanIn.Sched.Executor
+public import Std
+public import LeanIn.Sched.Executor
 
 
 public import Std.Sync.Mutex

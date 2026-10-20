@@ -1,7 +1,8 @@
 module
 
-import Std
+public import Std
 public import LeanIn.Task.Basic
+public import LeanIn.Sched.Executor
 
 
 public section
@@ -40,6 +41,12 @@ by its callers. -/
 structure Sendable (α : Type) where
   private mk :: of : α
 
+/-- The accessor the boundary needs. The constructor stays private, so a `Sendable` still exists only where the
+library made one; this projection is public so the push sites in `Sched` (a sibling namespace) can read it. -/
+public def Sendable.val (s : Sendable α) : α :=
+  match s with
+  | ⟨x⟩ => x
+
 /-- The values the library is willing to hand to another carrier. Instances are declared by this library, for
 its own values; a module outside it cannot declare a useful one, because it cannot build the witness. -/
 class Send (α : Type) where
@@ -64,17 +71,17 @@ variable {α : Type} [Inhabited α]
 /-- **Push a step into the shared inject, across a carrier boundary** — the external route, and a queue whose
 push has this signature and no other. -/
 def Executor.pushInject (e : Executor α cap) (x : Sendable α) : BaseIO Unit :=
-  e.pushInjectRaw x.of
+  e.pushInjectRaw x.val
 
 /-- **Push a step into worker `i`'s own queue, across a carrier boundary** — the local route, the LIFO slot,
 overflowing through the ring's placement rule when the slot displaces an occupant. -/
 def Executor.spawnLocal (e : Executor α cap) (i : Nat) (x : Sendable α) : BaseIO Unit :=
-  e.spawnLocalRaw i x.of
+  e.spawnLocalRaw i x.val
 
 /-- **Push a step into worker `i`'s ring, across a carrier boundary** — the FIFO lane, the counterpart of the
 slot lane above. -/
 def Executor.submitLocal (e : Executor α cap) (i : Nat) (x : Sendable α) : BaseIO Unit :=
-  e.submitLocalRaw i x.of
+  e.submitLocalRaw i x.val
 
 /-- **A worker's own route.** The step is re-scheduled on the worker that just ran it, so a chain stays on
 the core its parent ran on — `docs/interface.md` §3's rule at P carriers. It is where a step becomes a

@@ -1,8 +1,8 @@
 module
 
-import Std
-import LeanIn.Task.Basic
-import LeanIn.Task.Error
+public import Std
+public import LeanIn.Task.Basic
+public import LeanIn.Task.Error
 
 
 public import Std.Net.Addr
@@ -119,7 +119,7 @@ completion's bytes are still that connection's, before the next read on it can s
 
 /-- Which operation parked on the loop. Used to match an event to the operation that asked for it: one
 connection's read completion must never resolve that connection's write. -/
-private inductive Op where
+inductive Op where
   | accept
   | read
   | write
@@ -182,9 +182,6 @@ structure Conn where
   parked: a retired listener's connection is a caller's error, and a hang would report it as a wait. -/
   private loop : Std.Mutex Table
 
-/-- The running loop's connection table, if a listener is bound: `startListener` replaces it, and `Io.stop`
-retires it. The table is what operations park on and what `dispatch` resolves; it is *not* the loop's driver. -/
-private initialize loopRef : IO.Ref (Option (Std.Mutex Table)) ← IO.mkRef none
 
 /-- The pump thread, when one is driving the loop. A single-carrier driver (`Runtime.run`) drives the loop
 itself and starts none; the multi-carrier and virtual-clock entries (`Io.ensurePump`) start one, because their
@@ -233,6 +230,10 @@ private def flagGet (r : Std.Mutex Bool) : IO Bool := r.atomically do pure (← 
 private def flagSet (r : Std.Mutex Bool) (b : Bool) : IO Unit := r.atomically do set b
 
 namespace Io
+
+/-- The running loop's connection table, if a listener is bound: `startListener` replaces it, and `Io.stop`
+retires it. The table is what operations park on and what `dispatch` resolves; it is *not* the loop's driver. -/
+private initialize loopRef : IO.Ref (Option (Std.Mutex Table)) ← IO.mkRef none
 
 /-- The signed reading of an event argument. libuv reports a failure as the negated error code; the shim carries
 the argument as a `UInt32` (an immediate scalar, where a boxed `UInt64` allocated one object per field), so the
@@ -635,7 +636,7 @@ def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO U
 /-- **Stop the running loop**: fail everything parked, drop the queued and wheeled timers, ask the shim to stop,
 and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
 (and has finished) or nothing did, the stop-drain is run here, because no other thread will. -/
-@[expose] def stop : IO Unit := do
+def stop : IO Unit := do
   match ← loopRef.get with
   | none => pure ()
   | some table => do
@@ -932,4 +933,6 @@ def close (c : Conn) : IO Unit := do
   if (← npUvClose c.idx) == 0 then
     throw (IO.userError "Io.close: the shim refused to close the connection")
 
+end Io
+end LeanIn.Runtime
 end
