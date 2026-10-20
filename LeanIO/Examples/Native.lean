@@ -173,6 +173,32 @@ def sumBodyDemo : LeanIO.Backend.LeanIn.NativeRoute :=
     | .inl j => (Std.Http.Status.ok, s!"json:{j.body.title}\n")
     | .inr t => (Std.Http.Status.ok, s!"text:{t.body}\n")
 
+initialize cleanupCount : IO.Ref Nat ← IO.mkRef 0
+initialize childCount : IO.Ref Nat ← IO.mkRef 0
+
+/-- A route that registers an exit cleanup and responds immediately. -/
+def cleanupDemo : Handler :=
+  fun req w => do
+    let env : LeanIO.Backend.LeanIn.Env := { req, writer := w }
+    LeanIO.Backend.LeanIn.AppM.onExit
+      (fun _ => LeanIO.Backend.LeanIn.liftBase (cleanupCount.modify (· + 1))) env
+    LeanIO.Backend.LeanIn.respond w 200 "OK" "scheduled\n".toUTF8
+
+/-- A route that starts a request-owned child and responds without waiting. -/
+def childDemo : Handler :=
+  fun req w => do
+    let env : LeanIO.Backend.LeanIn.Env := { req, writer := w }
+    LeanIO.Backend.LeanIn.AppM.spawn
+      (fun _ => LeanIO.Backend.LeanIn.liftBase (childCount.modify (· + 1))) env
+    LeanIO.Backend.LeanIn.respond w 200 "OK" "spawned\n".toUTF8
+
+/-- The cleanup/child counters, for the fixture. -/
+def countersDemo : Handler :=
+  fun _ w => do
+    let c ← LeanIO.Backend.LeanIn.liftBase cleanupCount.get
+    let k ← LeanIO.Backend.LeanIn.liftBase childCount.get
+    LeanIO.Backend.LeanIn.respond w 200 "OK" s!"cleanup={c} child={k}\n".toUTF8
+
 /-- The stock-shaped request line: middleware and handlers may read `req.line.*`. -/
 def lineDemo : Handler :=
   fun req w =>
@@ -256,6 +282,9 @@ def routes (clock : LeanIn.Runtime.Clock) : LeanIO.Backend.LeanIn.NativeRouter :
     |>.add dropinJson
     |>.add methodDemo
     |>.route .get "/line" lineDemo
+    |>.route .get "/cleanup" cleanupDemo
+    |>.route .get "/child" childDemo
+    |>.route .get "/counters" countersDemo
     |>.add sumBodyDemo
     |>.route .get "/ext" extensionDemo
     |>.routeWith .get "/auth" secureDemo #[LeanIO.Backend.LeanIn.Middlewares.auth authDemo]

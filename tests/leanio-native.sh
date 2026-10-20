@@ -148,6 +148,30 @@ check("sum json", st.endswith("200 OK") and body == b"json:sumjson\n", f"{st} {b
 st, _, body = post("/sum", "text/plain", b"sumtext")
 check("sum text", st.endswith("200 OK") and body == b"text:sumtext\n", f"{st} {body!r}")
 
+# Request scope: cleanup runs once after the response; a spawned child runs.
+st, _, body = get("/cleanup")
+check("cleanup route", st.endswith("200 OK") and body == b"scheduled\n", f"{st} {body!r}")
+cleanup_seen = False
+for _ in range(50):
+    st, _, body = get("/counters")
+    if b"cleanup=1" in body:
+        cleanup_seen = True
+        break
+    time.sleep(0.02)
+check("cleanup ran once", cleanup_seen, f"{st} {body!r}")
+st2, _, body2 = get("/counters")
+check("cleanup not repeated", b"cleanup=1" in body2, f"{st2} {body2!r}")
+st, _, body = get("/child")
+check("child route", st.endswith("200 OK") and body == b"spawned\n", f"{st} {body!r}")
+child_seen = False
+for _ in range(50):
+    st, _, body = get("/counters")
+    if b"child=1" in body:
+        child_seen = True
+        break
+    time.sleep(0.02)
+check("child ran", child_seen, f"{st} {body!r}")
+
 # Stock-shaped request line.
 st, _, body = request(b"GET /line HTTP/1.1\r\nHost: example.test\r\n\r\n")
 check("request line view", st.endswith("200 OK") and body == b"GET /line host=example.test\n", f"{st} {body!r}")

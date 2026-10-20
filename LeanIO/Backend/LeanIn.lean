@@ -44,6 +44,16 @@ open Std.Http
 /-- The driver's handler: the streaming session shape. -/
 abbrev CoreHandler := LeanIn.Examples.Http.Server.StreamHandler
 
+/-- A request's cancellation/cleanup scope. Children share it; the scope owner sets `cancelled` on exit and
+runs `cleanups` exactly once, after the handler's outcome is fixed. -/
+structure Scope where
+  cancelled : IO.Ref Bool
+  cleanups : IO.Ref (Array (LeanIn.Runtime.VM Unit))
+
+/-- Lift a `BaseIO` action (reference operations and the like) into the VM. -/
+def liftBase {α : Type} (act : BaseIO α) : LeanIn.Runtime.VM α :=
+  monadLift (BaseIO.toIO act)
+
 /-- A request as the native backend sees it. `body` is the streaming reader; an extractor that needs the
 whole body reads it, and a route that streams consumes it incrementally. `params` are the trie's captures for
 a parameterised route, in the order the pattern names them. -/
@@ -54,6 +64,8 @@ structure Request where
   /-- Request extensions, as in LeanIO's `Request`: middleware can insert typed values and a handler can read
   them back with `Extensions.get`. -/
   extensions : Std.Http.Extensions := .empty
+  /-- The request scope, when dispatched through the backend. -/
+  scope : Option Scope := none
 
 /-- A native handler: the request and the response writer, so a response need not be accumulated. -/
 abbrev Handler := Request → LeanIn.Examples.Http.Server.ResponseWriter → LeanIn.Runtime.VM Unit
@@ -396,6 +408,27 @@ def writer : AppM LeanIn.Examples.Http.Server.ResponseWriter := fun env => pure 
 /-- The request body reader, for a route that streams the request. -/
 def bodyReader : AppM LeanIn.Examples.Http.Server.BodyReader := fun env => pure env.req.body
 
+/-- Abort if the request scope has been cancelled. Cooperative, like `ContextAsync.checkCancelled`: a
+computation that never checks continues until it finishes. -/
+def checkCancelled : AppM Unit := fun env =>
+  match env.req.scope with
+  | none => pure ()
+  | some scope => do
+    if (← liftBase scope.cancelled.get) then
+      .abortE (IO.userError "request cancelled")
+    else pure ()
+
+/-- Register a cleanup to run once when the request exits, after children have been asked to stop. -/
+def onExit (cleanup : AppM Unit) : AppM Unit := fun env => do
+  match env.req.scope with
+  | none => pure ()
+  | some scope => liftBase (scope.cleanups.modify (·.push (cleanup env)))
+
+/-- Start a request-owned child on the same carrier. The child shares the scope's cancellation flag; it stops
+when it next calls `checkCancelled`. -/
+def spawn (child : AppM Unit) : AppM Unit := fun env => do
+  monadLift (LeanIn.Runtime.VM.runAsync (child env) (fun _ => pure ()) : IO Unit)
+
 end AppM
 
 /-- A request-body extraction in the native application monad. The failure is the status and message to answer
@@ -651,6 +684,23 @@ def discardBody (w : LeanIn.Examples.Http.Server.ResponseWriter) :
   status := w.status
   code := w.code }
 
+/-- Run one handler with a fresh request scope: children are asked to stop, cleanups run exactly once, and
+the handler's outcome is re-raised (an abort stays an abort). -/
+def runScoped (handler : Handler) (req : Request) (w : LeanIn.Examples.Http.Server.ResponseWriter) : LeanIn.Runtime.VM Unit := do
+  let cancelled ← (monadLift (IO.mkRef (false : Bool) : IO (IO.Ref Bool)) : LeanIn.Runtime.VM _)
+  let cleanups ← (monadLift (IO.mkRef (#[] : Array (LeanIn.Runtime.VM Unit)) :
+    IO (IO.Ref (Array (LeanIn.Runtime.VM Unit)))) : LeanIn.Runtime.VM _)
+  let req := { req with scope := some { cancelled, cleanups } }
+  let outcome ← LeanIn.Runtime.VM.requestScope (handler req w)
+  liftBase (cancelled.set true)
+  let cs ← liftBase cleanups.get
+  for c in cs.reverse do
+    c
+  match outcome with
+  | .ok _ => pure ()
+  | .error e => throw e
+  | .aborted reason => .abortE reason
+
 /-- Dispatch a parsed head and streaming body through the trie.
 
 An unknown method token is refused with 501 rather than dispatched. A path known under other methods answers 405
@@ -661,20 +711,20 @@ def dispatch (trie : RouteTrie Handler) : CoreHandler := fun head body w =>
   | none => respond w 501 "Not Implemented" "method not supported\n".toUTF8
   | some m =>
     match trie.lookup m (pathSegments head) with
-    | .found params handler => handler { head, body, params } w
+    | .found params handler => runScoped handler { head, body, params } w
     | .methodMismatch allowed =>
       -- LeanIO serves HEAD from the GET handler and drops the body; the response declares
       -- `Content-Length: 0` rather than the length the body would have had, because declaring a length it
       -- will not send would strand the client. This matches the upstream trie's documented behaviour.
       if m == .head && allowed.contains .get then
         match trie.lookup .get (pathSegments head) with
-        | .found params handler => handler { head, body, params } (discardBody w)
+        | .found params handler => runScoped handler { head, body, params } (discardBody w)
         | _ => respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
       else
         respond w 405 "Method Not Allowed" "".toUTF8 #[("Allow", RouteTrie.allowValue allowed)]
     | .noMatch =>
       match trie.notFound with
-      | some handler => handler { head, body } w
+      | some handler => runScoped handler { head, body } w
       | none => respond w 404 "Not Found" "not found\n".toUTF8
 
 /-- Serve `handler` on `port` with the given hooks (so an application can build handlers against the same live
