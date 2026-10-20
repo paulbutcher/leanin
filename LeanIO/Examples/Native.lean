@@ -19,16 +19,17 @@ open LeanIO.Router
 open LeanIO.Backend
 
 abbrev Handler := LeanIO.Backend.LeanIn.Handler
+abbrev Middleware := LeanIO.Backend.LeanIn.Middleware
 
 namespace LeanIO.Examples.Native
 
 open LeanIn.Examples.Http
 
 def ping : Handler :=
-  fun _ _body => pure (LeanIO.Backend.LeanIn.response 200 "OK" "pong\n".toUTF8)
+  fun _ => pure (LeanIO.Backend.LeanIn.response 200 "OK" "pong\n".toUTF8)
 
 def slow (clock : LeanIn.Runtime.Clock) : Handler :=
-  fun _ _body => do
+  fun _ => do
     let _ ← LeanIn.Runtime.VM.sleep clock 200
     pure (LeanIO.Backend.LeanIn.response 200 "OK" "slept\n".toUTF8)
 
@@ -46,22 +47,34 @@ def reasonFor : Nat → String
 
 /-- JSON extraction: 415 for the wrong media type, 400 for malformed JSON, 422 when it does not fit. -/
 def postTodo : Handler :=
-  fun head body =>
-    match (LeanIO.Backend.LeanIn.jsonBody Todo { head, body } : Except (Nat × String) Todo) with
+  fun req =>
+    match (LeanIO.Backend.LeanIn.jsonBody Todo req : Except (Nat × String) Todo) with
     | .ok todo => pure (LeanIO.Backend.LeanIn.response 200 "OK" (Lean.toJson todo).compress.toUTF8)
     | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
 
 /-- Plain-text extraction with the same media-type contract. -/
 def postText : Handler :=
-  fun head body =>
-    match LeanIO.Backend.LeanIn.textBody { head, body } with
+  fun req =>
+    match LeanIO.Backend.LeanIn.textBody req with
     | .ok text => pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"text: {text}\n".toUTF8)
     | .error (status, msg) => pure (LeanIO.Backend.LeanIn.response status (reasonFor status) msg.toUTF8)
 
+/-- Path parameters captured by the trie (`/user/{id}`), plus a query parameter. -/
+def userById : Handler :=
+  fun req =>
+    let id := (req.pathParam? "id").getD ""
+    pure (LeanIO.Backend.LeanIn.response 200 "OK" s!"id={id}\n".toUTF8)
+
+/-- Middleware demonstration: adds a header to every response it wraps. -/
+def tag (value : String) : LeanIO.Backend.LeanIn.Middleware :=
+  fun handler req => do
+    let (head, body) ← handler req
+    pure ({ head with headers := head.headers.push ("X-Tag", value) }, body)
+
 /-- Form extraction: LeanIO's query parser and `FromForm` over the buffered body. -/
 def postForm : Handler :=
-  fun head body =>
-    match (LeanIO.Backend.LeanIn.formBody (Std.HashMap String String) { head, body }
+  fun req =>
+    match (LeanIO.Backend.LeanIn.formBody (Std.HashMap String String) req
             : Except (Nat × String) (Std.HashMap String String)) with
     | .ok m =>
       let user := (m.get? "user").getD ""
@@ -70,7 +83,7 @@ def postForm : Handler :=
 
 /-- Echo the buffered request body, at whatever length the body delivered. -/
 def echo : Handler :=
-  fun _ body => pure (LeanIO.Backend.LeanIn.response 200 "OK" body)
+  fun req => pure (LeanIO.Backend.LeanIn.response 200 "OK" req.body)
 
 def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
   (RouteTrie.empty : RouteTrie Handler)
@@ -80,6 +93,7 @@ def routes (clock : LeanIn.Runtime.Clock) : RouteTrie Handler :=
     |>.addRoute .post [Segment.lit "todos"] postTodo
     |>.addRoute .post [Segment.lit "text"] postText
     |>.addRoute .post [Segment.lit "form"] postForm
+    |>.addRoute .get [Segment.lit "user", Segment.param "id"] (tag "users" userById)
 
 end LeanIO.Examples.Native
 
