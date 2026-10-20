@@ -848,7 +848,8 @@ blocking poll.
 completions cost six box objects. Both sides now carry `Array UInt32` — `lean_box_uint32` is an immediate — with
 the sign of a libuv status decoded explicitly from two's complement (`signed`) rather than from a 64-bit
 encoding. Paired, nine rounds per level: **1.028 at C=1 (IQR 1.010–1.032), 1.005 at C=8, 1.009 at C=32**.
-SC19/20/23/24/27 and BT1–3 pass, covering EOF and negative-status paths.
+SC19/20/23/24/27 and BT1–3 pass, covering EOF and negative-status paths. Measured on `5b74698`; the change
+landed as `c24f381`.
 
 **Candidate 2 was then tested both ways, and both were rejected.** *Owner-gated direct writes*: the write path
 was re-gated on an explicit loop-owner claim (taken in `takeover`, released when the driver finishes) instead of
@@ -959,7 +960,7 @@ the empty poll but collapsed the server to ~1.5 k req/s: the wake is load-bearin
 table's earliest deadline (one lock and no per-iteration traversal) measured 0.990 against the current build — the
 2.3 % that removing the scan calls had shown did not come from the traversal. Neither is in the tree.
 
-**Load shapes** (`bench/screen.sh`: d1 = keep-alive depth 1, p16 = 16 requests in flight per connection,
+**Load shapes** — measured on `41943fa` with `bench/screen.sh` (`bench/screen.sh`: d1 = keep-alive depth 1, p16 = 16 requests in flight per connection,
 churn = one connection per request), one server per arm, 5 s per point, load 2.5 rising to 6.6 through the run.
 Requests per second:
 

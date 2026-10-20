@@ -142,3 +142,21 @@
   `toList` falls back to `default`. Carry it with one `variable`, as
   `Sched/Pool.lean` and `Sched/Executor.lean` do; adding it per
   declaration produces a page of cascading synthesis failures.
+
+## Performance records
+
+- Every performance number in `docs/PERFORMANCE.md` or the README states the
+  commit it was measured on, in the text next to the number (for example
+  "measured on `41943fa`"). A number without a commit is not a record.
+- Each run entry names, at minimum: the commit, the date, the command that
+  produced it (`bench/paired.sh`, `bench/threeway.sh`, `bench/screen.sh`, a
+  callgrind invocation with its request count), the levels and load shapes,
+  the host load average, the observed results, and the keep/reject/inconclusive
+  decision for any change the run evaluates.
+- Corrections do not erase the old number: record it as withdrawn, with the
+  commit that supersedes it and why (a counter, a control, a rerun).
+- A comparison that supports a claim is paired and interleaved in one
+  invocation, as `bench/paired.sh` does; a single reading may illustrate a
+  shape but not support a ratio.
+- The README carries the short table and cites the commit its numbers came
+  from; method, ranges and rejected attempts stay in `docs/PERFORMANCE.md`.

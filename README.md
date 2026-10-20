@@ -28,8 +28,8 @@ The concurrency engine is quite general but we have demonstrated it with an HTTP
 
 `C` is the number of concurrent connections; values are requests per second. Shapes: **depth 1** keeps one
 request in flight per connection, **pipe 16** keeps sixteen in flight, **churn** opens one connection per
-request. One invocation of `bench/screen.sh`; readings vary with host state. Method and ranges:
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+request. Measured on commit `41943fa` with one invocation of `bench/screen.sh` (the script landed in `7f27a27`);
+readings vary with host state. Method and ranges: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Development Status
 
