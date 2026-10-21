@@ -50,6 +50,11 @@
   change a *field*: it addresses records by field, so reordering
   lines changes nothing and must be accepted, and a mutation that
   changes nothing is reported rather than counted as a pass.
+- Lifecycle deadlines have their own focused checks: `nix develop -c bash
+  tests/stop-deadline.sh` (a scoped 60 s `VM.sleep` aborts at a 100 ms stop deadline) and
+  `nix develop -c bash tests/drain-deadline.sh` (a client's handler is parked in a 60 s
+  sleep; the accept loop's 100 ms drain deadline cancels it and the loop returns). Both
+  assert elapsed time, so a hang fails rather than passing.
 - Put externally observable executor scenarios in
   `tests/*contract.md` and their executable checks in the
   adjacent shell fixture. Run an individual check with

@@ -656,13 +656,14 @@ def liveScheduleCancel (deadline : Nat) (cancel : Task.Cancel) (fire onCancel : 
 def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit :=
   liveScheduleCancel deadline cancel fire (pure ())
 
-/-- **Stop the running loop**: fail everything parked, retire the queued and wheeled timers (running each
-cancellation continuation), ask the shim to stop, and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
-(and has finished) or nothing did, the stop-drain is run here, because no other thread will. -/
-def stop : IO Unit := do
-  -- A timer retired by a stop will never fire. Run its cancellation continuation so a sleeper
-  -- parked on it is aborted rather than left for a deadline that cannot arrive. This holds even
-  -- when no listener bound a loop table: timers are queued independently of one.
+/-- **Abort everything waiting, without stopping the loop**: fail parked operations, retire queued and
+wheeled timers (running each cancellation continuation), and mark the table stopped so accepts fail.
+The loop stays usable for the cleanup that follows, which is what a deadline needs: a body's close is an
+ordinary submission and must not be refused. -/
+def abortAll : IO Unit := do
+  -- A timer retired here will never fire. Run its cancellation continuation so a sleeper parked
+  -- on it is aborted rather than left for a deadline that cannot arrive. This holds even when no
+  -- listener bound a loop table: timers are queued independently of one.
   let pending ← timerPending.atomically do
     let ts ← get; set (#[] : Array WheelTimer); return ts
   let wheeled ← wheelRef.atomically do
@@ -671,7 +672,7 @@ def stop : IO Unit := do
     t.onCancel
   match ← loopRef.get with
   | none => pure ()
-  | some table => do
+  | some table =>
       let parked ← table.atomically do
         let t ← get
         let ps := t.parked
@@ -679,7 +680,16 @@ def stop : IO Unit := do
         return ps
       for p in parked do
         Task.Join.resolveFirst p.cell p.push
-          (.error (.userError "Io: the libuv loop was stopped while an operation was parked"))
+          (.error (.userError "Io: the loop aborted an operation that was parked"))
+
+/-- **Stop the running loop**: abort parked work and timers (`abortAll`), ask the shim to stop,
+and drain the loop. The abort is separate so a deadline can settle waiters while the loop is still
+usable by the cleanup that follows: a connection body's close is an ordinary submission. -/
+def stop : IO Unit := do
+  abortAll
+  match ← loopRef.get with
+  | none => pure ()
+  | some _table => do
       npUvStop
       npUvWheelWake
       -- An active single-carrier driver owns the loop and will drain it; the stopper must not

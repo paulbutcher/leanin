@@ -5,19 +5,19 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 
 ## P0 — lifecycle correctness
 
-- [ ] **Deadline abort on drain.** `serveUntilStopped` stops admission and drains in-flight work, but
-  waits indefinitely. Add a grace deadline that cancels what remains and then waits for every
-  connection task to settle.
-  - Needs: a live-connection registry with close/cancel handles; request-scope cancellation; a
-    drain-completion cell and a select against a grace timer.
-  - Evidence today: `Runtime.Net.serveUntilStopped`; LeanIO's `ServerHandle.stop` only drains.
-- [ ] **Cancellable parked timers.** `VM.sleep` schedules a clock continuation; setting
-  `Task.Cancel` disarms the fire but leaves the sleeper parked, and `Io.stop` clears the wheel
-  without resolving waiters.
-  - Needs: an `onCancel` continuation on wheel entries, and an ambient cancellation scope that
-    `sleepE` registers with.
-  - Acceptance: a parked 60 s sleep is aborted within a 200 ms deadline; `onExit` runs once; the
-    loop returns.
+- [x] **Deadline abort on drain.** `serveUntilStoppedWithDeadline` arms a grace timer when the
+  executor starts stopping, cancels the handles the registry still holds, aborts parked operations
+  and timers, and then awaits the registry, so a handler parked in a long sleep cannot hold shutdown.
+  A drain that finishes first disarms the timer.
+  - Evidence: `Runtime.Net.serveUntilStoppedWithDeadline`, `Runtime.stopWithDeadline`,
+    `bash tests/drain-deadline.sh` (one client, 60 s handler sleep, 100 ms grace, returns in
+    ~101 ms) and `bash tests/stop-deadline.sh` (scope reports `aborted` in ~151 ms).
+- [ ] **Cancellable parked timers.** Wheel entries now carry an `onCancel`, `VM.sleep` supplies an
+  abort continuation, and `Io.abortAll`/`Io.stop` run it so a parked sleeper is aborted rather than
+  dropped. Deadline cancellation of the whole loop is exercised by `tests/stop-deadline.sh`.
+  - Remaining: an ambient per-request cancellation scope that `sleepE` registers with, so a
+    user-triggered cancel (not a loop stop) aborts the sleeper; `onExit` does not exist yet and
+    exactly-once cleanup is untested.
 - [ ] **Request/handler scope.** User-triggered cancellation, child cancellation, and exactly-once
   cleanup on scope exit. Transport abort exists; the general scope does not.
   - Depends on the timer cancellation above for parked handlers.

@@ -143,8 +143,10 @@ private def Conn.serve (body : Conn → Task.EAsync IO.Error Unit) (c : Conn) : 
     catch e => pure (some e)
   monadLift (Io.close c)
   match bodyFailed? with
-  | none   => pure ()
-  | some e => throw e
+  | none   =>
+      pure ()
+  | some e =>
+      throw e
 
 /-- **An accept loop of our own.** It accepts `n` connections — one task each, through `background`, which
 against `MonadAsync` is the local route, so a connection stays on the carrier its accept ran on — and then
@@ -170,20 +172,23 @@ handle registered in a `Registry`, until `Executor.isStopping` — then `Registr
 registered, so the stop is a drain *operation* rather than a `List.forM` in the loop. -/
 private partial def serveUntilStoppedLoop (hooks : Hooks) (e : Sched.Executor Task.Item cap) (l : Listener)
     (clock : Clock) (interval : Std.Time.Millisecond.Offset) (body : Conn → Task.EAsync IO.Error Unit)
+    (beginStop : Task.Registry (Except IO.Error Unit) → IO (IO Unit))
     (reg : Task.Registry (Except IO.Error Unit)) : Task.EAsync IO.Error Unit := do
   if ← monadLift (e.isStopping : IO Bool) then
+    let disarm ← monadLift (beginStop reg)
     Task.EAsync.ofAsync (do
-      Task.Registry.drain reg)
+      Task.Registry.drain reg
+      disarm)
   else
     match ← monadLift (Listener.tryAccept l : IO (Option Conn)) with
     | some client =>
       let h ← Task.MonadAsync.spawn (Conn.serve body client)
       monadLift (Task.Registry.add reg h)
-      serveUntilStoppedLoop hooks e l clock interval body reg
+      serveUntilStoppedLoop hooks e l clock interval body beginStop reg
     | none =>
       Task.EAsync.ofAsync (do
         sleep clock interval)
-      serveUntilStoppedLoop hooks e l clock interval body reg
+      serveUntilStoppedLoop hooks e l clock interval body beginStop reg
 
 /-- **Accept until the executor is stopping, then finish what is in flight and return.**
 
@@ -214,7 +219,32 @@ def serveUntilStopped (hooks : Hooks) (e : Sched.Executor Task.Item cap) (l : Li
   let reg : Task.Registry (Except IO.Error Unit) ← monadLift (Task.Registry.new (α := Except IO.Error Unit))
   monadLift (hs.forM (fun h => Task.Registry.add reg h))
   let clock := Clock.live hooks
-  serveUntilStoppedLoop hooks e l clock interval body reg
+  let noDeadline : Task.Registry (Except IO.Error Unit) → IO (IO Unit) := fun _ => pure (pure ())
+  serveUntilStoppedLoop hooks e l clock interval body noDeadline reg
+
+/-- **`serveUntilStopped` with a grace deadline.** Once the executor is stopping, the loop arms a
+one-shot timer for `grace`: if the drain of in-flight connections has not returned by then, `Io.stop`
+retires the loop, which fails parked operations and aborts parked timers, so a handler that would sleep
+forever cannot hold shutdown. The timer is disarmed when the drain returns first, so a completed drain
+is not followed by an unrelated loop stop. -/
+def serveUntilStoppedWithDeadline (hooks : Hooks) (e : Sched.Executor Task.Item cap) (l : Listener)
+    (interval : Std.Time.Millisecond.Offset) (grace : Std.Time.Millisecond.Offset)
+    (body : Conn → Task.EAsync IO.Error Unit)
+    (hs : List (Task.Task (Except IO.Error Unit))) : Task.EAsync IO.Error Unit := do
+  let reg : Task.Registry (Except IO.Error Unit) ← monadLift (Task.Registry.new (α := Except IO.Error Unit))
+  monadLift (hs.forM (fun h => Task.Registry.add reg h))
+  let clock := Clock.live hooks
+  let beginStop (reg : Task.Registry (Except IO.Error Unit)) : IO (IO Unit) := do
+    let cancel ← Task.Cancel.new
+    let atDeadline : IO Unit := do
+      let hs ← reg.state.atomically (do return (← get))
+      for h in hs do
+        LeanIn.Task.Task.cancel h (fun it => e.pushInjectRaw it)
+          (.error (.userError "the drain deadline expired"))
+      Io.abortAll
+    clock.schedule grace cancel atDeadline
+    return (Task.Cancel.set cancel : IO Unit)
+  serveUntilStoppedLoop hooks e l clock interval body beginStop reg
 
 /-- **An accept loop that waits on the listener instead of polling it.** `Listener.accept` parks until a
 connection arrives, so this loop neither sleeps between attempts nor delays an accept by a poll interval: where
