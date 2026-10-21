@@ -58,6 +58,14 @@ namespace Handler
 def ofPure (h : H1.Head → H1.ResponseHead × ByteArray) : Handler := fun head _ => pure (h head)
 end Handler
 
+/-- Who answers `Expect: 100-continue`. `automatic` is the safe default for handlers that cannot write an
+interim response (the buffered handler); `application` turns the machine's own answer off so a stream handler
+decides through `ResponseWriter.sendContinue`. -/
+inductive ContinuePolicy where
+  | automatic
+  | application
+deriving Inhabited, Repr, BEq
+
 /-- **The driver's own configuration**: the protocol's limits, the clock the read deadline is read from, and the
 deadline itself. `h1` is handed to the machine unchanged and is the only thing that reaches it, so no clock
 value can enter the encoder. -/
@@ -68,10 +76,19 @@ structure Config where
   clock        : Clock
   /-- The longest a single read may wait for bytes or EOF. -/
   stallTimeout : Std.Time.Millisecond.Offset := 12000
+  /-- The single continue policy; it overrides `h1.autoContinue` so the two cannot disagree. -/
+  continuePolicy : ContinuePolicy := .automatic
   /-- Called once per streamed request with its head and a fresh cancellation scope. A server may retain the
   scope and cancel the request (for a shutdown deadline or an application decision); the request's timers are
   retired and its cleanup runs exactly once. -/
   onScope      : H1.Head → Runtime.Scope → IO Unit := fun _ _ => pure ()
+
+/-- The protocol limits this server actually uses. The continue decision is the explicit policy's, not a
+second field in `h1`; the nested `autoContinue` is kept for users of the pure machine. -/
+def Config.limits (cfg : Config) : H1.Limits :=
+  match cfg.continuePolicy with
+  | .automatic   => cfg.h1
+  | .application => { cfg.h1 with autoContinue := false }
 
 /-- Whether a step got anywhere: it wrote bytes, or handled an event other than `needMoreData`, which the
 machine re-emits on every starved step. The loop reads only when this is false, so no iteration can return to
@@ -691,7 +708,7 @@ async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Stream
 
 /-- Serve a streaming handler on one connection. -/
 def serveConnStream (cfg : Config) (c : Conn) (handler : StreamHandler) : Task.EAsync IO.Error Unit :=
-  driveStream c cfg handler ({ limits := cfg.h1, buffered := false } : H1.Machine)
+  driveStream c cfg handler ({ limits := cfg.limits, buffered := false } : H1.Machine)
 
 /-- **Serve one connection**: run the compiled loop from a fresh machine built from `cfg.h1` alone. The
 connection outlives a single exchange -- it ends when the machine halts, or when the peer closes or stalls past
@@ -701,7 +718,7 @@ suspension. One `Join` cell per connection -- never one per request. The cell ca
 **outcome**: a clean close is `.ok`, a transport failure is the error, so a reset is never reported as a
 success -- the shape the accept loops' registries and drains already account by. -/
 def serveConn (cfg : Config) (c : Conn) (handler : Handler) : Task.EAsync IO.Error Unit :=
-  drive c cfg handler ({ limits := cfg.h1 } : H1.Machine)
+  drive c cfg handler ({ limits := cfg.limits } : H1.Machine)
 
 end LeanIn.Http.Server
 end

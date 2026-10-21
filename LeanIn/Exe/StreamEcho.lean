@@ -28,7 +28,12 @@ partial def echoBody (body : Server.BodyReader) (w : Server.ResponseWriter) : Ru
 /-- `POST` streams; everything else answers one chunk. `/slow` parks in a sleep that the configured
 scope cancellation aborts after 50 ms, so the connection ends with no response. -/
 def handler (clock : Runtime.Clock) : Server.StreamHandler := fun head body w => do
-  if head.targetString? == some "/hints" then
+  if H1.expectsContinue head then
+    w.sendContinue
+    w.start { status := 200, reason := "OK" }
+    w.write "continued\n".toUTF8
+    w.finish
+  else if head.targetString? == some "/hints" then
     w.interim { status := 103, reason := "Early Hints" }
     w.start { status := 200, reason := "OK" }
     w.write "hinted\n".toUTF8
@@ -64,6 +69,7 @@ def main (args : List String) : IO UInt32 := do
       -- The streaming echo is the case for bodies past the buffered default; the test also checks
       -- that this configured ceiling is enforced with a 413.
       h1 := { maxBody := 4 * 1024 * 1024 }
+      continuePolicy := .application
       onScope := fun head scope => do
         if head.targetString? == some "/slow" then
           let _ ← IO.asTask (do

@@ -125,6 +125,17 @@ head, rest = recv_head(s)
 check("413 over limit", "413" in head and "Payload Too Large" in head, f"{head!r}")
 s.close()
 
+# With the continue policy delegated to the application, the handler's 100 arrives before its final head.
+s = connect()
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+h100, rest = recv_head(s)
+buf = rest
+while b"\r\n\r\n" not in buf:
+    buf += s.recv(4096)
+check("handler 100 Continue", "100 Continue" in h100 and b"200 OK" in buf,
+      f"{h100!r} {buf!r}")
+s.close()
+
 # A 103 interim response is written before the final head.
 s = connect()
 s.sendall(b"GET /hints HTTP/1.1\r\nHost: x\r\n\r\n")

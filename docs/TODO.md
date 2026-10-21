@@ -38,9 +38,11 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [ ] **Decoded path/query at the H1 boundary.** `H1.Head` exposes `targetString`; consumers
   re-parse and percent-decode with `Std.Http.RequestTarget.parse?` per request. Add slice-based
   decoded path/query views, and use them from routing to remove the per-request parse.
-- [ ] **One continue policy.** `Limits.autoContinue` defaults true and is independent of a
-  handler's `onContinue`; a router's decision is ignored unless the config also turns
-  `autoContinue` off. Make the policy single and explicit, with a safe default.
+- [x] **One continue policy.** `Config.continuePolicy` is the single switch: `automatic` keeps the
+  machine's safe default, while `application` clears `autoContinue` so a stream handler must call
+  `sendContinue`. `Config.limits` derives the machine's view, so the two cannot disagree.
+  - Evidence: `tests/http-stream.sh` sends `Expect: 100-continue` and reads the handler's `100`
+    before its `200`.
 - [x] **General interim responses.** `ResponseWriter.interim` writes any 1xx head before `start`
   (HTTP/1.1 only; a non-1xx status raises), and `sendContinue` remains the 100 case.
   - Evidence: `tests/http-stream.sh` reads `103 Early Hints` before the final `200` from the
