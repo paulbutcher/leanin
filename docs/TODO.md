@@ -49,8 +49,13 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   (HTTP/1.1 only; a non-1xx status raises), and `sendContinue` remains the 100 case.
   - Evidence: `tests/http-stream.sh` reads `103 Early Hints` before the final `200` from the
     `/hints` route.
-- [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier; wire a
-  multi-carrier accept/connection path and state the affinity rules.
+- [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier. Attempted wiring:
+  a caller-driven multi-carrier entry with shared dispatch, plus a pump-thread variant. The caller
+  variant's shared-task test passed, but the HTTP entry stalled intermittently (about 5 of 20
+  single-request runs) at a connection after accept; the pump variant cannot drive a listener the
+  caller bound, because the shim's loop is thread-affine. Needs a loop-driver wake or a listener
+  created on the pump thread before it is wired into `server`. The affinity rule to preserve: a
+  connection stays on the carrier that took its first step.
 - [x] **Correct the H1 documentation.** The module doc now states the implemented framing,
   continue handling and limits.
 
