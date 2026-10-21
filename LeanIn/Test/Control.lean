@@ -1437,17 +1437,10 @@ def runtimeMachineTime : IO UInt32 := do
   -- The reusable wake composition: arming from the loop's thread also nudges the parked driver through the
   -- inject (see `HarnessClock.clockWithWake`'s own note).
   let clock1 := Runtime.HarnessClock.clockWithWake hc1 push1
-  let cell1 ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
   let server1 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids1.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
     let c ← Runtime.Listener.accept l1 hooks1
-    monadLift (amDelayed.run c clock1 d (fun r => Task.Join.resolve cell1 push1 r))
-    let cancel ← monadLift (Task.Cancel.new : IO Task.Cancel)
-    let r ← LeanIn.Task.EAsync.ofAsync
-      (LeanIn.Task.Async.await (show LeanIn.Task.Task (Except IO.Error Unit) from ⟨cell1, cancel⟩))
-    match r with
-    | .error e => throw e
-    | .ok _ => pure ()
+    amDelayed c clock1 d
   let server1T ← IO.asTask (Runtime.runVirtual hc1 e1 server1) _root_.Task.Priority.dedicated
   let dlClient ←
     try
@@ -1498,18 +1491,11 @@ def runtimeMachineTime : IO UInt32 := do
   for _ in List.range 3 do e2.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore2, _) ← e2.observe
   let hc2 ← Runtime.HarnessClock.new
-  let cell2 ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
   let push2 := Runtime.sharedPush e2
   let server2 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids2.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
     let c ← Runtime.Listener.accept l2 hooks2
-    monadLift (amStall.run c (Runtime.HarnessClock.clockWithWake hc2 push2) d (fun r => Task.Join.resolve cell2 push2 r))
-    let cancel ← monadLift (Task.Cancel.new : IO Task.Cancel)
-    let r ← LeanIn.Task.EAsync.ofAsync
-      (LeanIn.Task.Async.await (show LeanIn.Task.Task (Except IO.Error Unit) from ⟨cell2, cancel⟩))
-    match r with
-    | .error e => throw e
-    | .ok _ => pure ()
+    amStall c (Runtime.HarnessClock.clockWithWake hc2 push2) d
   let server2T ← IO.asTask (Runtime.runVirtual hc2 e2 server2) _root_.Task.Priority.dedicated
   let stClient ←
     try

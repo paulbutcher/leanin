@@ -13,19 +13,17 @@ open LeanIn
 
 def payload : ByteArray := ByteArray.mk (Array.replicate 1048576 (UInt8.ofNat 120))
 
-async unboundWrite (c : Runtime.Conn) (clock : Runtime.Clock)
-    (onDone : Except IO.Error Unit → IO Unit) := do
+async def unboundWrite (c : Runtime.Conn) (clock : Runtime.Clock) : Unit := do
   let slept : Unit := await (LeanIn.Runtime.Io.sleepRaw clock.schedule (200 : Std.Time.Millisecond.Offset))
   await (LeanIn.Runtime.Io.sendRaw c payload)
-  onDone (.ok ())
-  halt
+  return ()
 
-async boundWrite (c : Runtime.Conn) (clock : Runtime.Clock)
-    (onDone : Except IO.Error Unit → IO Unit) := do
+async def boundWrite (c : Runtime.Conn) (clock : Runtime.Clock) : Unit := do
   let slept : Unit := await (LeanIn.Runtime.Io.sleepRaw clock.schedule (200 : Std.Time.Millisecond.Offset))
   let r := await (LeanIn.Runtime.Io.sendRaw c payload)
-  onDone r
-  halt
+  match r with
+  | .ok () => return ()
+  | .error e => throw e
 
 def main (args : List String) : IO UInt32 := do
   let port : UInt16 := ((args.headD "8799").toNat?.getD 8799).toUInt16
@@ -37,12 +35,8 @@ def main (args : List String) : IO UInt32 := do
   let c ← match ← Runtime.run e accepted with
     | .ok c => pure c
     | .error e => IO.eprintln s!"asyncFailure: accept: {e}"; return 1
-  let unbound : LeanIn.Task.EAsync IO.Error Unit :=
-    ⟨fun k ctx => unboundWrite.run c clock (fun r => k r ctx)⟩
-  let bound : LeanIn.Task.EAsync IO.Error Unit :=
-    ⟨fun k ctx => boundWrite.run c clock (fun r => k r ctx)⟩
-  let ru ← Runtime.run e unbound
-  let rb ← Runtime.run e bound
+  let ru ← Runtime.run e (unboundWrite c clock)
+  let rb ← Runtime.run e (boundWrite c clock)
   Runtime.Io.stop
   match ru, rb with
   | .ok (), .error _ => IO.println "asyncFailure: unbound reached its terminal; bound observed the failure"; return 0

@@ -33,14 +33,15 @@ Grammar:
 - `while c do B` (desugared through the same transitions), `for x in xs do B`, `break`, `continue`.
 - `recurse` — jump back to state 0 (must end a path). A close ends a path too; only pure statements may
   follow it, and they run after the socket goes (a completion signal is the use). `halt` ends a path as a
-  return — the machine stops; a callable machine invokes its `onDone` parameter and then `halt`s.
+  return — the machine stops; a result-bearing machine delivers its `Completion.done` (or `fail` for a
+  `throw`) and then halts.
 
 Effects this cut resumes: `Io.recvRaw` (the byte payload continues on `.ok (some …)`; an end of stream or a
 failure closes), `Io.recvTimeoutRaw` (the full race outcome is delivered: `none` stalled, `some (.ok …)` read,
 `some (.error …)` failed), `Io.sendAllRaw`/`Io.sendRaw` (the `Except` is delivered to a bound result; an
 unbound result discards it and the continuation still runs), `Io.closeRaw`, `VM.runAsync` (a sub-computation's result is delivered to the
 bind), and **machine calls**: any `*.run` application suspends on the callee, whose `run` must declare its
-continuation last — an `onDone`-style parameter the callee invokes with its result; the generator fills that
+completion last — a `Completion` the callee invokes with its result or failure; the generator fills that
 slot with the caller's continuation, so a machine awaiting a machine is a raw resume and **no cell**, exactly
 as `LeanIn.Examples.Http.Server.drive`'s `onClose` works. Field types are inferred without a general elaboration pass: a
 threaded parameter keeps its signature
@@ -256,7 +257,7 @@ private inductive Eff where
   | recvTimeout (conn : Term) (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
   | sleep (sched : Term) (deadline : Term)  -- `Io.sleepRaw sched d` → `Unit`
   | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
-  | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's `onDone` payload
+  | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's callback payload
   | runMachineResult (fn : Term) (args : List Term)  -- a result machine's `run` → its `Completion` payload
   | spawn (push : Term) (fn : Term) (args : List Term)  -- `Foo.spawn push a …` → the machine's completion cell
   | join (h : Term)             -- `RawCell.await h` → the cell's value
@@ -563,6 +564,7 @@ private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : 
     let k ← annot bv
     `($fn $argTs* $k)
   | .runMachineResult fn args =>
+    dbg_trace "async: result machine call lowered"
     let bv := bnd.getD `v
     let argTs := args.toArray
     let k ← annot bv
@@ -652,20 +654,33 @@ private meta partial def incContinues (i : Ident) (inc : Term) : List Item → L
   | .match_ s arms :: rest => .match_ s (arms.map (fun (nd, b) => (nd, incContinues i inc b))) :: incContinues i inc rest
   | item :: rest => item :: incContinues i inc rest
 
-/-- The pure tail a close may be followed by: every statement runs after the socket goes, so nothing that
-suspends is allowed -- a completion signal (the `onClose` of a served connection) is the use. -/
-private meta def closeTail : List Item → MacroM Term
+/-- The tail a close may be followed by: every statement runs after the socket goes, so nothing that
+suspends is allowed. Pure statements and a completion (`return`/`throw`, or an `if` of them) are the uses. -/
+private meta def closeTail (ctx : Ctx) : List Item → MacroM Term
   | [] => `(pure ())
+  | [.return_ e] => do
+    let some done := ctx.done
+      | Macro.throwError "async: `return` after `closeRaw` needs a result-bearing declaration"
+    `(($(mkIdent done)).done $(⟨e⟩) >>= fun _ => pure ())
+  | [.throw_ e] => do
+    match ctx.done with
+    | some done => `(($(mkIdent done)).fail $(⟨e⟩) >>= fun _ => pure ())
+    | none => `(throw $(⟨e⟩))
+  | [.if_ c t e] => do
+    let tt ← closeTail ctx t
+    let ee ← closeTail ctx e
+    `(if $(⟨c⟩) then $tt else $ee)
+  | [.pureStmt s] => `($(⟨s⟩) >>= fun _ => pure ())
   | .pureStmt s :: rs => do
-    let t ← closeTail rs
+    let t ← closeTail ctx rs
     `($(⟨s⟩) >>= fun _ => $t)
   | .pureBind pat none s :: rs => do
-    let t ← closeTail rs
+    let t ← closeTail ctx rs
     `(let $(⟨pat⟩) := $(⟨s⟩); $t)
   | .pureBind pat (some ty) s :: rs => do
-    let t ← closeTail rs
+    let t ← closeTail ctx rs
     `(let $(⟨pat⟩) : $ty := $(⟨s⟩); $t)
-  | _ :: _ => Macro.throwError "async: only pure statements may follow `closeRaw`"
+  | _ => Macro.throwError "async: only pure statements or a completion may follow `closeRaw`"
 
 mutual
 /-- Compile a list of items into the body Term of a state (or an inline continuation). Generates any
@@ -708,7 +723,7 @@ private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : Li
   | .await bnd ty? e :: rest => do
     match (← classify ctx e) with
     | .close conn => do
-      let tail ← closeTail rest
+      let tail ← closeTail ctx rest
       match bnd, ty? with
       | some bv, some t =>
         `(LeanIn.Runtime.Io.closeRaw $conn >>= fun ($(mkIdent bv) : $t) => $tail)
@@ -852,94 +867,6 @@ private meta partial def liveScope (ctx : Ctx) (rest : List Item) (scope : List 
   let live := liveNames ctx rest scope
   scope.filter (fun (n, _) => live.contains n)
 end
-
-/-- `async name (c : Conn) (x : T) … := do …` — lower the body to a state machine. -/
-syntax (docComment)? "async " ident " (" ident " : " term " )" bracketedBinder* " := " doSeq : command
-
-elab_rules : command
-  | `($[$doc?:docComment]? async $n:ident ( $c:ident : $cty:term ) $params:bracketedBinder* := $body:doSeq) => do
-  -- The threaded parameters (each `(x : T)`), with their signature types. The names are scope-erased: a
-  -- `bracketedBinder` parameter and the body's references to it can carry different macro scopes (an
-  -- inline-parsed parameter like the connection does not), which would leave a state field unresolvable.
-  let threadedInfo ← params.toList.mapM fun p =>
-    match p.raw with
-    | `(bracketedBinder| ( $x:ident : $ty:term )) => pure (x.getId.eraseMacroScopes, (ty : Term))
-    | _ => throwError "async: parameters must be `(x : T)`"
-  let threaded := threadedInfo.map (·.1)
-  let items ← Lean.Elab.liftMacroM (parseItems body)
-  -- Every parameter is a threaded field of state 0: an unrebound parameter keeps its value across `recurse`
-  -- (the constant-parameter shape, carried rather than resolved), and a rebound one advances. Splitting
-  -- constants out was the silent-trap shape: a parameter the body forgot to rebind stayed constant with no
-  -- sign of it.
-  let ctx : Ctx := { name := n.getId, conn := c.getId, threaded := threaded, paramTys := threadedInfo,
-                     env := ← Lean.getEnv, ns := ← Lean.getCurrNamespace }
-  let initScope : List (Name × Bind) := threadedInfo.map (fun (x, ty) => (x, .threaded ty))
-  -- Run the compiler, seeding state 0 as the entry (its fields are the threaded parameters).
-  let s0fields := threadedInfo.map (fun (x, ty) => (x, ty))
-  let compileAct : CompileM Unit := do
-    let bodyT ← compileBody ctx items initScope
-    addState { idx := 0, fields := s0fields, body := bodyT }
-  let ((), (_n, statesRev)) ← Lean.Elab.liftMacroM (compileAct.run (1, []))
-  let allStates := statesRev.reverse
-  let ctors ← allStates.toArray.mapM (fun st => do
-    let binders ← st.fields.toArray.mapM (fun (f, ty) => `(bracketedBinder| ($(mkIdent f) : $ty)))
-    `(Lean.Parser.Command.ctor| | $(stLocalName st.idx):ident $binders*))
-  let sn := mkIdent ((n.getId ++ `St).eraseMacroScopes)
-  let stepn := mkIdent ((n.getId ++ `step).eraseMacroScopes)
-  let runn := mkIdent ((n.getId ++ `run).eraseMacroScopes)
-  let indCmd ← `(inductive $sn:ident where
-    $[$ctors]*)
-  Lean.Elab.Command.elabCommand indCmd
-  let matchAlts ← allStates.toArray.mapM (fun st => do
-    let pats := st.fields.toArray.map (fun (f, _) => (mkIdent f : Term))
-    let cn := stLocalName st.idx
-    let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
-    `(matchAltExpr| | $patTerm => $(st.body)))
-  -- The step takes the connection alone; the threaded fields (every parameter) live in the states.
-  -- The first parameter's own type: a connection for a connection loop, a listener for an accept loop — the
-  -- step carries whatever the body's first value is, and the body names it by the declared identifier.
-  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : $cty) : $sn → IO Unit :=
-    fun st => match st with
-      $matchAlts:matchAlt*)
-  Lean.Elab.Command.elabCommand stepCmd
-  -- The run passes the connection to `step`, and the threaded fields (every parameter) to state 0.
-  let tfArgs := threaded.toArray.map (fun x => (mkIdent x : Term))
-  let s0app ← if tfArgs.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $tfArgs*)
-  let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : $cty) $params* : IO Unit :=
-    $stepn $(mkIdent c.getId) $s0app)
-  Lean.Elab.Command.elabCommand runCmd
-  -- The declaration the comment sits above is the machine; `name` itself is only a prefix (`name.St`,
-  -- `name.step`, `name.run`). Attach the docstring to `name.run`, the callable entry.
-  if let some d := doc? then
-    Lean.Elab.Command.liftTermElabM <| Lean.addDocString runn.getId Syntax.missing d
-  -- A spawner, when the machine is callable: its last parameter is the continuation `(α → IO Unit)`, so
-  -- `Foo.spawn push …` schedules the machine as an executor item and hands back the completion cell as the
-  -- handle. The payload type comes from that continuation's own domain; a machine whose last parameter has
-  -- another shape simply has no spawner.
-  match threadedInfo.getLast? with
-  | some (_, ty) =>
-    match ty.raw with
-    | `($_arg → IO Unit) =>
-      let others := threadedInfo.dropLast
-      let spawnn := mkIdent ((n.getId ++ `spawn).eraseMacroScopes)
-      let binders ← others.toArray.mapM (fun (x, t) => `(bracketedBinder| ($(mkIdent x) : $t)))
-      let ids := others.toArray.map (fun (x, _) => (mkIdent x : Term))
-      let pushId := mkIdent `push
-      let body ← `(do
-        let cell ← LeanIn.Runtime.RawCell.new
-        ($pushId (LeanIn.Task.Item.ofAction
-          ($runn $(mkIdent c.getId) $ids* (fun v => LeanIn.Runtime.RawCell.resolve cell v))))
-        pure cell)
-      let spawnCmd ← `(def $spawnn:ident
-        ($(mkIdent `push) : LeanIn.Task.Item → BaseIO Unit)
-        ($(mkIdent c.getId) : $cty) $binders* :
-          IO (LeanIn.Runtime.RawCell $_arg) := $body)
-      Lean.Elab.Command.elabCommand spawnCmd
-      modifyEnv fun env => LeanIn.Async.spawnAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `spawn))
-    | _ => pure ()
-  | none => pure ()
-  -- Provenance: the classifier accepts a machine call only for a tagged runner.
-  modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
 
 /-- `async def name (c : C) (x : T) … : R := do …` — a result-bearing machine. The generated public
 `name` returns `Task.EAsync IO.Error R`; its internal runner keeps the explicit completion parameter, and

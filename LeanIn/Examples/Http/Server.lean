@@ -146,8 +146,8 @@ def pump (handler : Handler) (m : H1.Machine) : Pump := pumpGo handler m #[]
 --
 -- A docstring here would not parse: `async` is a command syntax registered by `elab`, and that form does
 -- not take one.
-async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : LeanIn.Examples.Http.H1.Machine)
-    (onClose : Except IO.Error Unit → IO Unit) := do
+async def drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler)
+    (m : LeanIn.Examples.Http.H1.Machine) : Unit := do
   let r : Pump := pump handler m
   let machine : H1.Machine := r.machine
   let out : Array ByteArray := r.out
@@ -158,7 +158,7 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     let req : H1.Head × ByteArray := r.req?.getD (default, .empty)
     let head : H1.Head := req.1
@@ -177,7 +177,7 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     -- A live clock's deadline is a slot the driver sweeps on its own poll timeout; a harness clock's is an
     -- armed instant the virtual driver advances to, and it must be retired exactly.
@@ -186,10 +186,10 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
       match rt with
       | none =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+        if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
       | some (.error e) =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | some (.ok none) =>
         let m := H1.Machine.noMoreInput machine
         recurse
@@ -201,10 +201,10 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
       match rt with
       | none =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+        if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
       | some (.error e) =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | some (.ok none) =>
         let m := H1.Machine.noMoreInput machine
         recurse
@@ -217,10 +217,10 @@ async drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler) (m : Le
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     let closed := await (LeanIn.Runtime.Io.closeRaw c)
-    onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+    if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
 
 
 /-! ## Streaming session
@@ -534,8 +534,8 @@ private partial def pumpStreamGo (m : H1.Machine) (acc : Array ByteArray) : Pump
 /-- The streaming connection loop. The head is dispatched as soon as it parses; the body and the response are
 the handler's to read and write, so neither is buffered. The connection is reused only when the body was fully
 read, the response was started and finished, and the machine's disposition keeps it alive. -/
-async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHandler)
-    (m : LeanIn.Examples.Http.H1.Machine) (onClose : Except IO.Error Unit → IO Unit) := do
+async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHandler)
+    (m : LeanIn.Examples.Http.H1.Machine) : Unit := do
   let r : Pump := pumpStreamGo m #[]
   let machine : H1.Machine := r.machine
   let out : Array ByteArray := r.out
@@ -546,7 +546,7 @@ async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHand
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     let req : H1.Head × ByteArray := r.req?.getD (default, .empty)
     let head : H1.Head := req.1
@@ -583,34 +583,33 @@ async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHand
         recurse
       else
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+        if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
     | .error e =>
       let closed := await (LeanIn.Runtime.Io.closeRaw c)
-      onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+      throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
     | .aborted reason =>
       -- The request's own cancellation: the transport cannot carry this request's completion, so no further
       -- response — no 500, no keep-alive — is attempted, and the connection's outcome is the transport failure.
       -- Bytes already sent stand and are not retracted; the peer may still be able to read them.
       let closed := await (LeanIn.Runtime.Io.closeRaw c)
-      onClose (.error (if closed then reason
-                       else .userError s!"{reason}; and the shim refused the cleanup close"))
+      throw (if closed then reason else .userError s!"{reason}; and the shim refused the cleanup close")
   | .needRead =>
     if out.size > 0 then
       let sw := await (LeanIn.Runtime.Io.sendAllRaw c out)
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     if cfg.clock.swept then
       let rt := await (LeanIn.Runtime.Io.recvStallRaw c cfg.stallTimeout 65536)
       match rt with
       | none =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+        if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
       | some (.error e) =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | some (.ok none) =>
         let m := H1.Machine.noMoreInput machine
         recurse
@@ -622,10 +621,10 @@ async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHand
       match rt with
       | none =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+        if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
       | some (.error e) =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | some (.ok none) =>
         let m := H1.Machine.noMoreInput machine
         recurse
@@ -638,19 +637,14 @@ async driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHand
       match sw with
       | .error e =>
         let closed := await (LeanIn.Runtime.Io.closeRaw c)
-        onClose (.error (if closed then e else .userError s!"{e}; and the shim refused the cleanup close"))
+        throw (if closed then e else .userError s!"{e}; and the shim refused the cleanup close")
       | .ok _ => pure ()
     let closed := await (LeanIn.Runtime.Io.closeRaw c)
-    onClose (if closed then .ok () else .error (.userError "Io.closeRaw: the loop refused the connection's close submission"))
+    if closed then return () else throw (.userError "Io.closeRaw: the loop refused the connection's close submission")
 
 /-- Serve a streaming handler on one connection. -/
 def serveConnStream (cfg : Config) (c : Conn) (handler : StreamHandler) : Task.EAsync IO.Error Unit :=
-  ⟨fun k ctx => do
-    let cell ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
-    driveStream.run c cfg handler ({ limits := cfg.h1, buffered := false } : H1.Machine)
-      (fun r => Task.Join.resolve cell ctx.resumeShared r)
-    (Task.Async.await (show Task.Task (Except IO.Error Unit) from ⟨cell, ctx.cancel⟩)).step
-      (fun r ctx' => k r ctx') ctx⟩
+  driveStream c cfg handler ({ limits := cfg.h1, buffered := false } : H1.Machine)
 
 /-- **Serve one connection**: run the compiled loop from a fresh machine built from `cfg.h1` alone. The
 connection outlives a single exchange -- it ends when the machine halts, or when the peer closes or stalls past
@@ -660,12 +654,7 @@ suspension. One `Join` cell per connection -- never one per request. The cell ca
 **outcome**: a clean close is `.ok`, a transport failure is the error, so a reset is never reported as a
 success -- the shape the accept loops' registries and drains already account by. -/
 def serveConn (cfg : Config) (c : Conn) (handler : Handler) : Task.EAsync IO.Error Unit :=
-  ⟨fun k ctx => do
-    let cell ← (Task.Join.new : IO (Task.Join (Except IO.Error Unit)))
-    drive.run c cfg handler ({ limits := cfg.h1 } : H1.Machine)
-      (fun r => Task.Join.resolve cell ctx.resumeShared r)
-    (Task.Async.await (show Task.Task (Except IO.Error Unit) from ⟨cell, ctx.cancel⟩)).step
-      (fun r ctx' => k r ctx') ctx⟩
+  drive c cfg handler ({ limits := cfg.h1 } : H1.Machine)
 
 end LeanIn.Examples.Http.Server
 end

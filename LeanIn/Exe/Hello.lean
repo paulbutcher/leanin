@@ -28,27 +28,26 @@ def helloKeepResponse : ByteArray :=
 -- One connection's work: read the request, answer, close, and report the close. The write is deliberately
 -- unbound: its `Except` is discarded, and a failed write's connection is closed by the loop, so the following
 -- close sees the failure at that operation; no other connection is affected.
-async helloConn (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+async def helloConn (c : LeanIn.Runtime.Conn) : Unit := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[helloResponse])
   let closed := await (LeanIn.Runtime.Io.closeRaw c)
-  onDone (if closed then .ok () else .error (IO.userError "helloConn: the loop refused the close"))
+  if closed then return () else throw (IO.userError "helloConn: the loop refused the close")
 
 -- A keep-alive connection loop, for the benchmark arm: request, answer, request again on the same connection.
-async helloKeep (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
+async def helloKeep (c : LeanIn.Runtime.Conn) : Unit := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[helloKeepResponse])
   recurse
 
 -- The accept loop: one connection at a time, its handler spawned as an executor item, then recurse. The
 -- listener, the inject and the mode are the loop's carried state; an accept failure ends the loop loudly.
-async helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item → BaseIO Unit)
-    (keep : Bool) (onDone : Except IO.Error Unit → IO Unit) := do
+async def helloServe (l : LeanIn.Runtime.Listener) (push : LeanIn.Task.Item → BaseIO Unit)
+    (keep : Bool) : Unit := do
   let c : Except IO.Error LeanIn.Runtime.Conn := await (LeanIn.Runtime.Io.acceptRaw l push)
   match c with
   | .error e =>
-    onDone (.error e)
-    halt
+    throw e
   | .ok conn =>
     -- Handlers are unsupervised here: the handle is discarded deliberately. A connection's failure is
     -- confined to that connection by the handler's own policy, and the loop's only terminal is an accept the
@@ -71,9 +70,7 @@ def main (args : List String) : IO UInt32 := do
   (← IO.getStdout).flush
   -- The compiled loop owns the connection; only its terminal — an accept the loop can no longer complete —
   -- reaches the wrapper's continuation, which is what lets `main` report it.
-  let prog : LeanIn.Task.EAsync IO.Error Unit :=
-    ⟨fun k ctx => helloServe.run l push keep (fun r => k r ctx)⟩
-  match (← (LeanIn.Runtime.run e prog : IO (Except IO.Error Unit))) with
+  match (← (LeanIn.Runtime.run e (helloServe l push keep) : IO (Except IO.Error Unit))) with
   | .ok () => return 0
   | .error e =>
     IO.eprintln s!"hello: {e}"

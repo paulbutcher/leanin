@@ -12,15 +12,9 @@ the surface, and the items still open, is
 
 ## The shape
 
-There are two declaration forms. Both compile the same state machine and use the same effect set.
-
-| form | public entry | completion |
-|---|---|---|
-| `async def name (c : C) … : T := do …` | `name : … → Task.EAsync IO.Error T` | `return e`; compiler-owned |
-| `async name (c : C) … (onDone : α → IO Unit) := do …` | `name.run : … → IO Unit` | the author calls `onDone` |
-
-The result-bearing form is the authoring contract; the callback form is the integration layer it compiles
-through, and is still what a machine-to-machine call names.
+There is one declaration form: `async def name (c : C) … : T := do …`. The public `name` returns
+`Task.EAsync IO.Error T`; the compiler generates the internal runner and its completion. There is no
+author-written `onDone`.
 
 ```lean
 async def readSeven (src : LeanIn.Runtime.Conn) : ByteArray := do
@@ -28,28 +22,23 @@ async def readSeven (src : LeanIn.Runtime.Conn) : ByteArray := do
   return chunk
 ```
 
-The internal completion parameter is generated, not authored. In callback form it is explicit:
+The generated internal runner is `name.run`; it takes a `LeanIn.Async.Completion T` (`done` and `fail`) after
+the authored parameters. A compiled machine calls another with `await (name.run …)`, and the classifier fills
+that completion; the caller sees the result `T`, not an `Except`.
 
-```lean
-async helloCallback (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
-  let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
-  await (LeanIn.Runtime.Io.sendAllRaw c #[response])
-  let closed := await (LeanIn.Runtime.Io.closeRaw c)
-  onDone (if closed then .ok () else .error (IO.userError "hello: the loop refused the close"))
-```
+
 
 - The first parameter after the name is the **carried value** — a connection for a connection loop, a
   listener for an accept loop — and its declared type is the type the generated `step` and `run` take.
 - The remaining parameters are threaded through the machine's states. A parameter the body does not rebind
   keeps its value across `recurse`; one bound by `let … := await …` advances.
-- A machine ends a path in `recurse` (re-entering with the current fields), `halt`, a close, `return` (in a
-  result-bearing declaration), or a call to its continuation. The compiler rejects a path that can fall off
-  the end.
+- A machine ends a path in `recurse` (re-entering with the current fields), `halt`, a close, `return`, or
+  `throw`. The compiler rejects a path that can fall off the end.
 - The receiver and size written in the `await` are the ones lowered. `await (Io.recvRaw src 7)` reads at most
   seven bytes from `src`; it is not rewritten to the machine's carried connection or to a default size.
-- A send's result is the `Except IO.Error Unit` in both forms: `let r := await (Io.sendRaw c bs)` binds it,
-  and `await (Io.sendRaw c bs)` discards it and continues. Binding changes what the body can inspect, not
-  whether the path runs.
+- A send's result is `Except IO.Error Unit`: `let r := await (Io.sendRaw c bs)` binds it, and
+  `await (Io.sendRaw c bs)` discards it and continues. Binding changes what the body can inspect, not whether
+  the path runs.
 - Layouts are otherwise not observable.
 
 ## Result-bearing declarations
@@ -129,9 +118,8 @@ let push := LeanIn.Runtime.sharedPush e
 ```
 
 A result-bearing call needs no push of its own: `name args` is a `Task.EAsync`, and
-`LeanIn.Runtime.run e (name args)` drives it to `Except IO.Error T`. `push` is the executor's inject for the
-callback form: hand it to `spawn`, `acceptRaw`, and the join that ends the run. `Runtime.runVirtual` takes a
-harness clock for stated instants.
+`LeanIn.Runtime.run e (name args)` drives it to `Except IO.Error T`. `push` is the executor's inject for
+`spawn`, `acceptRaw`, and the internal runner when a long-lived machine is started without awaiting a terminal.
 
 ## The complete server
 
@@ -190,9 +178,8 @@ nix develop -c bash tests/async-diagnostics.sh
 - The effect set is closed; a body needing anything else awaits a `VM.runAsync` of the interpreted machine,
   which can express dynamic effects at the cost of an interpreter step.
 - Machine calls take one continuation last; `select` is over two cells of one type (no heterogeneous race).
-- A result-bearing declaration's public `name` is an `EAsync` value; compiled code calls its internal
-  `name.run`, which the classifier fills with a `Completion`. `await (name …)` on the public value is not a
-  classified effect.
+- A declaration's public `name` is an `EAsync` value; compiled code calls its internal `name.run`, which the
+  classifier fills with a `Completion`. `await (name …)` on the public value is not a classified effect.
 - A result-bearing machine resolves on `return` or `throw`. A `throw` becomes `.error` on the public
   `EAsync`; it is not a catchable local exception in this compiled subset.
 - A running handler is not cancelled by a scope of its own: closing a connection ends the I/O but not a

@@ -6,7 +6,7 @@ open LeanIn
 -- The formerly trapping shape: a parameter the body uses but never rebinds. Thread-by-default carries it
 -- across `recurse` — this must ELABORATE (it was silently a constant before, which is how the driver's
 -- protocol machine was once discarded).
-async carried (c : LeanIn.Runtime.Conn) (tag : ByteArray) := do
+async def carried (c : LeanIn.Runtime.Conn) (tag : ByteArray) : Unit := do
   let bs := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[tag, bs])
   recurse
@@ -15,4 +15,4 @@ async carried (c : LeanIn.Runtime.Conn) (tag : ByteArray) := do
 -- takes the connection alone, while `run` keeps the full parameter list. If `tag` ever becomes a constant
 -- step parameter again, `step`'s type gains it and the first example stops elaborating.
 example : LeanIn.Runtime.Conn → carried.St → IO Unit := carried.step
-example : LeanIn.Runtime.Conn → ByteArray → IO Unit := carried.run
+example : LeanIn.Runtime.Conn → ByteArray → LeanIn.Async.Completion Unit → IO Unit := carried.run

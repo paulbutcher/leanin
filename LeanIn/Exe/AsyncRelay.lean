@@ -14,12 +14,11 @@ open LeanIn
 
 /-- Read seven bytes from `src`, write them to `dst`, and close `dst`. The two connections are separate
 parameters: `src` is the machine's carried value, `dst` is threaded through the generated state. -/
-async relay (src : Runtime.Conn) (dst : Runtime.Conn)
-    (onDone : Except IO.Error Unit → IO Unit) := do
+async def relay (src : Runtime.Conn) (dst : Runtime.Conn) : Unit := do
   let chunk := await (LeanIn.Runtime.Io.recvRaw src 7)
   await (LeanIn.Runtime.Io.sendRaw dst chunk)
   let closed := await (LeanIn.Runtime.Io.closeRaw dst)
-  onDone (if closed then .ok () else .error (IO.userError "relay: the loop refused the close"))
+  if closed then return () else throw (IO.userError "relay: the loop refused the close")
 
 def main (args : List String) : IO UInt32 := do
   let port : UInt16 := ((args.headD "8795").toNat?.getD 8795).toUInt16
@@ -33,9 +32,7 @@ def main (args : List String) : IO UInt32 := do
   let (src, dst) ← match ← Runtime.run e prog with
     | .ok pair => pure pair
     | .error e => IO.eprintln s!"relay: accept failed: {e}"; return 1
-  let machine : LeanIn.Task.EAsync IO.Error Unit :=
-    ⟨fun k ctx => relay.run src dst (fun r => k r ctx)⟩
-  let outcome ← Runtime.run e machine
+  let outcome ← Runtime.run e (relay src dst)
   Runtime.Io.stop
   match outcome with
   | .ok () => return 0

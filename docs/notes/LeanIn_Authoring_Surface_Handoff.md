@@ -194,10 +194,10 @@ Still open from this handoff:
 - Result-bearing declarations and compiler-owned completion: the first slice landed (`async def … : T`,
   `return`, public `Task.EAsync` entry, `tests/async-result.sh`), and `throw` is delivered as `.error`.
   `onDone` remains the internal runner parameter; machine-to-machine composition and scopes are still open.
-  Machine-to-machine result calls now keep their payload `T` through a generated `Completion` record
-  (`done`/`fail`); a callee failure reaches the caller's failure channel. Removing the callback declaration
-  syntax still requires migrating the remaining old-form declarations (production drivers and test machines),
-  not a continuation-type change.
+  Single syntax is now enforced: `async def … : T` is the only declaration form. The callback syntax was
+  removed after all production drivers, test machines, diagnostics and call sites migrated. Machine-to-machine
+  calls keep their payload `T` through a generated `Completion` (`done`/`fail`), and a callee failure reaches
+  the caller's failure channel.
 - Typed helper lowering / extension rules, destructuring `let`, and the collapsed effect classifier.
 - Result-bearing child handles, explicit scopes, and the cancellation/cleanup/timeout lifetime contract.
 - ~~A dedicated runtime fixture for the send-failure policy~~ — added as `tests/async-failure.sh`: a peer RST
