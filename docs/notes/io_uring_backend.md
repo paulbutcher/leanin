@@ -83,3 +83,24 @@ Conclusion so far: the ring architecture is sound, but this workload has not sho
 E1/E2 remain as non-regressing improvements; E3 was not ported. A fair next experiment needs a minimal **libuv**
 C server with the same parser/response, not the Lean server, and then a zero-copy send path from the provided
 buffer before repeating the paired run.
+
+### Fair E0 baseline and SQPOLL (2026-10-21)
+
+`bench/libuv-http.c` is the same minimal HTTP parser/response on libuv C. This removes the Lean-server confound.
+Paired, 3 s, 3 rounds, client pinned:
+
+| C | libuv C | uring one-shot | uring multishot recv |
+|---:|---:|---:|---:|
+| 1 | 84 504–86 757 | 64 982–69 434 | 68 913–69 909 |
+| 8 | 208 495–211 089 | 206 294–210 167 | 206 161–211 818 |
+| 32 | 173 953–182 659 | 172 987–180 118 | 167 589–178 413 |
+
+So the earlier E0-vs-Lean-server gain was the C server, not the ring. Against the fair libuv C baseline, io_uring
+is ~0.8× at C=1 and parity at C=8/32. Multishot recv does not change that shape.
+
+SQPOLL (`IORING_SETUP_SQPOLL | SINGLE_ISSUER`, `sq_thread_idle=1000`; `DEFER_TASKRUN` is rejected in that
+combination) measured 63 131 rps at C=1 — no recovery.
+
+Conclusion: for this single-carrier, keep-alive, one-request-in-flight workload, io_uring does not beat epoll.
+The remaining levers (SQPOLL, multishot recv, setup flags) are all neutral or negative here. E1/E2 stay in the
+opt-in shim as non-regressing experiments; the backend should not be promoted.

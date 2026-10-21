@@ -137,7 +137,12 @@ int main(int argc, char **argv) {
 
   struct io_uring_params p;
   memset(&p, 0, sizeof(p));
+#ifdef SQPOLL
+  p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SQPOLL;
+  p.sq_thread_idle = 1000;
+#else
   p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+#endif
   p.cq_entries = 1024;
   int r = io_uring_queue_init_params(512, &ring, &p);
   if (r < 0) { fprintf(stderr, "queue_init: %d\n", r); return 1; }
