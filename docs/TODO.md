@@ -52,10 +52,11 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier. Attempted wiring:
   a caller-driven multi-carrier entry with shared dispatch, plus a pump-thread variant. The caller
   variant's shared-task test passed, but the HTTP entry stalled intermittently (about 5 of 20
-  single-request runs) at a connection after accept; the pump variant cannot drive a listener the
-  caller bound, because the shim's loop is thread-affine. Needs a loop-driver wake or a listener
-  created on the pump thread before it is wired into `server`. The affinity rule to preserve: a
-  connection stays on the carrier that took its first step.
+  single-request runs) at a connection after accept. A third variant bound the listener and ran the
+  pump on the same dedicated thread, with all executor carriers separate; the handshake and program
+  root started, but the pump never delivered an accept event. The blocker is therefore below the
+  executor wake: listener/loop ownership in the shim needs work before this is wired into `server`.
+  The affinity rule to preserve: a connection stays on the carrier that took its first step.
 - [x] **Correct the H1 documentation.** The module doc now states the implemented framing,
   continue handling and limits.
 
