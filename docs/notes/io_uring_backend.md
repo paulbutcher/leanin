@@ -104,3 +104,30 @@ combination) measured 63 131 rps at C=1 — no recovery.
 Conclusion: for this single-carrier, keep-alive, one-request-in-flight workload, io_uring does not beat epoll.
 The remaining levers (SQPOLL, multishot recv, setup flags) are all neutral or negative here. E1/E2 stay in the
 opt-in shim as non-regressing experiments; the backend should not be promoted.
+
+### E5: submit-and-wait, and pipelining (the missing shape)
+
+Two corrections changed the conclusion:
+
+1. `io_uring_submit_and_wait(ring, 1)` replaces the separate `submit` + `wait_cqe`. One enter per loop turn.
+2. The benchmark shape matters: at depth 1 there is nothing to batch. With `LOAD_PIPE=16` (16 requests in
+   flight per connection), the ring has work to amortise.
+
+Paired against the fair `bench/libuv-http.c`, 3 s, 3 rounds:
+
+| C | depth | libuv C | uring `submit_and_wait` |
+|---:|---:|---:|---:|
+| 1 | 1 | 84.5–86.8k | 68.9k |
+| 8 | 1 | 208–211k | ~208k |
+| 32 | 1 | 174–183k | ~175k |
+| 1 | 16 | 73–175k (unstable) | **279–283k** |
+| 8 | 16 | 221–223k | **263–278k** |
+| 32 | 16 | 238–249k | **292–294k** |
+
+At depth 16 the ring is ~1.2–1.25× at C=8/32 and clearly ahead at C=1 in this harness. The depth-1 result stands:
+there, epoll and one-shot ring are parity or epoll ahead.
+
+Conclusion: the earlier “no speedup” was a wrong-shape and wrong-syscall-pattern test. io_uring is viable for this
+server when the workload has pipelined requests and the loop uses one `submit_and_wait` per turn. The Lean shim
+still uses the hybrid loop and one-request benchmarks; porting the direct loop + submit-and-wait is the next step,
+then re-running the Lean server with `LOAD_PIPE=16`.

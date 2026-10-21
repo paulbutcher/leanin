@@ -189,7 +189,12 @@ int main(int argc, char **argv) {
 
   for (;;) {
     struct io_uring_cqe *cqe;
+#ifdef SUBMIT_WAIT
+    /* One enter for both: submit SQEs prepared by the previous iteration and wait for one completion. */
+    r = io_uring_submit_and_wait(&ring, 1);
+#else
     r = io_uring_wait_cqe(&ring, &cqe);
+#endif
     if (r < 0) {
       if (r == -EINTR) continue;
       fprintf(stderr, "wait_cqe: %d\n", r);
@@ -250,7 +255,9 @@ int main(int argc, char **argv) {
       }
       io_uring_cqe_seen(&ring, cqe);
     }
+#ifndef SUBMIT_WAIT
     io_uring_submit(&ring);
+#endif
   }
   return 0;
 }
