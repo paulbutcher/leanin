@@ -21,9 +21,13 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [ ] **Request/handler scope.** User-triggered cancellation, child cancellation, and exactly-once
   cleanup on scope exit. Transport abort exists; the general scope does not.
   - Depends on the timer cancellation above for parked handlers.
-- [ ] **Bound streaming request bodies.** `H1.Limits.maxBody` applies to the buffered driver only.
-  A streaming `BodyReader` that calls `readAll` can grow without bound.
-  - Needs a byte-count limit shared by buffered and streaming reads, with a typed 413 response.
+- [x] **Bound streaming request bodies.** `BodyReader` carries the connection's
+  `Config.h1.maxBody` and a delivered-byte count. A declared `Content-Length` over the limit is
+  answered `413` before the handler runs; a chunked or fixed read that crosses the limit raises
+  `bodyTooLarge`, which the stream driver renders as `413` when the handler has not started its
+  response and otherwise closes the connection without retracting bytes already sent.
+  - Evidence: `tests/http-stream.sh` streams 2 MiB under the configured 4 MiB ceiling and gets
+    `413 Payload Too Large` for a declared 5 MiB body.
 
 ## P1 — HTTP serving surface
 
@@ -37,8 +41,8 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   general 1xx writer path for `103 Early Hints`.
 - [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier; wire a
   multi-carrier accept/connection path and state the affinity rules.
-- [ ] **Correct the H1 documentation.** `H1.lean` still says chunked framing and `Expect:
-  100-continue` are follow-ups; both are implemented.
+- [x] **Correct the H1 documentation.** The module doc now states the implemented framing,
+  continue handling and limits.
 
 ## P2 — socket backend
 

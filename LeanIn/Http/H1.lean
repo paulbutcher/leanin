@@ -13,8 +13,8 @@ every line), this one **scans the read buffer in place** and keeps the request-t
 as a `Slice` — a pair of indices into that buffer. No per-line literal, no `String`, no backtracking; the method
 is dispatched on its first byte rather than tried against 40 `attempt`-wrapped alternatives.
 
-Body framing is **Content-Length only** here; chunked transfer and `Expect: 100-continue` are follow-ups, and the
-header limits are not yet enforced.
+Body framing is `Content-Length` and chunked transfer; the machine answers `Expect: 100-continue` itself
+when `Limits.autoContinue` is set, and header-line and buffered-body limits are enforced from `Limits`.
 -/
 
 namespace LeanIn.Http.H1
