@@ -85,6 +85,8 @@
               # headers (`dev`) and the shared object (`out`) reach the compiler and the linker.
               pkgs.libuv
               pkgs.libuv.dev
+              pkgs.liburing
+              pkgs.liburing.dev
               # The profiler, for the one question it answers: `callgrind` counts instructions, so it says where a
               # request's CPU goes without the I/O waits a wall-clock run is dominated by. In the shell rather than
               # fetched ad hoc, so a profile in `docs/PERFORMANCE.md` is reproducible as printed.
@@ -93,6 +95,11 @@
             ];
 
             shellHook = ''
+              # liburing is linked by the executable's own clang invocation, which does not consume
+              # NIX_LDFLAGS; LIBRARY_PATH is what its linker driver searches for -luring.
+              export LIBRARY_PATH="${pkgs.liburing}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.liburing}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
               # A function beats a PATH entry, so an exported `lean`/`lake` function
               # inherited from the caller's environment would shadow the wrappers, in
               # this shell and in every child shell that re-imports it.

@@ -29,14 +29,17 @@ theory that verify them. It imports nothing from `LeanIn/Examples/` or `LeanIn/E
 `lake build` produces it and no store path appears in any build flag. Lake traces the source, so editing the C
 rebuilds the object and relinks everything that uses it. -/
 extern_lib netuv pkg := do
-  let srcJob ← inputFile (pkg.dir / "c" / "netuv.c") true
+  let shim ← match (← IO.getEnv "LEANIN_SHIM") with
+    | some "uring" => pure "neturing.c"
+    | _ => pure "netuv.c"
+  let srcJob ← inputFile (pkg.dir / "c" / shim) true
   let oJob ← buildO (pkg.buildDir / "c" / "netuv.o") srcJob
     #["-fPIC", s!"-I{← getLeanIncludeDir}"] #["-O2"]
   buildStaticLib (pkg.buildDir / "lib" / nameToStaticLib "netuv") #[oJob]
 
 /-- Link arguments for the socket layer: the shim Lake builds above (at the package's own build directory), and
 the `libuv` it wraps, which stays a system dependency -- `uv.h` and `-luv` are needed to link it at all. -/
-def netuvLinkArgs : Array String := #["-L", ".lake/build/lib", "-lnetuv", "-luv"]
+def netuvLinkArgs : Array String := #["-L", ".lake/build/lib", "-lnetuv", "-luv", "-luring"]
 
 /- The library is the only default target, and that is deliberate. Every executable of this package links the
 socket shim, so building **any** of them needs `libuv` -- a bare `lake build` is what a registry and a
@@ -64,7 +67,9 @@ lean_exe stdServer where
   root := `LeanIn.Exe.StdServer
   moreLinkArgs := #["-luv"]
 
-lean_exe hello where root := `LeanIn.Exe.Hello
+lean_exe hello where
+  root := `LeanIn.Exe.Hello
+  moreLinkArgs := netuvLinkArgs
 
 lean_exe asyncRelay where
   root := `LeanIn.Exe.AsyncRelay
