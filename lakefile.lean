@@ -2,7 +2,7 @@ import Lake
 open System Lake DSL
 
 package leanin where
-  version := v!"0.1.0"
+  version := v!"0.2.0"
   description := "A concurrency runtime and work-stealing scheduler for Lean 4: Tokio's algorithms, an async that compiles to data rather than closures, and machine-checked proofs for the properties that matter."
   keywords := #["concurrency", "scheduler", "async", "runtime", "software-verification", "ffi"]
   license := "Apache-2.0"
@@ -69,6 +69,10 @@ lean_exe stdServer where
   moreLinkArgs := #["-luv"]
 
 lean_exe hello where root := `LeanIn.Exe.Hello
+
+lean_exe asyncRelay where
+  root := `LeanIn.Exe.AsyncRelay
+  moreLinkArgs := netuvLinkArgs
 
 lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 

@@ -37,8 +37,8 @@ Grammar:
 
 Effects this cut resumes: `Io.recvRaw` (the byte payload continues on `.ok (some …)`; an end of stream or a
 failure closes), `Io.recvTimeoutRaw` (the full race outcome is delivered: `none` stalled, `some (.ok …)` read,
-`some (.error …)` failed), `Io.sendAllRaw`/`Io.sendRaw` (the `Except` is delivered when the result is bound; an
-unbound write failure closes), `Io.closeRaw`, `VM.runAsync` (a sub-computation's result is delivered to the
+`some (.error …)` failed), `Io.sendAllRaw`/`Io.sendRaw` (the `Except` is delivered to a bound result; an
+unbound result discards it and the continuation still runs), `Io.closeRaw`, `VM.runAsync` (a sub-computation's result is delivered to the
 bind), and **machine calls**: any `*.run` application suspends on the callee, whose `run` must declare its
 continuation last — an `onDone`-style parameter the callee invokes with its result; the generator fills that
 slot with the caller's continuation, so a machine awaiting a machine is a raw resume and **no cell**, exactly
@@ -226,9 +226,9 @@ private meta partial def piShape (e : Lean.Expr) : Nat × Bool :=
 
 /-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
 private inductive Eff where
-  | recv                        -- `Io.recvRaw c _` → `some` ByteArray continues / `none` closes
-  | stallRead (deadline : Term) (size : Term)  -- `Io.recvStallRaw c d sz` → the same race, swept
-  | recvTimeout (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
+  | recv (conn : Term) (size : Option Term)  -- `Io.recvRaw c [sz]` → `some` ByteArray continues / `none` closes
+  | stallRead (conn : Term) (deadline : Term) (size : Term)  -- `Io.recvStallRaw c d sz` → the same race, swept
+  | recvTimeout (conn : Term) (sched : Term) (deadline : Term) (size : Term)  -- `Io.recvTimeoutRaw c sched d sz` → `Option (Option ByteArray)`
   | sleep (sched : Term) (deadline : Term)  -- `Io.sleepRaw sched d` → `Unit`
   | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
   | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's `onDone` payload
@@ -238,9 +238,9 @@ private inductive Eff where
   | resolve (cell : Term) (v : Term)  -- `RawCell.resolve cell v` → first-wins resolution
   | select (h0 : Term) (h1 : Term)  -- `VM.selectRaw h0 h1` → the winning index and value
   | accept (l : Term) (push : Term)  -- `Io.acceptRaw l push` → the accepted connection (or an error)
-  | sendAll (data : Term)
-  | send (data : Term)
-  | close
+  | sendAll (conn : Term) (data : Term)
+  | send (conn : Term) (data : Term)
+  | close (conn : Term)
   | unknown
 
 /-- Strip a `Term.paren` wrapper: `(e)` becomes `e`. -/
@@ -249,8 +249,8 @@ private meta partial def unparen (s : Syntax) : Syntax :=
 
 private meta def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   match unparen e with
-  | `(LeanIn.Runtime.Io.recvStallRaw $_ $d $z) => pure (.stallRead ⟨d⟩ ⟨z⟩)
-  | `(LeanIn.Runtime.Io.recvTimeoutRaw $_ $s $d $z) => pure (.recvTimeout ⟨s⟩ ⟨d⟩ ⟨z⟩)
+  | `(LeanIn.Runtime.Io.recvStallRaw $c $d $z) => pure (.stallRead ⟨c⟩ ⟨d⟩ ⟨z⟩)
+  | `(LeanIn.Runtime.Io.recvTimeoutRaw $c $s $d $z) => pure (.recvTimeout ⟨c⟩ ⟨s⟩ ⟨d⟩ ⟨z⟩)
   | `(LeanIn.Runtime.Io.sleepRaw $s $d) => pure (.sleep ⟨s⟩ ⟨d⟩)
   | `(LeanIn.Runtime.VM.runAsync $m) => pure (.runVM ⟨m⟩)
   | `(LeanIn.Runtime.selectRaw $a $b) => pure (.select ⟨a⟩ ⟨b⟩)
@@ -258,11 +258,11 @@ private meta def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
   | `(LeanIn.Runtime.RawCell.await $h) => pure (.join ⟨h⟩)
   | `(LeanIn.Runtime.RawCell.new) => pure .newCell
   | `(LeanIn.Runtime.RawCell.resolve $cell $v) => pure (.resolve ⟨cell⟩ ⟨v⟩)
-  | `(LeanIn.Runtime.Io.recvRaw $_ $_) => pure .recv
-  | `(LeanIn.Runtime.Io.recvRaw $_) => pure .recv
-  | `(LeanIn.Runtime.Io.sendAllRaw $_ $d) => pure (.sendAll ⟨d⟩)
-  | `(LeanIn.Runtime.Io.sendRaw $_ $d) => pure (.send ⟨d⟩)
-  | `(LeanIn.Runtime.Io.closeRaw $_) => pure .close
+  | `(LeanIn.Runtime.Io.recvRaw $c $z) => pure (.recv ⟨c⟩ (some ⟨z⟩))
+  | `(LeanIn.Runtime.Io.recvRaw $c) => pure (.recv ⟨c⟩ none)
+  | `(LeanIn.Runtime.Io.sendAllRaw $c $d) => pure (.sendAll ⟨c⟩ ⟨d⟩)
+  | `(LeanIn.Runtime.Io.sendRaw $c $d) => pure (.send ⟨c⟩ ⟨d⟩)
+  | `(LeanIn.Runtime.Io.closeRaw $c) => pure (.close ⟨c⟩)
   -- A machine call: any `*.run` application — but only a machine's: the name must resolve to a declaration
   -- beside a generated `.St`, its ordinary arguments must be complete (the continuation is the one
   -- parameter the generator fills, last), and that last parameter must be a function.
@@ -343,7 +343,7 @@ where
   | .await _ _ e => do
     let eff ← classify ctx e
     pure (match eff with
-     | .sendAll d | .send d => d.raw.isIdent && d.raw.getId == f
+     | .sendAll _ d | .send _ d => d.raw.isIdent && d.raw.getId == f
      | _ => false)
   | .if_ _ t e => do
     if (← usesSendArg ctx f t) then pure true else usesSendArg ctx f e
@@ -380,7 +380,7 @@ where
   | .await _ _ e => do
     let eff ← classify ctx e
     pure (match eff with
-     | .sendAll d | .send d =>
+     | .sendAll _ d | .send _ d =>
        (match d.raw[0]? with
         | some a => a.isAtom && a.getAtomVal == "#[" && containsName f d.raw
         | none => false)
@@ -461,7 +461,7 @@ private meta def recurseTerm (ctx : Ctx) : MacroM Term :=
 /-- The binding an effect's result variable gets. -/
 private meta def resultBind (eff : Eff) : Bind :=
   match eff with
-  | .recv => .recvRes
+  | .recv .. => .recvRes
   | .recvTimeout .. => .recvTimeoutRes
   | .stallRead .. => .recvTimeoutRes
   | .sendAll .. | .send .. => .sendRes
@@ -473,14 +473,13 @@ applies to the binder itself, so a mismatched ascription fails at elaboration wh
 later state or not — the alternative is that a dead binding's ascription silently disappears. -/
 private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : Option Term)
     (cont : Term) : MacroM Term := do
-  let c := mkIdent ctx.conn
   -- A binder carrying the source ascription when there is one.
   let annot (bv : Name) : MacroM Term :=
     match ty? with
     | some t => `(fun ($(mkIdent bv) : $t) => $cont)
     | none => `(fun $(mkIdent bv) => $cont)
   match eff with
-  | .recv =>
+  | .recv conn size =>
     let bv := bnd.getD `bs
     -- Cleanup ownership is single on every failure path. A *completion* failure is closed by the loop
     -- (`readDone` and `opDone` close after the raw callback and raise if the shim refuses), and a *submission
@@ -494,18 +493,21 @@ private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : 
       | some t => `(let _ : $t := $(mkIdent bv); $cont)
       | none => pure cont
     let body ← checked
-    `(LeanIn.Runtime.Io.recvRaw $c 65536 (fun
+    let read ← match size with
+      | some z => `(LeanIn.Runtime.Io.recvRaw $conn $z)
+      | none => `(LeanIn.Runtime.Io.recvRaw $conn)
+    `($read (fun
         | .ok (some $(mkIdent bv)) => $body
-        | .ok none => LeanIn.Runtime.Io.closeAfterFailure $c
+        | .ok none => LeanIn.Runtime.Io.closeAfterFailure $conn
         | .error _ => pure ()))
-  | .stallRead d z =>
+  | .stallRead conn d z =>
     let bv := bnd.getD `r
     let k ← annot bv
-    `(LeanIn.Runtime.Io.recvStallRaw $c $d $z $k)
-  | .recvTimeout sched d z =>
+    `(LeanIn.Runtime.Io.recvStallRaw $conn $d $z $k)
+  | .recvTimeout conn sched d z =>
     let bv := bnd.getD `r
     let k ← annot bv
-    `(LeanIn.Runtime.Io.recvTimeoutRaw $c $sched $d $z $k)
+    `(LeanIn.Runtime.Io.recvTimeoutRaw $conn $sched $d $z $k)
   | .sleep sched d =>
     -- The resume takes no argument; a bound sleep result is `()`, bound in the continuation so a
     -- `let u := await (sleepRaw …)` has its name in scope (`u : Unit`; an ascription to another type is a
@@ -560,27 +562,23 @@ private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : 
     let bv := bnd.getD `c
     let k ← annot bv
     `(LeanIn.Runtime.Io.acceptRaw $l $push $k)
-  -- A failed write ends the connection rather than continuing as if the bytes were sent — unless the body
-  -- bound the effect's result (`let r := await …`), in which case the whole `Except` is delivered and the
-  -- body owns the outcome.
-  | .sendAll d =>
+  -- A write's failure policy is the same whether its result is bound or discarded: the operation returns its
+  -- `Except`, and an unbound result simply discards it. Binding the result is the only way to inspect the
+  -- failure; it does not change whether the continuation runs. The receiver is the one the author named.
+  | .sendAll conn d =>
     match bnd with
     | some bv =>
       let k ← annot bv
-      `(LeanIn.Runtime.Io.sendAllRaw $c $d $k)
+      `(LeanIn.Runtime.Io.sendAllRaw $conn $d $k)
     | none =>
-      `(LeanIn.Runtime.Io.sendAllRaw $c $d (fun
-          | .ok _ => $cont
-          | .error _ => pure ()))
-  | .send d =>
+      `(LeanIn.Runtime.Io.sendAllRaw $conn $d (fun _ => $cont))
+  | .send conn d =>
     match bnd with
     | some bv =>
       let k ← annot bv
-      `(LeanIn.Runtime.Io.sendRaw $c $d $k)
+      `(LeanIn.Runtime.Io.sendRaw $conn $d $k)
     | none =>
-      `(LeanIn.Runtime.Io.sendRaw $c $d (fun
-          | .ok _ => $cont
-          | .error _ => pure ()))
+      `(LeanIn.Runtime.Io.sendRaw $conn $d (fun _ => $cont))
   | _ => Macro.throwError "async: unsupported effect"
 
 /-- Whether a path's last item is a terminal — `recurse`, `break`, `continue`, `halt`, or a close — so
@@ -594,7 +592,7 @@ private meta partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM B
   | some .halt => pure true
   | some (.await _ _ e) => do
     let eff ← classify ctx e
-    pure (match eff with | .close => true | _ => false)
+    pure (match eff with | .close _ => true | _ => false)
   -- A close may be followed by a pure tail, so the check looks past pure items for the terminal.
   | some (.pureStmt _) | some (.pureBind ..) => endsTerminal ctx items.dropLast
   | _ => pure false
@@ -654,16 +652,16 @@ private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : Li
     `($(⟨e⟩) >>= fun _ => $inner)
   | .await bnd ty? e :: rest => do
     match (← classify ctx e) with
-    | .close => do
+    | .close conn => do
       let tail ← closeTail rest
       match bnd, ty? with
       | some bv, some t =>
-        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun ($(mkIdent bv) : $t) => $tail)
+        `(LeanIn.Runtime.Io.closeRaw $conn >>= fun ($(mkIdent bv) : $t) => $tail)
       | some bv, none =>
-        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun $(mkIdent bv) => $tail)
+        `(LeanIn.Runtime.Io.closeRaw $conn >>= fun $(mkIdent bv) => $tail)
       -- An unbound close has no outcome channel, so a refusal is loud instead of silently unclosed.
       | none, _ =>
-        `(LeanIn.Runtime.Io.closeRaw $(mkIdent ctx.conn) >>= fun accepted =>
+        `(LeanIn.Runtime.Io.closeRaw $conn >>= fun accepted =>
           if accepted then $tail
           else throw (IO.userError "async: the loop refused the connection's close submission"))
     | .unknown => Macro.throwError "async: unsupported effect in await"

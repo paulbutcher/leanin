@@ -26,8 +26,8 @@ def helloKeepResponse : ByteArray :=
   "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".toUTF8
 
 -- One connection's work: read the request, answer, close, and report the close. The write is deliberately
--- unbound: the compiler's policy for an unbound send is to close the connection when it fails, which is this
--- example's boundary handling — a failed write ends that connection and reaches no other connection.
+-- unbound: its `Except` is discarded, and a failed write's connection is closed by the loop, so the following
+-- close sees the failure at that operation; no other connection is affected.
 async helloConn (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit) := do
   let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
   await (LeanIn.Runtime.Io.sendAllRaw c #[helloResponse])

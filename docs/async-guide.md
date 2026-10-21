@@ -111,8 +111,10 @@ open:
   arrive) is closed by the primitive that made the submission, which raises if the close is refused too;
 - an **end of stream** is closed by the machine, which raises if the close is refused.
 
-An unbound effect's error arm therefore does nothing: its failure is already owned. A bound effect hands the
-`Except` to the body, whose path ends at that effect — the same owners apply.
+A send returns its `Except IO.Error Unit` whether or not the body binds it: an unbound send discards the value
+and continues, so binding changes what the body can inspect, not whether the path ends. The cleanup owners
+above are unchanged; a failed send leaves the connection closed by the loop, and the next operation on it
+fails at that operation.
 
 ## What fails loudly
 
@@ -145,8 +147,8 @@ nix develop -c bash tests/async-diagnostics.sh
 - The single-carrier driver runs the accept loop, the connection's effects and its resumes on one thread; a
   multi-carrier entry is not wired in the shipped executables.
 - A spawned handler's outcome is not supervised by the example's loop (the handle is discarded): each
-  connection's failure is handled at that connection's own boundary — an unbound send closes on failure — and
-  reaches no other connection. A loop that must observe its children awaits their handles; a child that can
+  connection's failure is handled at that connection's own boundary — an unbound send discards its failure result and does not
+  end the path (the loop still closes the failed connection) — and reaches no other connection. A loop that must observe its children awaits their handles; a child that can
   end without resolving one (an end of stream before its continuation is reached) makes that wait unbounded,
   which is why this loop does not.
 - The example has no graceful-stop path: the accept loop runs until the process is stopped, and a signal ends

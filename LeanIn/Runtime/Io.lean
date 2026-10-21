@@ -109,7 +109,7 @@ fired timer's continuation is in the executor's inject) and must harvest socket 
 
 /-- The bytes accumulated on connection `idx`, clearing them. The loop thread's alone: it is called where a
 completion's bytes are still that connection's, before the next read on it can start. -/
-@[extern "np_uv_take"] opaque npUvTake (idx : UInt32) : IO ByteArray
+@[extern "np_uv_take"] opaque npUvTake (idx n : UInt32) : IO ByteArray
 
 /-- Ask the loop to stop and drain. Callable from any thread; the loop thread does the closing. -/
 @[extern "np_uv_stop"] opaque npUvStop : IO Unit
@@ -395,7 +395,7 @@ private def readDone (loop : Std.Mutex Table) (idx : UInt32) (n : Int) : IO Unit
     if (← npUvClose idx) == 0 then
       throw (IO.userError "Io: the shim refused to close a read-broken connection")
   else
-    let bytes ← npUvTake idx
+    let bytes ← npUvTake idx (UInt32.ofNat n.toNat)
     match taken? with
     | some p =>
       Task.Join.resolveFirst p.cell p.push (.ok (.read (if n == 0 then none else some bytes)))

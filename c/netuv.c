@@ -14,7 +14,7 @@
  *                            returns 1 while the loop has anything left to do and 0 once it is stopped and
  *                            drained, which is the loop thread's exit condition
  *   np_uv_events()           drain the event queue: (kind, conn, arg) triples, flat in one Array
- *   np_uv_take(idx)          the bytes accumulated on that connection, clearing them
+ *   np_uv_take(idx, n)       the first `n` bytes accumulated on that connection, leaving the rest queued
  *   np_uv_read(idx, size)    begin one read, holding the read to at most `size` bytes
  *   np_uv_write(idx, bytes)  one write, copying the bytes into memory the write request owns
  *   np_uv_shutdown(idx)      uv_shutdown, then close the handle on its completion, then report it
@@ -417,8 +417,13 @@ static void alloc_cb(uv_handle_t *h, size_t suggested, uv_buf_t *out) {
 static void deliver_read(conn_t *c) {
   if (!c->pending) return;
   if (c->len > 0) {
+    /* The submitted size caps what one read returns, including bytes already buffered from an earlier read. The
+       rest stays in the connection's buffer for the next submission; handing back all of it would make a read
+       size advisory and let a caller that asked for seven bytes receive ten. */
+    size_t n = c->len;
+    if (c->want != 0 && n > c->want) n = c->want;
     c->pending = 0; c->want = 0;
-    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)c->len);
+    push_ev(EV_READ, (uint64_t)c->idx, (uint64_t)n);
     return;
   }
   if (c->eof) {
@@ -746,13 +751,17 @@ LEAN_EXPORT lean_object *np_uv_events(void) {
   return lean_io_result_mk_ok(arr);
 }
 
-LEAN_EXPORT lean_object *np_uv_take(uint32_t idx) {
+LEAN_EXPORT lean_object *np_uv_take(uint32_t idx, uint64_t count) {
   conn_t *c = (idx < MAX_CONN) ? &g_conns[idx] : NULL;
   size_t n = (c != NULL && c->used) ? c->len : 0;
+  if (count < n) n = (size_t)count;
   lean_object *arr = lean_alloc_sarray(1, n, n);
   if (n > 0) memcpy(lean_sarray_cptr(arr), c->buf, n);
   if (c != NULL) {
-    c->len = 0;
+    /* The completion names one read's bytes; anything after them was read with no consumer waiting and stays
+       queued for the next submission. */
+    if (n > 0 && n < c->len) memmove(c->buf, c->buf + n, c->len - n);
+    c->len -= n;
     c->want = 0;
     if (c->used && !c->reading && !c->eof && !c->rerr) {
       if (uv_read_start((uv_stream_t *)&c->handle, alloc_cb, on_read) == 0) c->reading = 1;
