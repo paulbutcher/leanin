@@ -23,11 +23,9 @@ The result-bearing form is the authoring contract; the callback form is the inte
 through, and is still what a machine-to-machine call names.
 
 ```lean
-async def hello (c : LeanIn.Runtime.Conn) : Unit := do
-  let req := await (LeanIn.Runtime.Io.recvRaw c 65536)
-  await (LeanIn.Runtime.Io.sendAllRaw c #[response])
-  let closed := await (LeanIn.Runtime.Io.closeRaw c)
-  if closed then return () else throw (IO.userError "hello: the loop refused the close")
+async def readSeven (src : LeanIn.Runtime.Conn) : ByteArray := do
+  let chunk := await (LeanIn.Runtime.Io.recvRaw src 7)
+  return chunk
 ```
 
 The internal completion parameter is generated, not authored. In callback form it is explicit:
