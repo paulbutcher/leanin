@@ -78,6 +78,10 @@ lean_exe multiCarrier where
   root := `LeanIn.Exe.MultiCarrier
   moreLinkArgs := netuvLinkArgs
 
+lean_exe compatProbe where
+  root := `LeanIn.Exe.CompatProbe
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe h1Target where
   root := `LeanIn.Exe.H1Target
 

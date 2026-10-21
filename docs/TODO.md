@@ -75,11 +75,15 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 
 ## P3 — compatibility and release
 
-- [ ] **Stock `Std.Http.Server.Handler` adapter in LeanIn.** Blocked on the stock API: the handler
-  needs a `Std.Http.Request Std.Http.Body.Stream`, but `Body.Stream`'s constructor is private and the
-  only public operations are `recv`/`close`; there is no public way to build one over our
-  `BodyReader`. `Routing.Compat` is no longer in this tree. Needs an upstream constructor or an
-  explicitly accepted dependency on stock internals.
+- [x] **Stock `Std.Http.Server.Handler` adapter in LeanIn.** `LeanIn.Http.Compat.ofStock` runs a
+  stock handler as a LeanIn buffered handler. It builds the stock `Body.Stream` through the public
+  `Std.Http.Body.stream`/`Stream.send`, maps the H1 head and headers to stock types, drains the
+  stock response body through `Std.Http.Body`, and maps the status back with `Status.toCode`.
+  - Scope: the request body is the already-buffered LeanIn body, and the stock handler is run with
+    `Std.Async.Async.block`, so it blocks the calling carrier while suspended. LeanIn's
+    `StreamHandler` remains the streaming path.
+  - Evidence: `bash tests/compat-handler.sh` (a stock echo handler reads the body, adds a header,
+    and the adapter returns status 200, `body=hello`, `x-stock=yes`).
 - [ ] **Release the lifecycle work.** The package version is now `0.6.0`; the deadline, scope,
   timer cancellation, streaming bound and multi-carrier serving are in it. The annotated tag is
   deliberately deferred until the branch is merged, so it cannot point at an unmerged commit.

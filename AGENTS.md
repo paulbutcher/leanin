@@ -62,6 +62,8 @@
   count=8` answers every connection and exits). The server check uses a unique port and a finite
   batch; `waitFinished` must not park on the carriers' condition variable, or `notifyOne` can wake
   the caller instead of a worker.
+- The stock-handler adapter has a pure check: `nix develop -c bash tests/compat-handler.sh`
+  (a stock handler reads the buffered body, adds a header, and the adapter maps its response).
 - The H1 target views have a pure check: `nix develop -c bash tests/h1-target.sh`
   (`H1.Head.path?`/`query?` decode percent escapes and reject a malformed one).
 - Put externally observable executor scenarios in
