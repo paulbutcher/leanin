@@ -180,6 +180,10 @@ After semantic checks pass, measure representative workloads to ensure the autho
 
 ## Implementation status (2026-10-21)
 
+Released as `v0.3.0`: one declaration form (`async def … : T`), compiler-owned completion through
+`Completion`, delivered `throw`, machine-to-machine result calls, and the callback syntax removed after the
+migration. `v0.2.0` carried the earlier operand, send-policy and shim fixes.
+
 Resolved in `v0.2.0` (`edaa99a`):
 
 - Raw effects carry the authored receiver and read size through classification and lowering; `async-operands.sh`
