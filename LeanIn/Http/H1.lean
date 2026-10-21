@@ -138,6 +138,9 @@ structure Limits where
   maxMessages : Nat := 100
   /-- The most request-body bytes buffered before the request is rejected with 413. -/
   maxBody : Nat := 1048576
+  /-- Whether the machine writes `100 Continue` itself. A server with a continue policy (routing's
+  `onContinue`) turns this off and sends the interim response through the writer instead. -/
+  autoContinue : Bool := true
 deriving Inhabited
 
 /-- The result of trying to parse a head from a buffer at a position. -/
@@ -470,7 +473,8 @@ def step (m : Machine) : Machine × StepResult :=
         failBody m .bodyTooLarge
       else
         let bodyDone := !chunked && cl == 0
-        let interim := if expectsContinue head && !bodyDone then m.out.push continueBytes else m.out
+        let interim := if m.limits.autoContinue && expectsContinue head && !bodyDone then
+            m.out.push continueBytes else m.out
         ({ m with head? := some head, pos := rest, bodyRemaining := cl, messageCount := count,
                   chunkState := if chunked then some .sizeLine else none, bodyDone,
                   reqBody := .empty, out := interim,
