@@ -177,3 +177,22 @@ After semantic checks pass, measure representative workloads to ensure the autho
 - [LeanIO native backend, AppM, request scopes](https://github.com/scidonia/leanio/blob/c9adb0102a4899a6b7b36b404eb08149ac576f76/LeanIO/Backend/LeanIn.lean)
 - [LeanIO native authoring examples](https://github.com/scidonia/leanio/blob/c9adb0102a4899a6b7b36b404eb08149ac576f76/LeanIO/Examples/Native.lean)
 - [LeanIO route syntax](https://github.com/scidonia/leanio/blob/c9adb0102a4899a6b7b36b404eb08149ac576f76/LeanIO/Router/Macro.lean)
+
+## Implementation status (2026-10-21)
+
+Resolved in `v0.2.0` (`edaa99a`):
+
+- Raw effects carry the authored receiver and read size through classification and lowering; `async-operands.sh`
+  observes seven bytes read from one of two connections and written to the other.
+- Bound and unbound sends share one policy: the `Except` is returned to a bound result and discarded by an
+  unbound one, and the continuation runs in both cases.
+- `np_uv_take` now consumes exactly the completed byte count, so a submitted read size is honored even when
+  bytes were already buffered by the shim. The previous whole-buffer take made the size advisory at delivery.
+
+Still open from this handoff:
+
+- Result-bearing declarations and compiler-owned completion; `onDone` remains the callable-machine contract.
+- Typed helper lowering / extension rules, destructuring `let`, and the collapsed effect classifier.
+- Result-bearing child handles, explicit scopes, and the cancellation/cleanup/timeout lifetime contract.
+- A dedicated runtime fixture for the send-failure policy (the lowering is shared, but only the compiled server
+  scenario currently exercises a send path).
