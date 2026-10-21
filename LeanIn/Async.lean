@@ -69,6 +69,7 @@ private inductive Item where
   | recurse
   | halt                                         -- `halt` (the machine returns, must end a path)
   | return_ (value : Syntax)                     -- `return e` in a result-bearing declaration
+  | throw_ (error : Syntax)                      -- `throw e`, delivered as `.error` in a result-bearing declaration
   | goto (idx : Nat) (args : List Name)          -- internal: jump to a specific state
   | contStmt (term : Term)                       -- internal: a hoisted continuation
   deriving Inhabited
@@ -121,6 +122,7 @@ private meta partial def parseItem (d : Syntax) : MacroM Item := do
   | `(doElem| recurse) => return .recurse
   | `(doElem| halt) => return .halt
   | `(doElem| return $e:term) => return .return_ e
+  | `(doElem| throw $e:term) => return .throw_ e
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"async: unsupported do-item: {d}"
 end
@@ -173,6 +175,7 @@ where
   | .recurse => []
   | .halt => []
   | .return_ e => usedNames e
+  | .throw_ e => usedNames e
   | .goto _ args => args
   -- A hoisted continuation is a jump term: the fields it passes are used exactly here.
   | .contStmt t => usedNames t
@@ -595,6 +598,7 @@ private meta partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM B
   | some .continue_ => pure true
   | some .halt => pure true
   | some (.return_ _) => pure true
+  | some (.throw_ _) => pure true
   | some (.await _ _ e) => do
     let eff ← classify ctx e
     pure (match eff with | .close _ => true | _ => false)
@@ -641,6 +645,11 @@ private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : Li
     let some done := ctx.done
       | Macro.throwError "async: `return` needs a result-bearing declaration (`async def … : T`)"
     `(($(mkIdent done)) (.ok $(⟨e⟩)) >>= fun _ => pure ())
+  | .throw_ e :: rest => do
+    unless rest.isEmpty do Macro.throwError "async: `throw` must end a path"
+    match ctx.done with
+    | some done => `(($(mkIdent done)) (.error $(⟨e⟩)) >>= fun _ => pure ())
+    | none => `(throw $(⟨e⟩))
   | .contStmt t :: rest => do
     unless rest.isEmpty do Macro.throwError "async: internal continuation marker must end a path"
     pure t

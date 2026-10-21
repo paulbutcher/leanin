@@ -60,8 +60,8 @@ names. The internal `name.run` keeps that parameter last, so a caller that needs
 it; `name.spawn push …` yields a `RawCell (Except IO.Error T)`.
 
 A result-bearing declaration is called from `IO` or from `Runtime.run`; it is **not** yet a classified
-machine-to-machine effect. An uncaught `throw` still escapes the generated step instead of resolving the
-public `EAsync` with `.error`, and a path that never reaches `return` or another terminal never resolves.
+machine-to-machine effect. An uncaught `throw` is delivered as `.error` (and ends the path); a path that never
+reaches `return`, `throw`, or another terminal never resolves.
 
 ```lean
 async def immediate (u : Unit) : Nat := do
@@ -191,8 +191,8 @@ nix develop -c bash tests/async-diagnostics.sh
 - Machine calls take one continuation last; `select` is over two cells of one type (no heterogeneous race).
 - A result-bearing declaration's public `name` is an `EAsync` value, not a classified effect: calling it with
   `await` inside a compiled body is unsupported. Its internal `name.run` is the callback-shaped call.
-- A result-bearing machine resolves on `return` only. An uncaught `throw` escapes rather than resolving the
-  `EAsync` with `.error`; use the callback form when an error terminal must be delivered explicitly.
+- A result-bearing machine resolves on `return` or `throw`. A `throw` becomes `.error` on the public
+  `EAsync`; it is not a catchable local exception in this compiled subset.
 - A running handler is not cancelled by a scope of its own: closing a connection ends the I/O but not a
   suspended computation. A **peer-I/O failure** does end the request: a failed body read, a stall, a peer close
   mid-body or a failed response send is a VM abort, which the streaming driver's `requestScope` turns into an
