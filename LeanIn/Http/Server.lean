@@ -248,9 +248,23 @@ structure BodyState where
   done : Bool := true
   /-- Bytes after the body's end: a pipelined next request, handed back to the machine. -/
   leftover : ByteArray := .empty
+  /-- Body bytes already handed to the handler. -/
+  seen : Nat := 0
+  /-- The most body bytes this reader will hand over. -/
+  limit : Nat := 1048576
+  /-- A declared `Content-Length` already over the limit: fail on the first read. -/
+  tooLarge : Bool := false
 deriving Inhabited
 
-/-- A request body as the handler sees it: `recv n` returns at most `n` bytes, then `none` at the end. A
+/-- The error a body read raises when the request exceeds `Config.h1.maxBody`. The stream driver maps it
+to `413 Payload Too Large` rather than its generic 500. -/
+def bodyTooLarge : IO.Error := .userError "Http: request body exceeds maxBody"
+
+/-- Whether a handler's failure is the body-limit error. -/
+def isBodyTooLarge (e : IO.Error) : Bool := e.toString == bodyTooLarge.toString
+
+/-- A request body as the handler sees it: `recv n` returns at most `n` bytes, then `none` at the end. The
+reader enforces `Config.h1.maxBody` itself, so `readAll` cannot grow past the configured ceiling. A
 transport failure, a stall or the peer closing mid-body **aborts**: the handler's `try`/`VM.attempt` cannot see
 it, so a peer that disconnects mid-body ends the connection rather than looking like an EOF or an application
 error the handler could answer. -/
@@ -332,6 +346,7 @@ def liftSet {α : Type} (r : IO.Ref α) (a : α) : VM Unit := monadLift (r.set a
 partial def recvSome (st : IO.Ref BodyState) (c : Conn) (clock : Clock)
     (stall : Std.Time.Millisecond.Offset) (n : Nat) : VM (Option ByteArray) := do
   let s ← (liftGet st)
+  if s.tooLarge then throw bodyTooLarge
   if s.done then
     liftSet st { s with leftover := s.buf.extract s.pos s.buf.size }
     return none
@@ -351,7 +366,8 @@ partial def recvSome (st : IO.Ref BodyState) (c : Conn) (clock : Clock)
     let rem' := rem - k
     let done := rem' == 0
     let leftover := if done then s.buf.extract (s.pos + k) s.buf.size else .empty
-    liftSet st { s with pos := s.pos + k, remaining := some rem', done, leftover }
+    if s.seen + k > s.limit then throw bodyTooLarge
+    liftSet st { s with pos := s.pos + k, remaining := some rem', done, leftover, seen := s.seen + k }
     return some data
   else match s.chunk with
   | some H1.ChunkState.sizeLine =>
@@ -390,8 +406,9 @@ partial def recvSome (st : IO.Ref BodyState) (c : Conn) (clock : Clock)
       let k := min (min n rem) avail
       let data := s.buf.extract s.pos (s.pos + k)
       let rem' := rem - k
-      let st' := if rem' == 0 then { s with pos := s.pos + k, chunk := some .dataCRLF }
-                 else { s with pos := s.pos + k, chunk := some (.data rem') }
+      if s.seen + k > s.limit then throw bodyTooLarge
+      let st' := if rem' == 0 then { s with pos := s.pos + k, chunk := some .dataCRLF, seen := s.seen + k }
+                 else { s with pos := s.pos + k, chunk := some (.data rem'), seen := s.seen + k }
       liftSet st st'
       return some data
   | some .dataCRLF =>
@@ -434,13 +451,15 @@ partial def recvSome (st : IO.Ref BodyState) (c : Conn) (clock : Clock)
 
 /-- Build the reader for a head and the bytes already buffered behind it. -/
 def bodyReader (head : H1.Head) (initial : ByteArray) (c : Conn) (clock : Clock)
-    (stall : Std.Time.Millisecond.Offset) : IO BodyReader := do
+    (stall : Std.Time.Millisecond.Offset) (limit : Nat) : IO BodyReader := do
   let chunked := H1.chunked? head
   let cl := if chunked then 0 else (H1.contentLength? head.buf head.headers).getD 0
   let st ← IO.mkRef ({ buf := initial
                        remaining := if chunked then none else some cl
                        chunk := if chunked then some .sizeLine else none
-                       done := !chunked && cl == 0 } : BodyState)
+                       done := !chunked && cl == 0
+                       limit
+                       tooLarge := !chunked && cl > limit } : BodyState)
   let peer ← LeanIn.Runtime.peerAddr c
   return {
     peer
@@ -556,13 +575,25 @@ async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Stream
     let initial : ByteArray := req.2
     let answered : Outcome (Bool × ByteArray × (Bool × Bool × Bool)) :=
       await (LeanIn.Runtime.VM.runAsync (VM.requestScope (do
-      let reader ← (monadLift (Stream.bodyReader head initial c cfg.clock cfg.stallTimeout) : VM BodyReader)
+      let reader ← (monadLift (Stream.bodyReader head initial c cfg.clock cfg.stallTimeout cfg.h1.maxBody) : VM BodyReader)
       let writer ← (monadLift (Stream.responseWriter c head.version machine.keepAlive) : VM ResponseWriter)
+      let chunked := H1.chunked? head
+      let declared := if chunked then 0 else (H1.contentLength? head.buf head.headers).getD 0
+      if !chunked && declared > cfg.h1.maxBody then
+        -- The head is the only place the driver learns the size before the handler writes; rejecting here
+        -- means the 413 is not sent after a handler has already begun its response.
+        Stream.respond writer { status := 413, reason := "Payload Too Large" } "".toUTF8
+        let st ← writer.status
+        return (false, ByteArray.empty, st)
       try
         handler head reader writer
       catch e =>
         let st ← writer.status
-        if !st.1 then Stream.respond writer { status := 500, reason := "Internal Server Error" } "".toUTF8
+        if !st.1 then
+          if isBodyTooLarge e then
+            Stream.respond writer { status := 413, reason := "Payload Too Large" } "".toUTF8
+          else
+            Stream.respond writer { status := 500, reason := "Internal Server Error" } "".toUTF8
         throw e
       let drained ← reader.drained
       let left ← reader.leftover

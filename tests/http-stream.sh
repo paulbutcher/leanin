@@ -118,6 +118,13 @@ check("2 MiB streamed", "200 OK" in head and body == payload and how == "ok",
       f"{head!r} len={len(body)} {how}")
 s.close()
 
+# A declared body over the configured ceiling is rejected with 413 before it is read.
+s = connect()
+s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5242880\r\n\r\n")
+head, rest = recv_head(s)
+check("413 over limit", "413" in head and "Payload Too Large" in head, f"{head!r}")
+s.close()
+
 # A client that dies mid-body does not take the server down.
 s = connect()
 s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nshort")

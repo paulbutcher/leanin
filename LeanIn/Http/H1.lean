@@ -136,7 +136,8 @@ structure Limits where
   maxHeaders : Nat := 100
   /-- The most messages one connection may serve before keep-alive is dropped. -/
   maxMessages : Nat := 100
-  /-- The most request-body bytes buffered before the request is rejected with 413. -/
+  /-- The most request-body bytes accepted. The buffered driver rejects a larger body with 413
+  before buffering it; the streaming body reader enforces the same bound on delivered bytes. -/
   maxBody : Nat := 1048576
   /-- Whether the machine writes `100 Continue` itself. A server with a continue policy (routing's
   `onContinue`) turns this off and sends the interim response through the writer instead. -/
