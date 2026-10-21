@@ -5,7 +5,9 @@ event loop. Every `await` on a classified effect becomes a suspension: the machi
 holding its live values, the effect parks, and the completion resumes the state on a carrier. Nothing here
 needs a stock `Task`, a `Std.Http.Server` connection loop, or a continuation-passing rewrite by hand.
 
-This page names what compiles, what fails loudly, and what the limits are. Every command below was run.
+This page describes the compiled surface in LeanIn `v0.2.0`, names what compiles, what fails loudly, and what
+the limits are. The assessment of that surface, and the items still open, is
+[`notes/LeanIn_Authoring_Surface_Handoff.md`](notes/LeanIn_Authoring_Surface_Handoff.md). Every command below was run.
 
 ## The shape
 
@@ -23,8 +25,12 @@ async hello (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit
   keeps its value across `recurse`; one bound by `let … := await …` advances.
 - A machine ends a path in `recurse` (re-entering with the current fields), `halt`, a close, or a call to
   its continuation. The compiler rejects a path that can fall off the end.
-- Layouts are not observable: `await (LeanIn.Runtime.Io.sendRaw c bs)` discards the outcome, while
-  `let r := await (LeanIn.Runtime.Io.sendRaw c bs)` binds the whole `Except`.
+- The receiver and size written in the `await` are the ones lowered. `await (Io.recvRaw src 7)` reads at most
+  seven bytes from `src`; it is not rewritten to the machine's carried connection or to a default size.
+- A send's result is the `Except IO.Error Unit` in both forms: `let r := await (Io.sendRaw c bs)` binds it,
+  and `await (Io.sendRaw c bs)` discards it and continues. Binding changes what the body can inspect, not
+  whether the path runs.
+- Layouts are otherwise not observable.
 
 ## The effect set
 
