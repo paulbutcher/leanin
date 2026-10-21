@@ -185,7 +185,7 @@ and §4 carries the settled re-run beside it.
 | [`docs/primitive-theory.md`](docs/primitive-theory.md) | What the externs guarantee: axioms, discharge, control tests |
 | [`docs/tokio-map.md`](docs/tokio-map.md) | What we are taking from Tokio, component by component, with line anchors |
 | [`docs/async-vm.md`](docs/async-vm.md) | The defunctionalization approach: raw delivery, `VM`, `async` |
-| [`docs/async-guide.md`](docs/async-guide.md) | Writing a server with `async`: the effect set, the rules, the loud failures, the limits |
+| [`docs/async-guide.md`](docs/async-guide.md) | Writing a server with `async`: result-bearing declarations, the callback integration form, the effect set, the rules, and the limits |
 | [`docs/lean-scheduler.md`](docs/lean-scheduler.md) | The scheduler Lean actually uses today, read out of the runtime source |
 | [`docs/lean-concurrency-today.md`](docs/lean-concurrency-today.md) | What Lean 4.35 already gives you, and the measured gaps |
 | [`docs/reading-list.md`](docs/reading-list.md) | Annotated primary sources for proving scheduler facts, with verification status |
