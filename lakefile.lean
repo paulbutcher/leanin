@@ -78,6 +78,10 @@ lean_exe asyncFailure where
   root := `LeanIn.Exe.AsyncFailure
   moreLinkArgs := netuvLinkArgs
 
+lean_exe asyncResult where
+  root := `LeanIn.Exe.AsyncResult
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 
 lean_exe streamEcho where

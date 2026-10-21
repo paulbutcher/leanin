@@ -32,6 +32,25 @@ async hello (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit → IO Unit
   whether the path runs.
 - Layouts are otherwise not observable.
 
+## Result-bearing declarations
+
+`async def name (c : C) … : T := do …` is the compiler-owned-result form. The public `name` returns
+`Task.EAsync IO.Error T`; `return e` delivers `.ok e` through a generated completion parameter the author never
+names. The internal `name.run` keeps that parameter last, so a caller that needs callback style can still use it.
+
+```lean
+async def immediate (u : Unit) : Nat := do
+  return 42
+
+async def afterTimer (u : Unit) (clock : LeanIn.Runtime.Clock) : Nat := do
+  let slept : Unit := await (LeanIn.Runtime.Io.sleepRaw clock.schedule 5)
+  return 43
+```
+
+`tests/async-result.sh` runs both forms. This cut is the first proposal slice: results and `return` exist, and
+the public call is ordinary typed code. It does not yet provide result-bearing machine-to-machine calls,
+compiler-owned failure delivery for an unhandled `throw`, or the scope API; those remain in the handoff.
+
 ## The effect set
 
 These are the forms that compile. Anything else in `await` position is rejected with

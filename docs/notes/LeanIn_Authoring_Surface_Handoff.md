@@ -191,7 +191,9 @@ Resolved in `v0.2.0` (`edaa99a`):
 
 Still open from this handoff:
 
-- Result-bearing declarations and compiler-owned completion; `onDone` remains the callable-machine contract.
+- Result-bearing declarations and compiler-owned completion: the first slice landed (`async def … : T`,
+  `return`, public `Task.EAsync` entry, `tests/async-result.sh`). `onDone` remains the internal runner
+  parameter; machine-to-machine composition, failure delivery, and scopes are still open.
 - Typed helper lowering / extension rules, destructuring `let`, and the collapsed effect classifier.
 - Result-bearing child handles, explicit scopes, and the cancellation/cleanup/timeout lifetime contract.
 - ~~A dedicated runtime fixture for the send-failure policy~~ — added as `tests/async-failure.sh`: a peer RST

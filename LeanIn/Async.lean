@@ -68,6 +68,7 @@ private inductive Item where
   | continue_                                    -- `continue` (innermost `while`)
   | recurse
   | halt                                         -- `halt` (the machine returns, must end a path)
+  | return_ (value : Syntax)                     -- `return e` in a result-bearing declaration
   | goto (idx : Nat) (args : List Name)          -- internal: jump to a specific state
   | contStmt (term : Term)                       -- internal: a hoisted continuation
   deriving Inhabited
@@ -119,6 +120,7 @@ private meta partial def parseItem (d : Syntax) : MacroM Item := do
   | `(doElem| continue) => return .continue_
   | `(doElem| recurse) => return .recurse
   | `(doElem| halt) => return .halt
+  | `(doElem| return $e:term) => return .return_ e
   | `(doElem| $e:term) => return .pureStmt e
   | _ => Macro.throwError s!"async: unsupported do-item: {d}"
 end
@@ -170,6 +172,7 @@ where
   | .continue_ => []
   | .recurse => []
   | .halt => []
+  | .return_ e => usedNames e
   | .goto _ args => args
   -- A hoisted continuation is a jump term: the fields it passes are used exactly here.
   | .contStmt t => usedNames t
@@ -211,6 +214,7 @@ private structure LoopCtx where
 private structure Ctx where
   name : Name
   conn : Name
+  done : Option Name := none       -- the generated completion parameter, when the declaration has a result
   threaded : List Name          -- the threaded field names (state 0's fields: every parameter)
   paramTys : List (Name × Term) -- every parameter with its signature type (for use-inference)
   env : Lean.Environment        -- the environment at elaboration (machine-runner checks: `.St` lookup)
@@ -590,6 +594,7 @@ private meta partial def endsTerminal (ctx : Ctx) (items : List Item) : MacroM B
   | some .break_ => pure true
   | some .continue_ => pure true
   | some .halt => pure true
+  | some (.return_ _) => pure true
   | some (.await _ _ e) => do
     let eff ← classify ctx e
     pure (match eff with | .close _ => true | _ => false)
@@ -631,6 +636,11 @@ private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : Li
   | .halt :: rest => do
     unless rest.isEmpty do Macro.throwError "async: `halt` must end a path"
     `(pure ())
+  | .return_ e :: rest => do
+    unless rest.isEmpty do Macro.throwError "async: `return` must end a path"
+    let some done := ctx.done
+      | Macro.throwError "async: `return` needs a result-bearing declaration (`async def … : T`)"
+    `(($(mkIdent done)) (.ok $(⟨e⟩)) >>= fun _ => pure ())
   | .contStmt t :: rest => do
     unless rest.isEmpty do Macro.throwError "async: internal continuation marker must end a path"
     pure t
@@ -869,7 +879,7 @@ elab_rules : command
       let spawnn := mkIdent ((n.getId ++ `spawn).eraseMacroScopes)
       let binders ← others.toArray.mapM (fun (x, t) => `(bracketedBinder| ($(mkIdent x) : $t)))
       let ids := others.toArray.map (fun (x, _) => (mkIdent x : Term))
-      let pushId : Term := mkIdent `push
+      let pushId := mkIdent `push
       let body ← `(do
         let cell ← LeanIn.Runtime.RawCell.new
         ($pushId (LeanIn.Task.Item.ofAction
@@ -884,6 +894,89 @@ elab_rules : command
     | _ => pure ()
   | none => pure ()
   -- Provenance: the classifier accepts a machine call only for a tagged runner.
+  modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
+
+/-- `async def name (c : C) (x : T) … : R := do …` — a result-bearing machine. The generated public
+`name` returns `Task.EAsync IO.Error R`; its internal runner keeps the explicit completion parameter, and
+`return e` delivers `.ok e`. -/
+syntax (docComment)? "async " "def " ident " (" ident " : " term ")" bracketedBinder* " : " term " := " doSeq : command
+
+elab_rules : command
+  | `($[$doc?:docComment]? async def $n:ident ( $c:ident : $cty:term ) $params:bracketedBinder* : $res:term := $body:doSeq) => do
+  let threadedInfo ← params.toList.mapM fun p =>
+    match p.raw with
+    | `(bracketedBinder| ( $x:ident : $ty:term )) => pure (x.getId.eraseMacroScopes, (ty : Term))
+    | _ => throwError "async: parameters must be `(x : T)`"
+  let authored := threadedInfo.map (·.1)
+  let doneName := `__asyncDone
+  let doneTy ← `(Except IO.Error $res → IO Unit)
+  let threadedInfo := threadedInfo ++ [(doneName, doneTy)]
+  let threaded := threadedInfo.map (·.1)
+  let items ← Lean.Elab.liftMacroM (parseItems body)
+  let ctx : Ctx := { name := n.getId, conn := c.getId, done := some doneName, threaded := threaded,
+                     paramTys := threadedInfo, env := ← Lean.getEnv, ns := ← Lean.getCurrNamespace }
+  let initScope : List (Name × Bind) := threadedInfo.map (fun (x, ty) => (x, .threaded ty))
+  let s0fields := threadedInfo.map (fun (x, ty) => (x, ty))
+  let compileAct : CompileM Unit := do
+    let bodyT ← compileBody ctx items initScope
+    addState { idx := 0, fields := s0fields, body := bodyT }
+  let ((), (_n, statesRev)) ← Lean.Elab.liftMacroM (compileAct.run (1, []))
+  let allStates := statesRev.reverse
+  let ctors ← allStates.toArray.mapM (fun st => do
+    let binders ← st.fields.toArray.mapM (fun (f, ty) => `(bracketedBinder| ($(mkIdent f) : $ty)))
+    `(Lean.Parser.Command.ctor| | $(stLocalName st.idx):ident $binders*))
+  let sn := mkIdent ((n.getId ++ `St).eraseMacroScopes)
+  let stepn := mkIdent ((n.getId ++ `step).eraseMacroScopes)
+  let runn := mkIdent ((n.getId ++ `run).eraseMacroScopes)
+  let indCmd ← `(inductive $sn:ident where
+    $[$ctors]*)
+  Lean.Elab.Command.elabCommand indCmd
+  let matchAlts ← allStates.toArray.mapM (fun st => do
+    let pats := st.fields.toArray.map (fun (f, _) => (mkIdent f : Term))
+    let cn := stLocalName st.idx
+    let patTerm ← if pats.isEmpty then `(.$cn) else `(.$cn $pats*)
+    `(matchAltExpr| | $patTerm => $(st.body)))
+  let stepCmd ← `(partial def $stepn:ident ($(mkIdent c.getId) : $cty) : $sn → IO Unit :=
+    fun st => match st with
+      $matchAlts:matchAlt*)
+  Lean.Elab.Command.elabCommand stepCmd
+  let tfArgs := threaded.toArray.map (fun x => (mkIdent x : Term))
+  let s0app ← if tfArgs.isEmpty then `($(stIdent n.getId 0)) else `($(stIdent n.getId 0) $tfArgs*)
+  let doneId := mkIdent doneName
+  let runCmd ← `(def $runn:ident ($(mkIdent c.getId) : $cty) $params* ($doneId : $doneTy) : IO Unit :=
+    $stepn $(mkIdent c.getId) $s0app)
+  Lean.Elab.Command.elabCommand runCmd
+  -- The public entry: ordinary parameters, a result, and compiler-owned completion.
+  let authoredArgs := authored.toArray.map (fun x => (mkIdent x : Term))
+  let publicCmd ← `(def $n:ident ($(mkIdent c.getId) : $cty) $params* : LeanIn.Task.EAsync IO.Error $res :=
+    ⟨fun k ctx => $runn $(mkIdent c.getId) $authoredArgs* (fun r => k r ctx)⟩)
+  Lean.Elab.Command.elabCommand publicCmd
+  if let some d := doc? then
+    Lean.Elab.Command.liftTermElabM <| Lean.addDocString n.getId Syntax.missing d
+  -- The spawner, with the completion payload now the authored result.
+  match threadedInfo.getLast? with
+  | some (_, ty) =>
+    match ty.raw with
+    | `($_arg → IO Unit) =>
+      let others := threadedInfo.dropLast
+      let spawnn := mkIdent ((n.getId ++ `spawn).eraseMacroScopes)
+      let binders ← others.toArray.mapM (fun (x, t) => `(bracketedBinder| ($(mkIdent x) : $t)))
+      let ids := others.toArray.map (fun (x, _) => (mkIdent x : Term))
+      let pushId := mkIdent `push
+      let cellName := mkIdent `cell
+      let body ← `(do
+        let $cellName ← LeanIn.Runtime.RawCell.new
+        ($pushId (LeanIn.Task.Item.ofAction
+          ($runn $(mkIdent c.getId) $ids* (fun v => LeanIn.Runtime.RawCell.resolve $cellName v))))
+        pure $cellName)
+      let spawnCmd ← `(def $spawnn:ident
+        ($pushId : LeanIn.Task.Item → BaseIO Unit)
+        ($(mkIdent c.getId) : $cty) $binders* :
+          IO (LeanIn.Runtime.RawCell $_arg) := $body)
+      Lean.Elab.Command.elabCommand spawnCmd
+      modifyEnv fun env => LeanIn.Async.spawnAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `spawn))
+    | _ => pure ()
+  | none => pure ()
   modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
 
 end LeanIn.Async
