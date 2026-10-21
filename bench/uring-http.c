@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_CONN 4096
@@ -46,6 +47,15 @@ typedef struct {
 } conn_t;
 
 static struct io_uring ring;
+static int sq_dirty = 0;
+static unsigned spin_us = 0;
+static int sqpoll = 0;
+
+static uint64_t now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 static conn_t conns[MAX_CONN];
 static int listen_fd = -1;
 static const char response[] =
@@ -58,6 +68,7 @@ static void multishot_accept(void) {
   if (!sqe) return;
   io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, SOCK_NONBLOCK);
   io_uring_sqe_set_data64(sqe, OP_ACCEPT);
+  sq_dirty = 1;
 }
 
 static conn_t *conn_alloc(int fd) {
@@ -97,6 +108,7 @@ static void submit_recv(conn_t *c) {
   io_uring_prep_recv(sqe, c->fd, c->in, BUF_SIZE, 0);
 #endif
   io_uring_sqe_set_data64(sqe, (uint64_t)(uintptr_t)c | OP_RECV);
+  sq_dirty = 1;
   c->recv_armed = 1;
 }
 
@@ -109,6 +121,7 @@ static void submit_send(conn_t *c) {
   c->out_len = sizeof(response) - 1;
   io_uring_prep_send(sqe, c->fd, c->out, c->out_len, MSG_NOSIGNAL);
   io_uring_sqe_set_data64(sqe, (uint64_t)(uintptr_t)c | OP_SEND);
+  sq_dirty = 1;
 }
 
 /* Consume complete requests from c->in. One response per connection at depth 1; pipelined bytes are kept
@@ -135,14 +148,19 @@ int main(int argc, char **argv) {
   int port = argc > 1 ? atoi(argv[1]) : 8480;
   signal(SIGPIPE, SIG_IGN);
 
+  const char *e;
+  if ((e = getenv("URING_SPIN_US"))) spin_us = (unsigned)atoi(e);
+  if (getenv("URING_SQPOLL")) sqpoll = 1;
   struct io_uring_params p;
   memset(&p, 0, sizeof(p));
-#ifdef SQPOLL
-  p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SQPOLL;
-  p.sq_thread_idle = 1000;
-#else
-  p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
-#endif
+  if (sqpoll) {
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_SQPOLL;
+    p.sq_thread_idle = 0;
+  } else if (getenv("URING_COOP")) {
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+  } else {
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+  }
   p.cq_entries = 1024;
   int r = io_uring_queue_init_params(512, &ring, &p);
   if (r < 0) { fprintf(stderr, "queue_init: %d\n", r); return 1; }
@@ -189,16 +207,22 @@ int main(int argc, char **argv) {
 
   for (;;) {
     struct io_uring_cqe *cqe;
-#ifdef SUBMIT_WAIT
-    /* One enter for both: submit SQEs prepared by the previous iteration and wait for one completion. */
-    r = io_uring_submit_and_wait(&ring, 1);
-#else
-    r = io_uring_wait_cqe(&ring, &cqe);
-#endif
-    if (r < 0) {
-      if (r == -EINTR) continue;
-      fprintf(stderr, "wait_cqe: %d\n", r);
-      break;
+    if (sq_dirty) {
+      /* Submit without waiting; SQPOLL's kernel thread picks up the tail, so avoid the enter there. */
+      if (!sqpoll) io_uring_submit_and_wait(&ring, 0);
+      sq_dirty = 0;
+    }
+    uint64_t deadline = now_ns() + (uint64_t)spin_us * 1000ull;
+    while (io_uring_peek_cqe(&ring, &cqe) != 0) {
+      if (spin_us == 0 || now_ns() >= deadline) break;
+    }
+    if (io_uring_peek_cqe(&ring, &cqe) != 0) {
+      r = io_uring_wait_cqe(&ring, &cqe);
+      if (r < 0) {
+        if (r == -EINTR) continue;
+        fprintf(stderr, "wait_cqe: %d\n", r);
+        break;
+      }
     }
     struct io_uring_cqe *batch[64];
     unsigned n = io_uring_peek_batch_cqe(&ring, batch, 64);
@@ -255,9 +279,6 @@ int main(int argc, char **argv) {
       }
       io_uring_cqe_seen(&ring, cqe);
     }
-#ifndef SUBMIT_WAIT
-    io_uring_submit(&ring);
-#endif
   }
   return 0;
 }

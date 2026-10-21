@@ -131,3 +131,32 @@ Conclusion: the earlier “no speedup” was a wrong-shape and wrong-syscall-pat
 server when the workload has pipelined requests and the loop uses one `submit_and_wait` per turn. The Lean shim
 still uses the hybrid loop and one-request benchmarks; porting the direct loop + submit-and-wait is the next step,
 then re-running the Lean server with `LOAD_PIPE=16`.
+
+### E6: can C=1 reach parity? (2026-10-21)
+
+Depth 1, C=1, minimal HTTP, paired against `bench/libuv-http.c` (88.5k rps):
+
+| ring variant | rps | vs libuv |
+|---|---:|---:|
+| `submit_and_wait`, no spin | 72.5k | 0.82 |
+| spin 10 µs | 66.8k | 0.75 |
+| SQPOLL, spin 20 µs | 70.5k | 0.80 |
+| `COOP_TASKRUN|TASKRUN_FLAG`, spin 20 µs | 69.3k | 0.78 |
+
+Depth 16, same loop:
+
+| ring variant | rps (C=1) |
+|---|---:|
+| spin 0 | 340.9k |
+| spin 2 µs | 344.1k |
+| spin 10 µs | 329.0k |
+| SQPOLL, spin 10 µs | 350.7k |
+
+So the best C=1 result found is ~0.82×, and it comes from the single-enter fast path, not polling.
+Every additional latency lever (spin, SQPOLL, COOP) is neutral or worse at depth 1. At depth 16 the same loop is
+2× or more over the libuv C baseline and improves slightly with SQPOLL, at the cost of a kernel polling thread.
+
+Conclusion: there is a path to a large depth-16 speedup, and no path to C=1 parity on this shape with these levers.
+The ring pays a per-request kernel cost that one outstanding request cannot amortise; epoll's wait amortises across
+the poll set at no per-operation cost. Parity would require changing the workload (pipelining/multiplexing), not
+more ring flags.
