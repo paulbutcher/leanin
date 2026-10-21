@@ -49,7 +49,8 @@ def main (args : List String) : IO UInt32 := do
   let hooks ← Runtime.Hooks.new
   let l ← Runtime.Listener.bind (Runtime.loopback port)
   let addr ← Runtime.Listener.sockName l
-  let workers := 1
+  let workers :=
+    args.findSome? (fun a => (a.dropPrefix? "workers=").bind (fun n => n.toNat?)) |>.getD 1
   let e ← Sched.Executor.new LeanIn.Task.Item 256 workers
   let bigstall := args.contains "bigstall"
   -- `maxMessages` bumped far past the default 100 so keep-alive is not closed mid-benchmark, as the client
@@ -86,19 +87,15 @@ def main (args : List String) : IO UInt32 := do
   -- writes one complete profile instead of being killed mid-run.
   let count? := args.findSome? (fun a =>
     (a.dropPrefix? "count=").bind (fun n => n.toNat?))
+  let body : Runtime.Conn → LeanIn.Task.EAsync IO.Error Unit :=
+    fun c => LeanIn.Http.Server.serveConn cfg c handler
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
     match count? with
-    | some n => Runtime.serveNJoin hooks l n (LeanIn.Http.Server.serveConn cfg · handler)
-    | none   => Runtime.serveForever hooks l (LeanIn.Http.Server.serveConn cfg · handler)
-  -- Driven by `Runtime.run`: the caller's thread runs the executor while it waits, which is what pumps the
-  -- live clock's timer. The multi-carrier entry `Runtime.runCarriers` does **not** serve here — a connection is
-  -- accepted by the kernel and never answered, because its caller waits on a cell without pumping and the accept
-  -- loop's own sleep never resumes. That is a defect to fix rather than a configuration to choose, and it is
-  -- recorded in the notes beside this file rather than worked around by leaving the server single-carrier blind.
-  let outcome : Except IO.Error Unit ← Runtime.run e prog
-  -- The accept loop can only return once the loop that accepted its connections is gone (that is what fails a
-  -- parked accept), so this is a no-op in the ordinary case; it is here so that a run that ended some other way
-  -- — a full slot table, say — does not leave the loop thread parked and the process waiting on it at shutdown.
+    | some n => Runtime.serveNJoinShared hooks e l n body
+    | none   => Runtime.serveForeverShared hooks e l body
+  -- The listener's bind started the pump thread; `runCarriersWait` starts `workers` carriers and waits for
+  -- the program while that pump serves the loop. A connection stays on the carrier that took its first step.
+  let (_, outcome) ← Runtime.runCarriersWait e workers prog
   Runtime.Io.stop
   match outcome with
   | .ok _ => return 0

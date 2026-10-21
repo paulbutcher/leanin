@@ -57,6 +57,11 @@
   `nix develop -c bash tests/scope-cancel.sh` (a user cancel retires a parked sleep
   immediately, a child scope is cancelled with its parent, and cleanup runs exactly once).
   All assert elapsed time or counts, so a hang or a double cleanup fails rather than passes.
+- Multi-carrier serving: `nix develop -c bash tests/multi-carrier.sh` (64 shared tasks land on at
+  least two of three carriers) and `nix develop -c bash tests/multi-server.sh` (`server workers=2
+  count=8` answers every connection and exits). The server check uses a unique port and a finite
+  batch; `waitFinished` must not park on the carriers' condition variable, or `notifyOne` can wake
+  the caller instead of a worker.
 - The H1 target views have a pure check: `nix develop -c bash tests/h1-target.sh`
   (`H1.Head.path?`/`query?` decode percent escapes and reject a malformed one).
 - Put externally observable executor scenarios in

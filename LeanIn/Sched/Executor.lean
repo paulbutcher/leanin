@@ -469,14 +469,20 @@ def Executor.waitForWork (e : Executor α cap) : IO Unit := do
 
 /-- **The parallel entry's wait**: block the calling thread until the program records its completion.
 
-The caller of `Runtime.runCarriers` is not a carrier and does not run worker `0`'s loop, so it waits on the
-completion flag the program's last step sets (`noteFinished`) in the one cell a notify is serializable
-against. No `parked` accounting is kept: nothing wakes this wait by the count, and `noteFinished` issues a
-`notifyAll` under the same lock the predicate is evaluated under. -/
+The caller is not a carrier and does not run a worker loop, so it reads the completion flag the program's
+last step sets (`noteFinished`). It polls rather than waiting on `e.cv`: a push wakes one waiter
+(`notifyOne`), and a caller parked there competes with the carrier that wake is meant for. A caller's
+predicate is only `finished`, so it would re-park and leave the carrier asleep. `noteFinished` still
+`notifyAll`s the carriers' condition variable for any driver parked there. -/
 def Executor.waitFinished (e : Executor α cap) : IO Unit := do
-  e.inject.atomicallyOnce e.cv
-    (pred := do return (← get).finished)
-    (k := pure ())
+  -- **Not on the carriers' condition variable.** A push uses `notifyOne`, and a caller parked on `e.cv`
+  -- competes with a carrier for that wake: the caller's predicate is only `finished`, so it re-parks and the
+  -- carrier stays asleep. Poll the flag instead, leaving `e.cv` to the carriers (and the single-carrier
+  -- driver) for which its one-wake accounting is written.
+  let mut done := false
+  while !done do
+    done ← e.inject.atomically do return (← get).finished
+    unless done do IO.sleep 1
 
 /-! ### The carrier loop -/
 

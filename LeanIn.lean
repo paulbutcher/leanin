@@ -16,6 +16,7 @@ public import LeanIn.Runtime.Clock
 public import LeanIn.Runtime.Io
 public import LeanIn.Runtime.Leaf
 public import LeanIn.Runtime.Net
+public import LeanIn.Runtime.Multi
 public import LeanIn.Runtime.Time
 public import LeanIn.Runtime.VM
 public import LeanIn.Sched.Basic

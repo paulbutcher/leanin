@@ -148,6 +148,10 @@ private def Conn.serve (body : Conn → Task.EAsync IO.Error Unit) (c : Conn) : 
   | some e =>
       throw e
 
+/-- Public wrapper for a connection body with the close-on-exit lifetime rule. -/
+def Conn.serveBody (body : Conn → Task.EAsync IO.Error Unit) (c : Conn) : Task.EAsync IO.Error Unit :=
+  Conn.serve body c
+
 /-- **An accept loop of our own.** It accepts `n` connections — one task each, through `background`, which
 against `MonadAsync` is the local route, so a connection stays on the carrier its accept ran on — and then
 awaits them all.

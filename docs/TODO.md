@@ -49,14 +49,15 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   (HTTP/1.1 only; a non-1xx status raises), and `sendContinue` remains the 100 case.
   - Evidence: `tests/http-stream.sh` reads `103 Early Hints` before the final `200` from the
     `/hints` route.
-- [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier. Attempted wiring:
-  a caller-driven multi-carrier entry with shared dispatch, plus a pump-thread variant. The caller
-  variant's shared-task test passed, but the HTTP entry stalled intermittently (about 5 of 20
-  single-request runs) at a connection after accept. A third variant bound the listener and ran the
-  pump on the same dedicated thread, with all executor carriers separate; the handshake and program
-  root started, but the pump never delivered an accept event. The blocker is therefore below the
-  executor wake: listener/loop ownership in the shim needs work before this is wired into `server`.
-  The affinity rule to preserve: a connection stays on the carrier that took its first step.
+- [x] **Multi-carrier serving.** The bind starts the shim's pump thread; `runCarriersWait` starts
+  `workers` carriers and waits for the shared-spawned accept loop, and every connection is spawned on
+  the shared inject. A connection stays on the carrier that took its first step; the accept chain stays
+  on the carrier that ran it. The earlier intermittent stall was `waitFinished` parking the caller on
+  the carriers' condition variable: a `notifyOne` from a join resolution could wake the caller (whose
+  predicate is only `finished`) and leave the worker parked. `waitFinished` now polls the flag, leaving
+  the condition variable to the carriers.
+  - Evidence: `tests/multi-server.sh` (15/15 runs, `workers=2`, eight connections) and
+    `tests/multi-carrier.sh` (64 shared tasks observed on 3 carriers).
 - [x] **Correct the H1 documentation.** The module doc now states the implemented framing,
   continue handling and limits.
 

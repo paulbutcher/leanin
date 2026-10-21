@@ -168,7 +168,7 @@ Each is a dedicated thread running `Executor.workerLoop` on the index it was giv
 function: the step runs on the worker's own route, so a chain stays where its parent ran. The thread records
 its id before entering the loop, which is what makes "which carriers were started" readable without the client
 keeping a log. -/
-private def startCarriersFrom (e : Executor cap) (first p : Nat) : IO (Carriers cap) := do
+def startCarriersFrom (e : Executor cap) (first p : Nat) : IO (Carriers cap) := do
   let tids ← Std.Mutex.new ([] : List UInt64)
   let mut ts : Array (_root_.Task (Except IO.Error Unit)) := #[]
   for i in List.range p do
