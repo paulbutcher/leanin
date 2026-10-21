@@ -1219,7 +1219,7 @@ the ordinary error channel: an application `throw` after a successful send is an
 abort. That property was the reason for the shape: an earlier encoding, a node whose interpreter converted the
 error channel of an enclosed subtree, also converted every later step of a `bind` and was rejected for it.
 
-**Where the driver puts the scopes.** [`LeanIn/Examples/Http/Server.lean`](../LeanIn/Examples/Http/Server.lean)'s
+**Where the driver puts the scopes.** [`LeanIn/Http/Server.lean`](../LeanIn/Http/Server.lean)'s
 `driveStream` wraps the handler in `VM.requestScope` and puts the body reader's five read sites (raw read
 failure, stall, peer close, in fixed-length and chunked framing alike) and the response writer's head, body-chunk
 and terminating-chunk sends on the abort channel. On `.aborted` the driver closes the connection and reports

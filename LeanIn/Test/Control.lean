@@ -3,7 +3,7 @@ import Std.Http
 import LeanIn.Sched.Basic
 import LeanIn.Sched.Executor
 import LeanIn.Runtime.Basic
-import LeanIn.Examples.Http.Server
+import LeanIn.Http.Server
 import LeanIn.Runtime.Leaf
 import LeanIn.Runtime.Net
 import LeanIn.Runtime.Time
@@ -1046,8 +1046,8 @@ one request line is `Std.Async`'s TCP client, driven by `Async.block` on this th
 is what makes the thread identities mean anything. The response bytes the client reads back are the observable,
 printed escaped so the field stays one token (`\`→`\\`, CR→`\r`, LF→`\n`).
 
-The per-connection half is `LeanIn.Examples.Http.Server.serveConn`, driven by `Runtime.serveNJoin` — the accept loop of ours —
-so the socket bytes are carried through the `LeanIn.Examples.Http.H1` machine and the handler is dispatched
+The per-connection half is `LeanIn.Http.Server.serveConn`, driven by `Runtime.serveNJoin` — the accept loop of ours —
+so the socket bytes are carried through the `LeanIn.Http.H1` machine and the handler is dispatched
 inline on the carrier the connection runs on. `Std.Http.Server`'s loop would have spawned it with `.asTask`
 (`Std/Http/Server/Connection.lean:319`), putting it back on the stock pool — the observation SC19's carrier
 clause reports.
@@ -1073,13 +1073,13 @@ def runtimeHttp : IO UInt32 := do
   -- The driver's own configuration: the protocol's limits, the clock the read deadline is read from, and the
   -- deadline. The machine still sees `h1` alone, so no `Server` agent and no clock value can enter the encoder,
   -- and the response the client reads is a function of the request and the pinned head alone.
-  let cfg : LeanIn.Examples.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks }
-  let respHead : LeanIn.Examples.Http.H1.ResponseHead :=
+  let cfg : LeanIn.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks }
+  let respHead : LeanIn.Http.H1.ResponseHead :=
     { status := 200, reason := "OK", headers := #[("Content-Length", "5")] }
   statusRef.set respHead.status
   -- Our handler: it records the thread it ran on and answers with the pinned head and body. `serveConn` awaits
   -- it inline, so the thread it reads is the carrier the connection runs on.
-  let handler : LeanIn.Examples.Http.Server.Handler := fun head _body => do
+  let handler : LeanIn.Http.Server.Handler := fun head _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids.modify (· ++ [tid]) : IO Unit)
     monadLift (methodRef.set (toString head.method) : IO Unit)
@@ -1091,7 +1091,7 @@ def runtimeHttp : IO UInt32 := do
   let (heldBefore, _) ← e.observe
   let serverProg : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks l 1 (LeanIn.Examples.Http.Server.serveConn cfg · handler)
+    Runtime.serveNJoin hooks l 1 (LeanIn.Http.Server.serveConn cfg · handler)
   let server ← IO.asTask (Runtime.run e serverProg) _root_.Task.Priority.dedicated
   let clientTid ← IO.getTID
   let got ← Std.Async.Async.block do
@@ -1185,7 +1185,7 @@ socket carries two request/response exchanges; a handler that suspends and only 
 raise arriving from a resumed continuation — puts a failure response on the wire; and a peer that never sends a
 byte ends the connection at the mode's stated instant, read from the harness
 clock. The client is deliberately `Std.Async`'s, driven by `Async.block` on this thread — a client that is not
-ours is what makes the thread identities mean anything — and the server side is `LeanIn.Examples.Http.Server.serveConn` under
+ours is what makes the thread identities mean anything — and the server side is `LeanIn.Http.Server.serveConn` under
 `Runtime.serveNJoin`, the accept loop of ours.
 
 Records: `ka|` (clause one), `fa|` (clause two), `idle|` (clause three), plus the tid detector's own control in
@@ -1200,8 +1200,8 @@ and it is never the relation a clause asserts: clause three asserts the harness 
 which is what ends the peer's read — and this mode then drives its loop in bounded rounds until the peer's run
 returns, so the clause reports the peer's behaviour rather than a hang.
 
-The drive path is ours: `Runtime.serveNJoin` is the accept loop and `LeanIn.Examples.Http.Server.serveConn` the per-connection
-body, driving a `LeanIn.Examples.Http.H1` machine built from its `Limits` alone. The records the mode prints are the ones the frozen
+The drive path is ours: `Runtime.serveNJoin` is the accept loop and `LeanIn.Http.Server.serveConn` the per-connection
+body, driving a `LeanIn.Http.H1` machine built from its `Limits` alone. The records the mode prints are the ones the frozen
 fixture reads, so a red here is about the connection's behaviour rather than about a missing binding.
 
 Beside the drive path, and the mode's own rather than the driver's, clause three drives its executor once past
@@ -1216,7 +1216,7 @@ def runtimeHttpService : IO UInt32 := do
     { status := .ok, version := .v11,
       headers := Std.Http.Headers.empty.insert Std.Http.Header.Name.contentLength
         (Std.Http.Header.Value.ofString! "5") }
-  let respHead : LeanIn.Examples.Http.H1.ResponseHead :=
+  let respHead : LeanIn.Http.H1.ResponseHead :=
     { status := 200, reason := "OK", headers := #[("Content-Length", "5")] }
   let expected := encodedResponse request wireHead pinnedBody
   let clientBound : Std.Time.Millisecond.Offset := 5000
@@ -1231,17 +1231,17 @@ def runtimeHttpService : IO UInt32 := do
   let e1 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids1 ← IO.mkRef ([] : List UInt64)
   let handled1 ← IO.mkRef (0 : Nat)
-  let handler1 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
+  let handler1 : LeanIn.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids1.modify (· ++ [tid]) : IO Unit)
     monadLift (handled1.modify (· + 1) : IO Unit)
     return (respHead, pinnedBody)
   for _ in List.range 3 do e1.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore1, _) ← e1.observe
-  let cfg1 : LeanIn.Examples.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks1 }
+  let cfg1 : LeanIn.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks1 }
   let server1 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids1.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks1 l1 1 (LeanIn.Examples.Http.Server.serveConn cfg1 · handler1)
+    Runtime.serveNJoin hooks1 l1 1 (LeanIn.Http.Server.serveConn cfg1 · handler1)
   let server1T ← IO.asTask (Runtime.run e1 server1) _root_.Task.Priority.dedicated
   -- The client: two exchanges on one socket. The second send is guarded because a peer that has already closed
   -- is an ordinary case for this clause, and what the clause records is the bytes, which the guard cannot change.
@@ -1281,8 +1281,8 @@ def runtimeHttpService : IO UInt32 := do
   let addr2 ← Runtime.Listener.sockName l2
   let e2 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids2 ← IO.mkRef ([] : List UInt64)
-  let cfg2 : LeanIn.Examples.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
-  let handler2 : LeanIn.Examples.Http.Server.Handler := fun _ _body => do
+  let cfg2 : LeanIn.Http.Server.Config := { h1 := {}, clock := Runtime.Clock.live hooks2 }
+  let handler2 : LeanIn.Http.Server.Handler := fun _ _body => do
     let tid ← monadLift (IO.getTID : IO UInt64)
     monadLift (srvTids2.modify (· ++ [tid]) : IO Unit)
     -- The suspension is the point: the raise reaches the driver from a *resumed* continuation, not from the
@@ -1293,7 +1293,7 @@ def runtimeHttpService : IO UInt32 := do
   let (heldBefore2, _) ← e2.observe
   let server2 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids2.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks2 l2 1 (LeanIn.Examples.Http.Server.serveConn cfg2 · handler2)
+    Runtime.serveNJoin hooks2 l2 1 (LeanIn.Http.Server.serveConn cfg2 · handler2)
   let server2T ← IO.asTask (Runtime.run e2 server2) _root_.Task.Priority.dedicated
   let faClient ←
     try
@@ -1331,15 +1331,15 @@ def runtimeHttpService : IO UInt32 := do
   let addr3 ← Runtime.Listener.sockName l3
   let e3 ← Sched.Executor.new LeanIn.Task.Item 256 1
   let srvTids3 ← IO.mkRef ([] : List UInt64)
-  let handler3 : LeanIn.Examples.Http.Server.Handler := fun _ _body => return (respHead, pinnedBody)
+  let handler3 : LeanIn.Http.Server.Handler := fun _ _body => return (respHead, pinnedBody)
   for _ in List.range 3 do e3.submit (LeanIn.Task.Item.ofAction (pure ()))
   let (heldBefore3, _) ← e3.observe
   let hc ← Runtime.HarnessClock.new
-  let cfg3 : LeanIn.Examples.Http.Server.Config :=
+  let cfg3 : LeanIn.Http.Server.Config :=
     { h1 := {}, clock := Runtime.HarnessClock.clock hc, stallTimeout := stall }
   let server3 : LeanIn.Task.EAsync IO.Error Unit := do
     srvTids3.modify (· ++ [← monadLift (IO.getTID : IO UInt64)])
-    Runtime.serveNJoin hooks3 l3 1 (LeanIn.Examples.Http.Server.serveConn cfg3 · handler3)
+    Runtime.serveNJoin hooks3 l3 1 (LeanIn.Http.Server.serveConn cfg3 · handler3)
   let server3T ← IO.asTask (Runtime.runVirtual hc e3 server3) _root_.Task.Priority.dedicated
   -- The client connects and sends nothing, which is what leaves the driver's read to the deadline. If the
   -- invocation's bound fires first, the client closes its write side, which is what ends the peer's read.
@@ -5290,12 +5290,12 @@ def controlVMAbort : IO Unit := do
     unless got == abortedWant do
       throw (IO.userError s!"vm abort control: a scoped VM.runToCell resolved {got}, expected {abortedWant}")
   -- ==== C3: the streaming response writer's transport classification ====
-  let head ← (match LeanIn.Examples.Http.H1.parseHead
+  let head ← (match LeanIn.Http.H1.parseHead
       "GET /probe HTTP/1.1\r\nHost: x\r\n\r\n".toUTF8 0 {} with
     | .ok h _ => pure h
     | _ => throw (IO.userError "vm abort control: could not parse the probe request head"))
   let fiveHundreds ← IO.mkRef (0 : Nat)
-  let detectStart : LeanIn.Examples.Http.H1.ResponseHead → LeanIn.Runtime.VM Unit :=
+  let detectStart : LeanIn.Http.H1.ResponseHead → LeanIn.Runtime.VM Unit :=
     fun rh => do
       if rh.status == 500 then
         (monadLift (do
@@ -5303,28 +5303,28 @@ def controlVMAbort : IO Unit := do
           (fiveHundreds.set (n + 1) : IO Unit)) : LeanIn.Runtime.VM Unit)
       else pure ()
   -- The writer whose `write` is the writer's own wrapper around a scripted completion: no socket, one sentinel.
-  let failingWriter : LeanIn.Examples.Http.Server.ResponseWriter :=
+  let failingWriter : LeanIn.Http.Server.ResponseWriter :=
     { start := detectStart
       write := fun _ => LeanIn.Runtime.VM.abortOnFailure fun _ fail => fail sentinel
       finish := pure ()
       status := pure (true, true, false)
       code := pure (some 500) }
-  let okWriter : LeanIn.Examples.Http.Server.ResponseWriter :=
+  let okWriter : LeanIn.Http.Server.ResponseWriter :=
     { start := detectStart
       write := fun _ => pure ()
       finish := pure ()
       status := pure (true, true, false)
       code := pure (some 500) }
-  let emptyReader : LeanIn.Examples.Http.Server.BodyReader :=
+  let emptyReader : LeanIn.Http.Server.BodyReader :=
     { recv := fun _ => pure none, drained := pure true, leftover := pure .empty }
-  let catchErrorsStream (h : LeanIn.Examples.Http.Server.StreamHandler) :
-      LeanIn.Examples.Http.Server.StreamHandler := fun _ _ w => do
+  let catchErrorsStream (h : LeanIn.Http.Server.StreamHandler) :
+      LeanIn.Http.Server.StreamHandler := fun _ _ w => do
     match ← LeanIn.Runtime.VM.attempt (h head emptyReader w) with
     | .ok _ => pure ()
     | .error e =>
-      LeanIn.Examples.Http.Server.Stream.respond w
+      LeanIn.Http.Server.Stream.respond w
         { status := 500, reason := "Internal Server Error" } (toString e).toUTF8
-  let tripWireRoute : LeanIn.Examples.Http.Server.StreamHandler := fun _ _ w => do
+  let tripWireRoute : LeanIn.Http.Server.StreamHandler := fun _ _ w => do
     w.write "body".toUTF8
     throw (IO.userError "vm abort control tripwire: a step after the failed write ran")
   let aborted := outcomeText (← settleOutcome
@@ -5337,7 +5337,7 @@ def controlVMAbort : IO Unit := do
   -- affirmative clause: with a normal writer the fallback is the 500 the detector sees. The load-bearing clause:
   -- with a writer whose head send fails the transport's way, that failure is an abort at the scope (what lets the
   -- driver close and report it), not a raise that escapes to the runner.
-  let fallbackWriter (failStart : Bool) : LeanIn.Examples.Http.Server.ResponseWriter :=
+  let fallbackWriter (failStart : Bool) : LeanIn.Http.Server.ResponseWriter :=
     { start := fun rh =>
         if failStart then
           (LeanIn.Runtime.VM.abortOnFailure
@@ -5349,20 +5349,20 @@ def controlVMAbort : IO Unit := do
       code := pure (some 500) }
   fiveHundreds.set 0
   let fallbackOk := outcomeText (← settleOutcome
-    (LeanIn.Examples.Http.Server.Stream.respond (fallbackWriter false)
+    (LeanIn.Http.Server.Stream.respond (fallbackWriter false)
       { status := 500, reason := "Internal Server Error" } "".toUTF8))
   unless fallbackOk == "ok" do
     throw (IO.userError s!"vm abort control: the driver's fallback response: expected ok, got {fallbackOk}")
   unless (← fiveHundreds.get) == 1 do
     throw (IO.userError s!"vm abort control: the fallback response's 500 was counted {← fiveHundreds.get} times, expected 1")
   let fallbackAbort := outcomeText (← settleOutcome
-    (LeanIn.Examples.Http.Server.Stream.respond (fallbackWriter true)
+    (LeanIn.Http.Server.Stream.respond (fallbackWriter true)
       { status := 500, reason := "Internal Server Error" } "".toUTF8))
   unless fallbackAbort == abortedWant do
     throw (IO.userError s!"vm abort control: a failed fallback head send: expected {abortedWant}, got {fallbackAbort}")
   -- The detector's affirmative control: an ordinary, `Http:`-prefixed route error does reach that 500.
   fiveHundreds.set 0
-  let ordinaryRoute : LeanIn.Examples.Http.Server.StreamHandler :=
+  let ordinaryRoute : LeanIn.Http.Server.StreamHandler :=
     fun _ _ _ => throw (IO.userError "Http: vm abort control ordinary sentinel")
   let ordinary := outcomeText (← settleOutcome
     (catchErrorsStream ordinaryRoute head emptyReader okWriter))
@@ -5441,8 +5441,8 @@ def runMode (args : List String) : IO UInt32 := do
 /-- The parser keeps the method token: an unknown method must not become a known one, and a known method
 still classifies as itself. -/
 def h1MethodTokenSelfTest : IO Unit := do
-  let parse (s : String) : IO LeanIn.Examples.Http.H1.Head := do
-    match LeanIn.Examples.Http.H1.parseHead s.toUTF8 0 {} with
+  let parse (s : String) : IO LeanIn.Http.H1.Head := do
+    match LeanIn.Http.H1.parseHead s.toUTF8 0 {} with
     | .ok h _ => return h
     | _ => throw (IO.userError s!"h1 method token: could not parse {s}")
   let pf ← parse "PROPFIND /x HTTP/1.1\r\nHost: x\r\n\r\n"

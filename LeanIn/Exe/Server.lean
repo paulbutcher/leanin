@@ -2,15 +2,15 @@ import Std
 
 import LeanIn
 import LeanIn.Runtime.Net
-import LeanIn.Examples.Http.Server
+import LeanIn.Http.Server
 
 /-!
 # An HTTP server on `leanin`'s runtime
 
 Run it with `lake exe server [port]` — the port defaults to 8080. It binds the loopback address, prints the
-address it took, and serves every connection on an executor of our own, driving `LeanIn.Examples.Http.H1`'s pure machine
-through `LeanIn.Examples.Http.Server.serveConn` — a per-connection state machine compiled by `async`. The protocol is
-ours as well (parsing, framing, keep-alive and the limits live in `LeanIn.Examples.Http.H1`), and the driver, the accept
+address it took, and serves every connection on an executor of our own, driving `LeanIn.Http.H1`'s pure machine
+through `LeanIn.Http.Server.serveConn` — a per-connection state machine compiled by `async`. The protocol is
+ours as well (parsing, framing, keep-alive and the limits live in `LeanIn.Http.H1`), and the driver, the accept
 loop and every await are ours, so a handler runs on one of our carriers rather than on the stock `Task` pool.
 
 `Runtime.serveUntilStopped` is the accept loop. It polls a non-blocking `tryAccept` between sleeps because the
@@ -19,7 +19,7 @@ absence is recorded in the runtime's own docstring as W7's, not hidden here.
 -/
 
 open LeanIn
-open LeanIn.Examples.Http
+open LeanIn.Http
 
 /-- The reply to any request: the method, path and version echoed back in a small body. -/
 def reply (head : H1.Head) : H1.ResponseHead × ByteArray :=
@@ -54,7 +54,7 @@ def main (args : List String) : IO UInt32 := do
   let bigstall := args.contains "bigstall"
   -- `maxMessages` bumped far past the default 100 so keep-alive is not closed mid-benchmark, as the client
   -- harness (one connection, sequential keep-alive) would otherwise measure only the first 100 exchanges.
-  let cfg : LeanIn.Examples.Http.Server.Config :=
+  let cfg : LeanIn.Http.Server.Config :=
     { h1 := { maxMessages := 1000000000 }, clock := Runtime.Clock.live hooks,
       stallTimeout := if bigstall then 3600000 else 12000 }
   let quiet := args.contains "quiet"
@@ -70,7 +70,7 @@ def main (args : List String) : IO UInt32 := do
   let staticBody : ByteArray := "hello from leanin\nmethod=GET path=/bench version=HTTP/1.1\n".toUTF8
   let staticHead : H1.ResponseHead :=
     { status := 200, reason := "OK", headers := #[("Content-Length", toString staticBody.size)] }
-  let handler : LeanIn.Examples.Http.Server.Handler := fun head _body => do
+  let handler : LeanIn.Http.Server.Handler := fun head _body => do
     if metrics then
       monadLift (reportMetrics e hooks served metricsT0)
     if static then
@@ -88,8 +88,8 @@ def main (args : List String) : IO UInt32 := do
     (a.dropPrefix? "count=").bind (fun n => n.toNat?))
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
     match count? with
-    | some n => Runtime.serveNJoin hooks l n (LeanIn.Examples.Http.Server.serveConn cfg · handler)
-    | none   => Runtime.serveForever hooks l (LeanIn.Examples.Http.Server.serveConn cfg · handler)
+    | some n => Runtime.serveNJoin hooks l n (LeanIn.Http.Server.serveConn cfg · handler)
+    | none   => Runtime.serveForever hooks l (LeanIn.Http.Server.serveConn cfg · handler)
   -- Driven by `Runtime.run`: the caller's thread runs the executor while it waits, which is what pumps the
   -- live clock's timer. The multi-carrier entry `Runtime.runCarriers` does **not** serve here — a connection is
   -- accepted by the kernel and never answered, because its caller waits on a cell without pumping and the accept

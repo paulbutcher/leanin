@@ -2,7 +2,7 @@ import Std
 
 import LeanIn
 import LeanIn.Runtime.Net
-import LeanIn.Examples.Http.Server
+import LeanIn.Http.Server
 
 /-!
 # A streaming HTTP echo on `leanin`'s runtime
@@ -13,7 +13,7 @@ on HTTP/1.1. A `POST` echoes each body chunk as it arrives; any other method ans
 -/
 
 open LeanIn
-open LeanIn.Examples.Http
+open LeanIn.Http
 
 namespace LeanIn.Exe.StreamEcho
 

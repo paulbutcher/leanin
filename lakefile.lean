@@ -2,7 +2,7 @@ import Lake
 open System Lake DSL
 
 package leanin where
-  version := v!"0.3.0"
+  version := v!"0.4.0"
   description := "A concurrency runtime and work-stealing scheduler for Lean 4: Tokio's algorithms, an async that compiles to data rather than closures, and machine-checked proofs for the properties that matter."
   keywords := #["concurrency", "scheduler", "async", "runtime", "software-verification", "ffi"]
   license := "Apache-2.0"
@@ -20,14 +20,10 @@ theory that verify them. It imports nothing from `LeanIn/Examples/` or `LeanIn/E
              .submodules `LeanIn.Data,
              .submodules `LeanIn.Model,
              .submodules `LeanIn.Runtime,
+             .submodules `LeanIn.Http,
              .submodules `LeanIn.Sched,
              .submodules `LeanIn.Task,
              .submodules `LeanIn.Theory]
-
-/-- The **example**: the HTTP/1.1 protocol and server, built on the toolkit and published separately so the
-library's surface stays the concurrency toolkit. -/
-lean_lib LeanInExamples where
-  globs := #[.one `LeanIn.Examples, .submodules `LeanIn.Examples]
 
 /-- The socket shim: `c/netuv.c` compiled and archived by Lake rather than by the dev shell, so that a plain
 `lake build` produces it and no store path appears in any build flag. Lake traces the source, so editing the C

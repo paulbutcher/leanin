@@ -38,6 +38,6 @@ the data structures, and the model and theory that verify them. `import LeanIn` 
 
 The HTTP/1.1 protocol and server are an **example**, not part of the library: they live under
 `LeanIn/Examples/` and `LeanIn/Exe/`, are imported by nothing in the toolkit, and are published as the separate
-`LeanInExamples` target. The executable roots live under `LeanIn/Exe/` and the scenario harnesses under
+`LeanIn` library. The executable roots live under `LeanIn/Exe/` and the scenario harnesses under
 `LeanIn/Test/`; neither is part of the library.
 -/

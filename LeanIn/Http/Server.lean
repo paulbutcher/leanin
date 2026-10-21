@@ -1,7 +1,7 @@
 module
 
 public import Std.Http.Data
-public import LeanIn.Examples.Http.H1
+public import LeanIn.Http.H1
 public import LeanIn.Runtime.Net
 public import LeanIn.Runtime.Io
 public import LeanIn.Runtime.Clock
@@ -17,7 +17,7 @@ public section
 
 The per-connection loop below (`drive`) is an `async`: every suspension in it is a **state of a compiled
 machine**, not a closure, so a request costs a step and a raw resume rather than a `bind`, a cell and an item.
-The protocol is `LeanIn.Examples.Http.H1` — our own parser and machine, in `LeanIn/Examples/Http/H1.lean` — so nothing here scans
+The protocol is `LeanIn.Http.H1` — our own parser and machine, in `LeanIn/Http/H1.lean` — so nothing here scans
 bytes and there is no framer. The accept loops in `LeanIn.Runtime.Net` are the callers.
 
 **A handler that raises** is answered rather than re-raised: `VM.attempt` turns the raise into a value the loop
@@ -44,10 +44,10 @@ never have arrived. What it does not bound is a handler that never returns, `Lis
 to a complete head — a peer that sends one byte before each deadline keeps the connection alive.
 -/
 
-namespace LeanIn.Examples.Http.Server
+namespace LeanIn.Http.Server
 
 open LeanIn.Runtime
-open LeanIn.Examples.Http
+open LeanIn.Http
 
 /-- A request handler of ours: the parsed request head to the response head and its fully buffered body, in the
 `VM`. It may suspend, and its suspension is a suspension of the connection's machine. -/
@@ -147,7 +147,7 @@ def pump (handler : Handler) (m : H1.Machine) : Pump := pumpGo handler m #[]
 -- A docstring here would not parse: `async` is a command syntax registered by `elab`, and that form does
 -- not take one.
 async def drive (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Handler)
-    (m : LeanIn.Examples.Http.H1.Machine) : Unit := do
+    (m : LeanIn.Http.H1.Machine) : Unit := do
   let r : Pump := pump handler m
   let machine : H1.Machine := r.machine
   let out : Array ByteArray := r.out
@@ -535,7 +535,7 @@ private partial def pumpStreamGo (m : H1.Machine) (acc : Array ByteArray) : Pump
 the handler's to read and write, so neither is buffered. The connection is reused only when the body was fully
 read, the response was started and finished, and the machine's disposition keeps it alive. -/
 async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : StreamHandler)
-    (m : LeanIn.Examples.Http.H1.Machine) : Unit := do
+    (m : LeanIn.Http.H1.Machine) : Unit := do
   let r : Pump := pumpStreamGo m #[]
   let machine : H1.Machine := r.machine
   let out : Array ByteArray := r.out
@@ -656,5 +656,5 @@ success -- the shape the accept loops' registries and drains already account by.
 def serveConn (cfg : Config) (c : Conn) (handler : Handler) : Task.EAsync IO.Error Unit :=
   drive c cfg handler ({ limits := cfg.h1 } : H1.Machine)
 
-end LeanIn.Examples.Http.Server
+end LeanIn.Http.Server
 end

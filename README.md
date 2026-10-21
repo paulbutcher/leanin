@@ -12,9 +12,8 @@ languages but which lives in a proof assistant. The basic trick is to use **data
 defunctionalisation rather than vanilla `do`.
 
 The library is the concurrency toolkit: `import LeanIn` brings in the runtime, scheduler, task and async
-interfaces, data structures and their model. The HTTP/1.1 implementation is an **example**, published separately
-as the `LeanInExamples` target under `LeanIn/Examples/`; the library does not import it. We have demonstrated the
-toolkit with that server. Requests to
+interfaces, data structures and their model. The HTTP/1.1 protocol and serving layer live in `LeanIn.Http`, part
+of the same library; LeanIO consumes that serving layer as its native backend. Requests to
 `/bench`, both sides pinned to distinct P-cores:
 
 | shape | server | C=1 | C=8 | C=32 |
