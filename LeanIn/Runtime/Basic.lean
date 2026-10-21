@@ -219,6 +219,14 @@ private def fireAt (e : Executor cap) (now : IO Nat) (it : Task.Item) : IO Unit 
     e.accrueAt 0 (t1 - t0)
   else it.fire
 
+/-- **Stop an executor with a deadline.** `e.stop` stops admission and lets in-flight work drain;
+`Io.stop` at the deadline aborts what is left, including parked timers (whose cancellation
+continuation runs) and socket operations. Call from a thread that is not the loop's driver. -/
+def stopWithDeadline (e : Executor cap) (graceMs : Nat) : IO Unit := do
+  e.stop
+  IO.sleep graceMs.toUInt32
+  Io.stop
+
 /-- **Drive worker `0`'s loop on the caller's thread** until `finished` holds, with a hook for a driver that
 has somewhere to advance to.
 

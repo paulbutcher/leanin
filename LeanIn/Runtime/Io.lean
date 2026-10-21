@@ -195,6 +195,9 @@ private structure WheelTimer where
   deadline : Nat
   cancel   : Task.Cancel
   fire     : IO Unit
+  /-- Run when the timer is retired without firing (a stop/deadline), so a parked sleeper is
+  aborted rather than left waiting for a fire that will never come. -/
+  onCancel : IO Unit := pure ()
 
 /-- The scheduling hand-off: timers carriers asked for (`liveSchedule`) and the driver has not yet taken into
 the wheel. Carriers touch only this queue, which is taken in one pointer swap. -/
@@ -586,13 +589,17 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
   let nothing := nothingOne && !(← rawLive)
   if nothing && nextDue.isNone then
     return false
+  -- A single-carrier driver must return to its executor: its program can finish on another carrier,
+  -- and a stop arrives from another thread, neither of which a poll blocked until a far timer would
+  -- observe. Bound its park; socket events and the wheel wake still cut it short.
+  let capMs : Nat := if ownedWorkOnly then 100 else 60000
   let timeoutMs : UInt32 := match nextDue with
-    | some d => if d > now then (max 1 ((d - now) / 1000000)).toUInt32 else 1
+    | some d => if d > now then (min capMs (max 1 ((d - now) / 1000000))).toUInt32 else 1
     -- With no deadline but raw work outstanding, block until an event: a raw completion is delivered by the
     -- loop, so an event is what ends the wait. Polling at 1 ms here cost one extra syscall per request — the
     -- write wait, which carries no stall slot — and measured 10 % of C=1 throughput; spinning at zero burns the
     -- core instead.
-    | none => if nothing then 0 else 1000
+    | none => if nothing then 0 else (min capMs 1000).toUInt32
   let active ← npUvRunOnceTimeout timeoutMs
   match ← loopRef.get with
   | some table => dispatch table (← npUvEvents)
@@ -641,15 +648,27 @@ pump is started only if no single-carrier driver is active — when one is, it d
 step. The wake is load-bearing, not an optimisation: a timer scheduled while the loop is parked with nothing
 armed strands without it (SC11's shape), so it is sent unconditionally rather than gated on a park state that
 could be read stale. -/
-def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit := do
-  timerPending.atomically (modify (·.push { deadline, cancel, fire }))
+def liveScheduleCancel (deadline : Nat) (cancel : Task.Cancel) (fire onCancel : IO Unit) : IO Unit := do
+  timerPending.atomically (modify (·.push { deadline, cancel, fire, onCancel }))
   unless ← flagGet driverActiveRef do ensurePump
   npUvWheelWake
 
-/-- **Stop the running loop**: fail everything parked, drop the queued and wheeled timers, ask the shim to stop,
-and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
+def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit :=
+  liveScheduleCancel deadline cancel fire (pure ())
+
+/-- **Stop the running loop**: fail everything parked, retire the queued and wheeled timers (running each
+cancellation continuation), ask the shim to stop, and wait for the loop to drain. If a pump thread is driving it is waited on; if a single-carrier driver drove
 (and has finished) or nothing did, the stop-drain is run here, because no other thread will. -/
 def stop : IO Unit := do
+  -- A timer retired by a stop will never fire. Run its cancellation continuation so a sleeper
+  -- parked on it is aborted rather than left for a deadline that cannot arrive. This holds even
+  -- when no listener bound a loop table: timers are queued independently of one.
+  let pending ← timerPending.atomically do
+    let ts ← get; set (#[] : Array WheelTimer); return ts
+  let wheeled ← wheelRef.atomically do
+    let w ← get; set (Std.TreeMap.empty : Std.TreeMap Nat (Array WheelTimer)); return w.toList.flatMap (fun (_, ts) => ts.toList)
+  for t in pending.toList ++ wheeled do
+    t.onCancel
   match ← loopRef.get with
   | none => pure ()
   | some table => do
@@ -661,9 +680,11 @@ def stop : IO Unit := do
       for p in parked do
         Task.Join.resolveFirst p.cell p.push
           (.error (.userError "Io: the libuv loop was stopped while an operation was parked"))
-      timerPending.atomically (set (#[] : Array WheelTimer))
-      wheelRef.atomically (set (Std.TreeMap.empty : Std.TreeMap Nat (Array WheelTimer)))
       npUvStop
+      npUvWheelWake
+      -- An active single-carrier driver owns the loop and will drain it; the stopper must not
+      -- drive a second pass on the same loop.
+      if ← flagGet driverActiveRef then return
       match ← pumpRef.get with
       | some t =>
           let _ ← IO.wait t

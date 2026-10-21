@@ -167,7 +167,8 @@ partial def runK (m : VM α) (kok : α → IO Unit) (kerr : IO.Error → IO Unit
     | some (.error e) => kerr e)
   | .sleepE cl d kk => do
     let cancel ← Task.Cancel.new
-    cl.schedule d cancel (runK kk kok kerr kab)
+    cl.scheduleCancel d cancel (runK kk kok kerr kab)
+      (kab (.userError "async: the sleep was cancelled"))
   | .closeE c kk => do
     if (← Io.closeRaw c) then
       runK kk kok kerr kab

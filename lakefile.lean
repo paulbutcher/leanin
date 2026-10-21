@@ -74,6 +74,10 @@ lean_exe asyncFailure where
   root := `LeanIn.Exe.AsyncFailure
   moreLinkArgs := netuvLinkArgs
 
+lean_exe stopDeadline where
+  root := `LeanIn.Exe.StopDeadline
+  moreLinkArgs := netuvLinkArgs
+
 lean_exe asyncResult where
   root := `LeanIn.Exe.AsyncResult
   moreLinkArgs := netuvLinkArgs

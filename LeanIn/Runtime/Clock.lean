@@ -44,6 +44,9 @@ structure Clock where
   action rather than parking a waiter, so a timeout that resolves a cell directly leaves no parked task for a
   winner to abandon — `withTimeout` arms its deadline this way and sets the token when its computation wins. -/
   schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit
+  /-- As `schedule`, with the continuation to run if the timer is retired without firing (a loop
+  stop or a deadline): the sleeper is aborted rather than left parked. -/
+  scheduleCancel : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit → IO Unit
   /-- Whether a read's stall bound should be **swept** (the live clock: a slot the driver expires on its own
   timeout) or **armed** (a harness clock: an instant the driver advances to, retired exactly). -/
   swept : Bool
@@ -66,6 +69,9 @@ def Clock.live (_hooks : Hooks) : Clock :=
   , schedule := fun d cancel fire => do
       let now0 ← IO.monoNanosNow
       Io.liveSchedule (now0 + d.toInt.toNat * 1000000) cancel fire
+  , scheduleCancel := fun d cancel fire onCancel => do
+      let now0 ← IO.monoNanosNow
+      Io.liveScheduleCancel (now0 + d.toInt.toNat * 1000000) cancel fire onCancel
   , swept := true }
 
 /-- The virtual clock's state: the current instant and its pending timers, sorted by instant and FIFO on
@@ -147,6 +153,10 @@ def HarnessClock.clock (hc : HarnessClock) : Clock :=
   , schedule := fun d cancel fire => do
       let now0 ← hc.now
       hc.schedule (now0 + d.val.toNat) (do unless ← Task.Cancel.isSet cancel do fire)
+  , scheduleCancel := fun d cancel fire onCancel => do
+      let now0 ← hc.now
+      hc.schedule (now0 + d.val.toNat) (do
+        if ← Task.Cancel.isSet cancel then onCancel else fire)
   , swept := false }
 
 /-- **The harness clock, composed with the executor wake a virtual driver needs.**
@@ -162,6 +172,9 @@ def HarnessClock.clockWithWake (hc : HarnessClock) (push : Task.Item → BaseIO 
   { base with
     schedule := fun d cancel fire => do
       base.schedule d cancel fire
+      push (Task.Item.ofAction (pure ()))
+    scheduleCancel := fun d cancel fire onCancel => do
+      base.scheduleCancel d cancel fire onCancel
       push (Task.Item.ofAction (pure ())) }
 
 /-- **Run a computation with a harness clock driving it.** The general driver with this clock's reading for the
