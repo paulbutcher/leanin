@@ -265,9 +265,9 @@ static void arm_accept(void) {
   if (sqe == NULL) { io_uring_submit(&g_ring); sqe = io_uring_get_sqe(&g_ring); }
   if (sqe == NULL) return;
   g_accept_len = sizeof(g_accept_addr);
-  io_uring_prep_accept(sqe, g_lfd, (struct sockaddr *)&g_accept_addr, &g_accept_len, SOCK_NONBLOCK);
+  io_uring_prep_multishot_accept(sqe, g_lfd, (struct sockaddr *)&g_accept_addr, &g_accept_len,
+                                 SOCK_NONBLOCK);
   io_uring_sqe_set_data64(sqe, UD_MAKE(0, 0xF0, 0));
-  io_uring_submit(&g_ring);
 }
 
 static int process_cqes(void) {
@@ -294,7 +294,8 @@ static int process_cqes(void) {
           push_ev(EV_ACCEPT, (uint64_t)c->idx, 0);
         }
       }
-      arm_accept();
+      /* Multishot accept stays armed until it terminates; re-arm only the final CQE. */
+      if (!(cqe->flags & IORING_CQE_F_MORE)) arm_accept();
       continue;
     }
     if (idx >= MAX_CONN) continue;

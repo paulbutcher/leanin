@@ -60,3 +60,26 @@ The shape: a small loss at one connection, where per-request orchestration domin
 submission path; a gain at 8 and 32, where batching and fewer socket syscalls pay. These are provisional — one
 host state, no load average recorded, and no repetition after the final buffer-retirement change beyond the
 tests above. Do not promote to a performance record without a same-session paired rerun on a settled host.
+
+## Direct-ring experiment sequence (2026-10-21)
+
+E0: a standalone C HTTP keep-alive server, `bench/uring-http.c`, with
+`IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN`, multishot accept, batched submission and no
+eventfd/epoll. Against the LeanIn libuv `server` on the same `/bench` shape (3 rounds, 3 s, client pinned):
+1.14× at C=1, 1.41× at C=8, 1.43× at C=32. That comparison is **confounded**: E0 is a minimal C server, while
+`server` carries the Lean runtime and HTTP driver, so it does not isolate epoll from io_uring.
+
+E1: the hybrid shim with the two setup flags and one submit per loop. It passes SC27; measured 0.94× at C=1,
+~1.04–1.31× at C=8 and ~1.13× at C=32 against libuv. No C=1 recovery.
+
+E2: multishot accept in the hybrid. SC20/SC22–SC27, http-stream and raw-registry pass. Throughput was
+indistinguishable within the run-to-run noise; accept was not the bottleneck at these levels.
+
+E3: multishot recv with a provided buffer ring in the E0 harness. No consistent gain over E0's one-shot recv:
+C=1 equal or lower, C=8/C=32 equal within noise. The request path is dominated by response construction,
+copying and per-connection orchestration, not recv SQE submission.
+
+Conclusion so far: the ring architecture is sound, but this workload has not shown a stable neturing speedup.
+E1/E2 remain as non-regressing improvements; E3 was not ported. A fair next experiment needs a minimal **libuv**
+C server with the same parser/response, not the Lean server, and then a zero-copy send path from the provided
+buffer before repeating the paired run.
