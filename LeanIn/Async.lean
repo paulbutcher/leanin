@@ -53,6 +53,13 @@ arrow ⇒ its domain — and anything else is a **compile error naming the field
 -/
 
 namespace LeanIn.Async
+
+/-- The two terminal channels of a compiled machine: a successful result and an ordinary failure. The
+callback syntax exposes this continuation directly; `async def` hides it behind `Task.EAsync`. -/
+structure Completion (α : Type) where
+  done : α → IO Unit
+  fail : IO.Error → IO Unit
+
 open Lean Lean.Macro Lean.Parser.Term
 
 /-- A parsed do-item: a node in the body's tree. `contStmt` is internal — a hoisted continuation marker. -/
@@ -231,6 +238,17 @@ private meta partial def piShape (e : Lean.Expr) : Nat × Bool :=
       if b.isForall then go b (n + 1) else (n + 1, t.isArrow || t.isForall)
     | _, n => (n, false)
 
+/-- The type of the last parameter of a function type, if there is one. -/
+private meta partial def lastParamType : Lean.Expr → Option Lean.Expr
+  | .forallE _ t b _ => if b.isForall then lastParamType b else some t
+  | _ => none
+
+/-- Whether a type is `LeanIn.Async.Completion _`. -/
+private meta def isCompletionType (t : Lean.Expr) : Bool :=
+  match t.getAppFn.constName? with
+  | some n => n == ``LeanIn.Async.Completion
+  | none => false
+
 /-- The effect an `await` runs, classified so the generator knows its resume shape and result type. -/
 private inductive Eff where
   | recv (conn : Term) (size : Option Term)  -- `Io.recvRaw c [sz]` → `some` ByteArray continues / `none` closes
@@ -239,6 +257,7 @@ private inductive Eff where
   | sleep (sched : Term) (deadline : Term)  -- `Io.sleepRaw sched d` → `Unit`
   | runVM (m : Term)            -- `VM.runAsync m` → the machine's result (spawn + await a sub-computation)
   | runMachine (fn : Term) (args : List Term)  -- `Foo.run a b …` → the callee's `onDone` payload
+  | runMachineResult (fn : Term) (args : List Term)  -- a result machine's `run` → its `Completion` payload
   | spawn (push : Term) (fn : Term) (args : List Term)  -- `Foo.spawn push a …` → the machine's completion cell
   | join (h : Term)             -- `RawCell.await h` → the cell's value
   | newCell                     -- `RawCell.new` → a fresh completion cell
@@ -287,11 +306,20 @@ private meta def classify (ctx : Ctx) (e : Syntax) : MacroM Eff :=
         let some info := ctx.env.find? resolved
           | Macro.throwError s!"async: internal: `{resolved}` exists and does not"
         let (pis, lastIsFn) := piShape info.type
-        unless lastIsFn do
-          Macro.throwError s!"async: the machine call `{resolved}` does not end in a continuation parameter — a callable machine declares its `onDone`-style parameter last, of function type"
-        unless args.size + 1 == pis do
-          Macro.throwError s!"async: the machine call `{resolved}` takes {pis - 1} ordinary arguments before its continuation, but {args.size} were supplied"
-        pure (.runMachine fn args.toList)
+        if lastIsFn then
+          unless args.size + 1 == pis do
+            Macro.throwError s!"async: the machine call `{resolved}` takes {pis - 1} ordinary arguments before its continuation, but {args.size} were supplied"
+          pure (.runMachine fn args.toList)
+        else
+          match lastParamType info.type with
+          | some t =>
+            if isCompletionType t then
+              unless args.size + 1 == pis do
+                Macro.throwError s!"async: the machine call `{resolved}` takes {pis - 1} ordinary arguments before its completion, but {args.size} were supplied"
+              pure (.runMachineResult fn args.toList)
+            else
+              Macro.throwError s!"async: the machine call `{resolved}` does not end in a continuation or completion parameter — a callable machine declares one last"
+          | none => Macro.throwError s!"async: the machine call `{resolved}` has no parameters"
     else if fn.getId.getString! == "spawn" then do
       -- A spawned machine: the generator emits `Foo.spawn` beside every callable `Foo.run`, so the surface
       -- exists exactly where the sibling `run` is tagged. The first argument is the executor's push.
@@ -472,7 +500,7 @@ private meta def resultBind (eff : Eff) : Bind :=
   | .recvTimeout .. => .recvTimeoutRes
   | .stallRead .. => .recvTimeoutRes
   | .sendAll .. | .send .. => .sendRes
-  | .runMachine .. => .pureB
+  | .runMachine .. | .runMachineResult .. => .pureB
   | _ => .pureB
 
 /-- The suspension for one effect, with continuation `cont`. A source ascription (`let x : T := await …`)
@@ -534,6 +562,14 @@ private meta def suspendTerm (ctx : Ctx) (eff : Eff) (bnd : Option Name) (ty? : 
     let argTs := args.toArray
     let k ← annot bv
     `($fn $argTs* $k)
+  | .runMachineResult fn args =>
+    let bv := bnd.getD `v
+    let argTs := args.toArray
+    let k ← annot bv
+    let fail ← match ctx.done with
+      | some c => `(fun e => ($(mkIdent c)).fail e)
+      | none => `(fun e => throw e)
+    `($fn $argTs* ({ done := $k, fail := $fail } : LeanIn.Async.Completion _))
   | .spawn push fn args =>
     -- A spawned machine: the spawner allocates the completion cell, pushes the machine's first step onto
     -- the executor through the app's own inject, and hands the cell back as the handle. Nothing suspends
@@ -644,11 +680,11 @@ private meta partial def compileBody (ctx : Ctx) (items : List Item) (scope : Li
     unless rest.isEmpty do Macro.throwError "async: `return` must end a path"
     let some done := ctx.done
       | Macro.throwError "async: `return` needs a result-bearing declaration (`async def … : T`)"
-    `(($(mkIdent done)) (.ok $(⟨e⟩)) >>= fun _ => pure ())
+    `(($(mkIdent done)).done $(⟨e⟩) >>= fun _ => pure ())
   | .throw_ e :: rest => do
     unless rest.isEmpty do Macro.throwError "async: `throw` must end a path"
     match ctx.done with
-    | some done => `(($(mkIdent done)) (.error $(⟨e⟩)) >>= fun _ => pure ())
+    | some done => `(($(mkIdent done)).fail $(⟨e⟩) >>= fun _ => pure ())
     | none => `(throw $(⟨e⟩))
   | .contStmt t :: rest => do
     unless rest.isEmpty do Macro.throwError "async: internal continuation marker must end a path"
@@ -918,7 +954,7 @@ elab_rules : command
     | _ => throwError "async: parameters must be `(x : T)`"
   let authored := threadedInfo.map (·.1)
   let doneName := `__asyncDone
-  let doneTy ← `(Except IO.Error $res → IO Unit)
+  let doneTy ← `(LeanIn.Async.Completion $res)
   let threadedInfo := threadedInfo ++ [(doneName, doneTy)]
   let threaded := threadedInfo.map (·.1)
   let items ← Lean.Elab.liftMacroM (parseItems body)
@@ -958,34 +994,32 @@ elab_rules : command
   -- The public entry: ordinary parameters, a result, and compiler-owned completion.
   let authoredArgs := authored.toArray.map (fun x => (mkIdent x : Term))
   let publicCmd ← `(def $n:ident ($(mkIdent c.getId) : $cty) $params* : LeanIn.Task.EAsync IO.Error $res :=
-    ⟨fun k ctx => $runn $(mkIdent c.getId) $authoredArgs* (fun r => k r ctx)⟩)
+    ⟨fun k ctx => $runn $(mkIdent c.getId) $authoredArgs*
+      ({ done := fun v => k (.ok v) ctx, fail := fun e => k (.error e) ctx } : LeanIn.Async.Completion $res)⟩)
   Lean.Elab.Command.elabCommand publicCmd
   if let some d := doc? then
     Lean.Elab.Command.liftTermElabM <| Lean.addDocString n.getId Syntax.missing d
-  -- The spawner, with the completion payload now the authored result.
-  match threadedInfo.getLast? with
-  | some (_, ty) =>
-    match ty.raw with
-    | `($_arg → IO Unit) =>
-      let others := threadedInfo.dropLast
-      let spawnn := mkIdent ((n.getId ++ `spawn).eraseMacroScopes)
-      let binders ← others.toArray.mapM (fun (x, t) => `(bracketedBinder| ($(mkIdent x) : $t)))
-      let ids := others.toArray.map (fun (x, _) => (mkIdent x : Term))
-      let pushId := mkIdent `push
-      let cellName := mkIdent `cell
-      let body ← `(do
-        let $cellName ← LeanIn.Runtime.RawCell.new
-        ($pushId (LeanIn.Task.Item.ofAction
-          ($runn $(mkIdent c.getId) $ids* (fun v => LeanIn.Runtime.RawCell.resolve $cellName v))))
-        pure $cellName)
-      let spawnCmd ← `(def $spawnn:ident
-        ($pushId : LeanIn.Task.Item → BaseIO Unit)
-        ($(mkIdent c.getId) : $cty) $binders* :
-          IO (LeanIn.Runtime.RawCell $_arg) := $body)
-      Lean.Elab.Command.elabCommand spawnCmd
-      modifyEnv fun env => LeanIn.Async.spawnAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `spawn))
-    | _ => pure ()
-  | none => pure ()
+  -- The spawner: the completion cell holds the machine's `Except`, and both channels resolve it.
+  let spawnn := mkIdent ((n.getId ++ `spawn).eraseMacroScopes)
+  let others := threadedInfo.dropLast
+  let binders ← others.toArray.mapM (fun (x, t) => `(bracketedBinder| ($(mkIdent x) : $t)))
+  let ids := others.toArray.map (fun (x, _) => (mkIdent x : Term))
+  let pushId := mkIdent `push
+  let cellName := mkIdent `cell
+  let body ← `(do
+    let $cellName ← LeanIn.Runtime.RawCell.new
+    ($pushId (LeanIn.Task.Item.ofAction
+      ($runn $(mkIdent c.getId) $ids*
+        ({ done := fun v => LeanIn.Runtime.RawCell.resolve $cellName (.ok v),
+           fail := fun e => LeanIn.Runtime.RawCell.resolve $cellName (.error e) } :
+          LeanIn.Async.Completion $res))))
+    pure $cellName)
+  let spawnCmd ← `(def $spawnn:ident
+    ($pushId : LeanIn.Task.Item → BaseIO Unit)
+    ($(mkIdent c.getId) : $cty) $binders* :
+      IO (LeanIn.Runtime.RawCell (Except IO.Error $res)) := $body)
+  Lean.Elab.Command.elabCommand spawnCmd
+  modifyEnv fun env => LeanIn.Async.spawnAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `spawn))
   modifyEnv fun env => LeanIn.Async.machineAttr.ext.addEntry env (ctx.ns ++ (n.getId ++ `run))
 
 end LeanIn.Async

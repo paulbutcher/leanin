@@ -14,6 +14,22 @@ async def immediate (u : Unit) : Nat := do
   let unused := u
   return 42
 
+async def child (u : Unit) : Nat := do
+  let unused := u
+  return 7
+
+async def parent (u : Unit) : Nat := do
+  let x : Nat := await (child.run ())
+  return x + 1
+
+async def badChild (u : Unit) : Nat := do
+  let unused := u
+  throw (IO.userError "child sentinel")
+
+async def parentFails (u : Unit) : Nat := do
+  let x : Nat := await (badChild.run ())
+  return x
+
 async def fails (u : Unit) : Nat := do
   let unused := u
   throw (IO.userError "sentinel")
@@ -30,11 +46,13 @@ def main : IO UInt32 := do
   let a ← Runtime.run e (immediate ())
   let b ← Runtime.run e (afterTimer () clock)
   let c ← Runtime.run e (fails ())
+  let d ← Runtime.run e (parent ())
+  let f ← Runtime.run e (parentFails ())
   Runtime.Io.stop
-  match a, b, c with
-  | .ok 42, .ok 43, .error _ =>
+  match a, b, c, d, f with
+  | .ok 42, .ok 43, .error _, .ok 8, .error _ =>
     IO.println "async-result: immediate and post-suspension returns delivered"
     return 0
-  | _, _, _ =>
+  | _, _, _, _, _ =>
     IO.eprintln "async-result: the returns did not deliver the expected values"
     return 1

@@ -56,12 +56,13 @@ async helloCallback (c : LeanIn.Runtime.Conn) (onDone : Except IO.Error Unit →
 
 `async def name (c : C) … : T := do …` is the compiler-owned-result form. The public `name` returns
 `Task.EAsync IO.Error T`; `return e` delivers `.ok e` through a generated completion parameter the author never
-names. The internal `name.run` keeps that parameter last, so a caller that needs callback style can still use
-it; `name.spawn push …` yields a `RawCell (Except IO.Error T)`.
+names. The internal `name.run` takes a `LeanIn.Async.Completion T` — `done` and `fail` — so a machine-to-machine
+call `await (name.run c …)` keeps the payload `T`, and a failure from the callee is delivered to the caller's
+own failure channel. `name.spawn push …` yields a `RawCell (Except IO.Error T)`.
 
-A result-bearing declaration is called from `IO` or from `Runtime.run`; it is **not** yet a classified
-machine-to-machine effect. An uncaught `throw` is delivered as `.error` (and ends the path); a path that never
-reaches `return`, `throw`, or another terminal never resolves.
+A result-bearing declaration is called from `IO` or from `Runtime.run`, and from a compiled machine with
+`await (name.run …)`; the result payload is `T`, not `Except`. An uncaught `throw` is delivered as `.error` and
+ends the path; a path that never reaches `return`, `throw`, or another terminal never resolves.
 
 ```lean
 async def immediate (u : Unit) : Nat := do
@@ -189,8 +190,9 @@ nix develop -c bash tests/async-diagnostics.sh
 - The effect set is closed; a body needing anything else awaits a `VM.runAsync` of the interpreted machine,
   which can express dynamic effects at the cost of an interpreter step.
 - Machine calls take one continuation last; `select` is over two cells of one type (no heterogeneous race).
-- A result-bearing declaration's public `name` is an `EAsync` value, not a classified effect: calling it with
-  `await` inside a compiled body is unsupported. Its internal `name.run` is the callback-shaped call.
+- A result-bearing declaration's public `name` is an `EAsync` value; compiled code calls its internal
+  `name.run`, which the classifier fills with a `Completion`. `await (name …)` on the public value is not a
+  classified effect.
 - A result-bearing machine resolves on `return` or `throw`. A `throw` becomes `.error` on the public
   `EAsync`; it is not a catchable local exception in this compiled subset.
 - A running handler is not cancelled by a scope of its own: closing a connection ends the I/O but not a
