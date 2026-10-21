@@ -194,5 +194,5 @@ Still open from this handoff:
 - Result-bearing declarations and compiler-owned completion; `onDone` remains the callable-machine contract.
 - Typed helper lowering / extension rules, destructuring `let`, and the collapsed effect classifier.
 - Result-bearing child handles, explicit scopes, and the cancellation/cleanup/timeout lifetime contract.
-- A dedicated runtime fixture for the send-failure policy (the lowering is shared, but only the compiled server
-  scenario currently exercises a send path).
+- ~~A dedicated runtime fixture for the send-failure policy~~ — added as `tests/async-failure.sh`: a peer RST
+  and a delayed megabyte write, with both bound and unbound machines required to reach a terminal.
