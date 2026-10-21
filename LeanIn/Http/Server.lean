@@ -304,6 +304,8 @@ end BodyReader
 to answer. The state checks (a body before its head, a body after `finish`) stay ordinary raises, because those
 are the handler's mistakes, not the transport's. -/
 structure ResponseWriter where
+  /-- Send an interim `100 Continue` (used when the driver's own `autoContinue` is off). -/
+  sendContinue : VM Unit
   start : H1.ResponseHead → VM Unit
   write : ByteArray → VM Unit
   finish : VM Unit
@@ -459,6 +461,7 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
     let s ← (liftGet st)
     liftSet st (f s)
   return {
+    sendContinue := VM.sendAllTransport c #[H1.continueBytes]
     start := fun rh => do
       let declared := rh.headers.any (fun (n, _) => n.toLower == "content-length")
       let closeAsked := rh.headers.any (fun (n, v) =>
