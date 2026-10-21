@@ -6,6 +6,8 @@ cd "$(dirname "$0")/.."
 out=$(nix develop -c lake exe drainDeadline)
 echo "$out"
 grep -q 'returned=yes' <<<"$out"
+grep -q 'aborted=true' <<<"$out"
+grep -q 'exits=1' <<<"$out"
 elapsed=$(sed -n 's/.*elapsedMs=\([0-9]*\).*/\1/p' <<<"$out")
-test -n "$elapsed" && test "$elapsed" -lt 2000
+test -n "$elapsed" && test "$elapsed" -lt 1000
 echo "drain-deadline: ok"

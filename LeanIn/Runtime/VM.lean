@@ -456,27 +456,6 @@ def runAsync (m : VM α) (resume : α → IO Unit) : IO Unit :=
     runToCell m cell
     RawCell.await cell resume
 
-/-- Run a machine under a scope and return its result, exiting the scope on every terminal path. An
-ordinary raise is re-raised after the cleanup; an abort no `tryAbort` handled is likewise re-raised. -/
-def runScoped (scope : Scope) (m : VM α) : IO α := do
-  let cell ← RawCell.new
-  runK (some scope) m
-    (fun v => do scope.exit; RawCell.resolve cell v)
-    (fun e => do scope.exit; throw e)
-    (fun r => do scope.exit; throw r)
-  let out ← IO.mkRef (none : Option α)
-  RawCell.await cell (fun v => out.set (some v))
-  match ← out.get with
-  | some v => return v
-  | none => throw (.userError "VM.runScoped: the scope exited without a value")
-
-/-- Create a scope, hand it to the caller, then run the machine under it. This is the entry a server uses
-to publish a request's scope for later cancellation without taking the scope away from the machine. -/
-def runScopedWith (onScope : Scope → IO Unit) (m : VM α) : IO α := do
-  let scope ← Scope.new
-  onScope scope
-  runScoped scope m
-
 /-- **Run a machine under a cancellation scope.** The scope's token is read at every interpreter step and its
 registered timer retirements are run by `cancelNow`; the terminal continuation — value, raise or abort — runs
 the scope's cleanup exactly once. Wrap the machine in `requestScope` when the caller wants cancellation and

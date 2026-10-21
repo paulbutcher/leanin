@@ -10,8 +10,9 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   and timers, and then awaits the registry, so a handler parked in a long sleep cannot hold shutdown.
   A drain that finishes first disarms the timer.
   - Evidence: `Runtime.Net.serveUntilStoppedWithDeadline`, `Runtime.stopWithDeadline`,
-    `bash tests/drain-deadline.sh` (one client, 60 s handler sleep, 100 ms grace, returns in
-    ~101 ms) and `bash tests/stop-deadline.sh` (scope reports `aborted` in ~151 ms).
+    `bash tests/drain-deadline.sh` (one client, 60 s handler sleep, 100 ms grace: the request reports
+    `aborted`, its scope cleanup runs once, and the loop returns in ~101 ms) and
+    `bash tests/stop-deadline.sh` (scope reports `aborted` in ~151 ms).
 - [x] **Cancellable parked timers.** Wheel entries carry an `onCancel` and an identity;
   `Clock.scheduleCancel` returns a retirement action, and `VM.sleep` registers it with the ambient
   `Scope`. `Scope.cancelNow` retires the wheel entry immediately (or the driver runs `onCancel` if
