@@ -41,8 +41,10 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [ ] **One continue policy.** `Limits.autoContinue` defaults true and is independent of a
   handler's `onContinue`; a router's decision is ignored unless the config also turns
   `autoContinue` off. Make the policy single and explicit, with a safe default.
-- [ ] **General interim responses.** Only `100 Continue` is exposed via `sendContinue`; add a
-  general 1xx writer path for `103 Early Hints`.
+- [x] **General interim responses.** `ResponseWriter.interim` writes any 1xx head before `start`
+  (HTTP/1.1 only; a non-1xx status raises), and `sendContinue` remains the 100 case.
+  - Evidence: `tests/http-stream.sh` reads `103 Early Hints` before the final `200` from the
+    `/hints` route.
 - [ ] **Multi-carrier serving.** The shipped HTTP entry points are single-carrier; wire a
   multi-carrier accept/connection path and state the affinity rules.
 - [x] **Correct the H1 documentation.** The module doc now states the implemented framing,

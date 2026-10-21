@@ -5305,6 +5305,7 @@ def controlVMAbort : IO Unit := do
   -- The writer whose `write` is the writer's own wrapper around a scripted completion: no socket, one sentinel.
   let failingWriter : LeanIn.Http.Server.ResponseWriter :=
     { sendContinue := pure ()
+      interim := fun _ => pure ()
       start := detectStart
       write := fun _ => LeanIn.Runtime.VM.abortOnFailure fun _ fail => fail sentinel
       finish := pure ()
@@ -5312,6 +5313,7 @@ def controlVMAbort : IO Unit := do
       code := pure (some 500) }
   let okWriter : LeanIn.Http.Server.ResponseWriter :=
     { sendContinue := pure ()
+      interim := fun _ => pure ()
       start := detectStart
       write := fun _ => pure ()
       finish := pure ()
@@ -5341,6 +5343,7 @@ def controlVMAbort : IO Unit := do
   -- driver close and report it), not a raise that escapes to the runner.
   let fallbackWriter (failStart : Bool) : LeanIn.Http.Server.ResponseWriter :=
     { sendContinue := pure ()
+      interim := fun _ => pure ()
       start := fun rh =>
         if failStart then
           (LeanIn.Runtime.VM.abortOnFailure

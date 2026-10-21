@@ -324,6 +324,10 @@ are the handler's mistakes, not the transport's. -/
 structure ResponseWriter where
   /-- Send an interim `100 Continue` (used when the driver's own `autoContinue` is off). -/
   sendContinue : VM Unit
+  /-- Send any 1xx interim response (for example `103 Early Hints`) before `start`. Only HTTP/1.1
+  carries interim responses; on HTTP/1.0 this is a no-op. A status outside 100–199 is a handler
+  mistake and raises. -/
+  interim : H1.ResponseHead → VM Unit
   start : H1.ResponseHead → VM Unit
   write : ByteArray → VM Unit
   finish : VM Unit
@@ -485,6 +489,11 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
     liftSet st (f s)
   return {
     sendContinue := VM.sendAllTransport c #[H1.continueBytes]
+    interim := fun rh => do
+      unless 100 ≤ rh.status && rh.status < 200 do
+        throw (.userError s!"Http.ResponseWriter.interim: status {rh.status} is not 1xx")
+      if version == .v11 then
+        VM.sendAllTransport c #[H1.encodeResponseHead rh]
     start := fun rh => do
       let declared := rh.headers.any (fun (n, _) => n.toLower == "content-length")
       let closeAsked := rh.headers.any (fun (n, v) =>

@@ -125,6 +125,17 @@ head, rest = recv_head(s)
 check("413 over limit", "413" in head and "Payload Too Large" in head, f"{head!r}")
 s.close()
 
+# A 103 interim response is written before the final head.
+s = connect()
+s.sendall(b"GET /hints HTTP/1.1\r\nHost: x\r\n\r\n")
+h1, rest = recv_head(s)
+buf = rest
+while b"HTTP/1.1 200" not in buf:
+    buf += s.recv(4096)
+check("103 interim response", "103 Early Hints" in h1 and b"HTTP/1.1 200" in buf,
+      f"{h1!r} {buf!r}")
+s.close()
+
 # A handler parked in a sleep is cancelled by its request scope: no response bytes and EOF.
 s = connect()
 s.settimeout(3)
