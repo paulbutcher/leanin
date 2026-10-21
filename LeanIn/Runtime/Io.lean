@@ -192,6 +192,7 @@ private initialize pumpRef : IO.Ref (Option (_root_.Task (Except IO.Error Unit))
 sets to disarm the loser, and the fire — the parked waiter's own continuation, enqueued on the shared route so
 it runs on a carrier rather than here. -/
 private structure WheelTimer where
+  id       : Nat
   deadline : Nat
   cancel   : Task.Cancel
   fire     : IO Unit
@@ -208,6 +209,9 @@ or the pump thread, never both at once — so the lock is uncontended; it exists
 an entry point changes which one drives, not because two threads share it. The driver drains `timerPending`
 into it and reads the earliest deadline and the due timers from it, both `O(log n)`. -/
 private initialize wheelRef : Std.Mutex (Std.TreeMap Nat (Array WheelTimer)) ← Std.Mutex.new Std.TreeMap.empty
+
+/-- The next wheel entry's identity, for retiring one timer without touching its neighbours. -/
+private initialize timerNextId : IO.Ref Nat ← IO.mkRef 0
 
 /-- A signal waiter: the signum it is for, the cell resolved with that signum when the shim's watcher fires, and
 the route the waiter was registered on. One watch at a time for now — the one the signal-driven drain uses. -/
@@ -554,8 +558,7 @@ def driveOnce (ownedWorkOnly : Bool) : IO Bool := do
     set w'
     return due
   for t in due do
-    unless ← Task.Cancel.isSet t.cancel do
-      t.fire
+    if ← Task.Cancel.isSet t.cancel then t.onCancel else t.fire
   -- Firing a timer enqueued its continuation on the executor's inject. If any fired, that work is ready now, so
   -- harvest socket events *without* parking and return: the driver runs those continuations before it would
   -- block again. Parking here instead is the hang — the poll cannot see the executor's queue.
@@ -642,19 +645,38 @@ def ensurePump : IO Unit := do
         let t ← IO.asTask pumpLoop _root_.Task.Priority.dedicated
         pumpRef.set (some t)
 
-/-- **Schedule a fire at a monotone-nanosecond deadline.** Callable from any carrier: the entry is appended to
-the hand-off queue, and the loop is woken so a deadline earlier than its current park is picked up at once. A
-pump is started only if no single-carrier driver is active — when one is, it drains the queue on its own idle
-step. The wake is load-bearing, not an optimisation: a timer scheduled while the loop is parked with nothing
-armed strands without it (SC11's shape), so it is sent unconditionally rather than gated on a park state that
-could be read stale. -/
-def liveScheduleCancel (deadline : Nat) (cancel : Task.Cancel) (fire onCancel : IO Unit) : IO Unit := do
-  timerPending.atomically (modify (·.push { deadline, cancel, fire, onCancel }))
+/-- **Retire one timer by identity.** If it is still queued or wheeled it is removed and its cancellation
+continuation runs; if the driver has already taken it as due, the caller has set the token, so the driver runs
+the cancellation continuation there instead. Callers that set the token before this call (a scope cancel does)
+therefore get exactly one of fire and onCancel. -/
+def liveCancelTimer (id : Nat) : IO Unit := do
+  let takenPending ← timerPending.atomically do
+    let ts ← get
+    let (hit, rest) := ts.partition (·.id == id)
+    set rest
+    return hit
+  let takenWheel ← wheelRef.atomically do
+    let w ← get
+    let mut hit : Array WheelTimer := #[]
+    let mut w' : Std.TreeMap Nat (Array WheelTimer) := Std.TreeMap.empty
+    for (d, ts) in w.toList do
+      let (mine, rest) := ts.partition (·.id == id)
+      hit := hit ++ mine
+      unless rest.isEmpty do w' := w'.insert d rest
+    set w'
+    return hit
+  let hit := takenPending ++ takenWheel
+  for t in hit.toList do t.onCancel
+
+def liveScheduleCancel (deadline : Nat) (cancel : Task.Cancel) (fire onCancel : IO Unit) : IO (IO Unit) := do
+  let id ← timerNextId.modifyGet fun n => (n, n + 1)
+  timerPending.atomically (modify (·.push { id, deadline, cancel, fire, onCancel }))
   unless ← flagGet driverActiveRef do ensurePump
   npUvWheelWake
+  return (liveCancelTimer id : IO Unit)
 
-def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit :=
-  liveScheduleCancel deadline cancel fire (pure ())
+def liveSchedule (deadline : Nat) (cancel : Task.Cancel) (fire : IO Unit) : IO Unit := do
+  let _ ← liveScheduleCancel deadline cancel fire (pure ())
 
 /-- **Abort everything waiting, without stopping the loop**: fail parked operations, retire queued and
 wheeled timers (running each cancellation continuation), and mark the table stopped so accepts fail.

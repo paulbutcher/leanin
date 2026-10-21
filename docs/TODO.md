@@ -12,15 +12,19 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   - Evidence: `Runtime.Net.serveUntilStoppedWithDeadline`, `Runtime.stopWithDeadline`,
     `bash tests/drain-deadline.sh` (one client, 60 s handler sleep, 100 ms grace, returns in
     ~101 ms) and `bash tests/stop-deadline.sh` (scope reports `aborted` in ~151 ms).
-- [ ] **Cancellable parked timers.** Wheel entries now carry an `onCancel`, `VM.sleep` supplies an
-  abort continuation, and `Io.abortAll`/`Io.stop` run it so a parked sleeper is aborted rather than
-  dropped. Deadline cancellation of the whole loop is exercised by `tests/stop-deadline.sh`.
-  - Remaining: an ambient per-request cancellation scope that `sleepE` registers with, so a
-    user-triggered cancel (not a loop stop) aborts the sleeper; `onExit` does not exist yet and
-    exactly-once cleanup is untested.
-- [ ] **Request/handler scope.** User-triggered cancellation, child cancellation, and exactly-once
-  cleanup on scope exit. Transport abort exists; the general scope does not.
-  - Depends on the timer cancellation above for parked handlers.
+- [x] **Cancellable parked timers.** Wheel entries carry an `onCancel` and an identity;
+  `Clock.scheduleCancel` returns a retirement action, and `VM.sleep` registers it with the ambient
+  `Scope`. `Scope.cancelNow` retires the wheel entry immediately (or the driver runs `onCancel` if
+  it already took the timer), so a user cancel aborts a parked sleeper without waiting for its
+  deadline. `Io.abortAll`/`Io.stop` retire every timer on shutdown.
+  - Evidence: `tests/scope-cancel.sh` (a scoped 60 s sleep aborts in ~50 ms) and
+    `tests/stop-deadline.sh` (loop-wide abort).
+- [x] **Request/handler scope.** `Runtime.Scope` carries a token, live timer retirements, child
+  scopes and exit actions. `VM.withScope` creates a request scope (a child when one is active),
+  `VM.runScoped`/`runAsyncScoped` exit it exactly once on value, raise or abort, and the streaming
+  HTTP driver publishes each request's scope through `Config.onScope`. User cancellation and child
+  propagation are exercised by `tests/scope-cancel.sh`; `tests/http-stream.sh` cancels a `/slow`
+  handler parked in a sleep and observes EOF with no response bytes.
 - [x] **Bound streaming request bodies.** `BodyReader` carries the connection's
   `Config.h1.maxBody` and a delivered-byte count. A declared `Content-Length` over the limit is
   answered `413` before the handler runs; a chunked or fixed read that crosses the limit raises

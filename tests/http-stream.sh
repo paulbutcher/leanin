@@ -125,6 +125,17 @@ head, rest = recv_head(s)
 check("413 over limit", "413" in head and "Payload Too Large" in head, f"{head!r}")
 s.close()
 
+# A handler parked in a sleep is cancelled by its request scope: no response bytes and EOF.
+s = connect()
+s.settimeout(3)
+s.sendall(b"GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+try:
+    early = s.recv(4096)
+except socket.timeout:
+    early = b"<timeout>"
+check("request scope cancels a parked handler", early == b"", f"{early!r}")
+s.close()
+
 # A client that dies mid-body does not take the server down.
 s = connect()
 s.sendall(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nshort")

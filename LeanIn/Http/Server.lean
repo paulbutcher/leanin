@@ -68,6 +68,10 @@ structure Config where
   clock        : Clock
   /-- The longest a single read may wait for bytes or EOF. -/
   stallTimeout : Std.Time.Millisecond.Offset := 12000
+  /-- Called once per streamed request with its head and a fresh cancellation scope. A server may retain the
+  scope and cancel the request (for a shutdown deadline or an application decision); the request's timers are
+  retired and its cleanup runs exactly once. -/
+  onScope      : H1.Head → Runtime.Scope → IO Unit := fun _ _ => pure ()
 
 /-- Whether a step got anywhere: it wrote bytes, or handled an event other than `needMoreData`, which the
 machine re-emits on every starved step. The loop reads only when this is false, so no iteration can return to
@@ -574,7 +578,7 @@ async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Stream
     let head : H1.Head := req.1
     let initial : ByteArray := req.2
     let answered : Outcome (Bool × ByteArray × (Bool × Bool × Bool)) :=
-      await (LeanIn.Runtime.VM.runAsync (VM.requestScope (do
+      await (LeanIn.Runtime.VM.runAsync (LeanIn.Runtime.VM.withScope (cfg.onScope head) (VM.requestScope (do
       let reader ← (monadLift (Stream.bodyReader head initial c cfg.clock cfg.stallTimeout cfg.h1.maxBody) : VM BodyReader)
       let writer ← (monadLift (Stream.responseWriter c head.version machine.keepAlive) : VM ResponseWriter)
       let chunked := H1.chunked? head
@@ -605,7 +609,7 @@ async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Stream
         -- abort escape `VM.attempt` and `runToCell`'s runner, leaving the connection unclosed.
         Stream.respond writer { status := 500, reason := "Internal Server Error" } "".toUTF8
       let st' ← writer.status
-      return (drained, left, st'))))
+      return (drained, left, st')))))
     match answered with
     | .ok res =>
       let drained : Bool := res.1

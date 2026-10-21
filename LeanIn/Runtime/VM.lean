@@ -109,6 +109,96 @@ inductive Outcome (α : Type) where
   /-- A transport operation aborted the machine; `reason` is the transport failure that did it. -/
   | aborted (reason : IO.Error)
 
+/-- **A cancellation scope**: one token, the timers currently waiting under it, the child scopes, and the
+cleanup actions a request registered. Cancellation sets the token and runs the registered timer retirements;
+the computation aborts at its next interpreter step or at the timer it was parked on. `exit` runs the cleanup
+list exactly once, whether the computation succeeded, raised, or aborted. -/
+structure ScopeState where
+  /-- Live timers: identity and the action that retires one. -/
+  waits : List (Nat × IO Unit) := []
+  /-- Actions run once when the scope exits. -/
+  exits : List (IO Unit) := []
+  /-- Child cancel actions, cancelled with the parent. -/
+  children : List (Nat × IO Unit) := []
+  nextId : Nat := 0
+  exited : Bool := false
+  /-- The cancellation abort has been delivered; a late step or timer must not deliver a second. -/
+  cancelDelivered : Bool := false
+
+structure Scope where
+  id : Nat := 0
+  cancel : Task.Cancel
+  /-- The parent's state cell, for unregistering on exit. -/
+  parent : Option (Std.Mutex ScopeState) := none
+  state : Std.Mutex ScopeState
+
+namespace Scope
+
+def new : IO Scope := do
+  return { cancel := ← Task.Cancel.new, state := ← Std.Mutex.new ({} : ScopeState) }
+
+/-- Register a timer retirement; the returned action removes it (a normal fire or abort). -/
+def addWait (s : Scope) (retire : IO Unit) : IO (IO Unit) := do
+  let id ← s.state.atomically do
+    let st ← get
+    let id := st.nextId
+    set { st with nextId := id + 1, waits := (id, retire) :: st.waits }
+    return id
+  return (s.state.atomically (modify (fun st => { st with waits := st.waits.filter (·.1 != id) })) : IO Unit)
+
+/-- Register cleanup to run on the scope's single exit. -/
+def onExit (s : Scope) (act : IO Unit) : IO Unit :=
+  s.state.atomically (modify (fun st => { st with exits := act :: st.exits }))
+
+/-- Cancel: set the token, take the live timers and children, then retire the timers and cancel the children.
+Their abort continuations (or the interpreter's next step) deliver the abort; `exit` then runs cleanup once. -/
+def cancelNow (s : Scope) : IO Unit := do
+  Task.Cancel.set s.cancel
+  let (waits, children) ← s.state.atomically do
+    let st ← get
+    set { st with waits := [], children := [] }
+    return (st.waits.map (·.2), st.children.map (·.2))
+  for retire in waits do retire
+  for cancelChild in children do cancelChild
+
+/-- A child scope: it is cancelled with its parent and unregisters itself when it exits. -/
+def child (p : Scope) : IO Scope := do
+  let c ← Scope.new
+  let id ← p.state.atomically do
+    let st ← get
+    let id := st.nextId
+    set { st with nextId := id + 1, children := (id, c.cancelNow) :: st.children }
+    return id
+  return { c with id, parent := some p.state }
+
+/-- First request for the cancellation abort. False once one was delivered, so a step and a timer cannot both
+run the abort continuation. -/
+def claimCancel (s : Scope) : IO Bool := do
+  s.state.atomically do
+    let st ← get
+    if st.cancelDelivered then return false
+    set { st with cancelDelivered := true }
+    return true
+
+/-- Run the cleanup list once. A second call, whether from another terminal path or an explicit call, does
+nothing. -/
+def exit (s : Scope) : IO Unit := do
+  let exits? ← s.state.atomically do
+    let st ← get
+    if st.exited then return none
+    set { st with exited := true, waits := [], children := [] }
+    return some st.exits
+  match exits? with
+  | none => pure ()
+  | some exits =>
+      for act in exits do act
+      match s.parent with
+      | none => pure ()
+      | some p =>
+          p.atomically (modify (fun st => { st with children := st.children.filter (·.1 != s.id) }))
+
+end Scope
+
 /-- A defunctionalized computation. -/
 inductive VM (α : Type) where
   | pure (v : α)
@@ -126,7 +216,7 @@ inductive VM (α : Type) where
   continuation positions, exactly as it does for the other effects. The error continuation is what lets a
   `bind` thread a `tryE`'s catch through the leaf, and the abort continuation is what lets an abort raised in
   the leaf's continuation stay an abort instead of being caught as a raise. -/
-  | ioLeaf (act : (α → IO Unit) → (IO.Error → IO Unit) → (IO.Error → IO Unit) → IO Unit)
+  | ioLeaf (act : Option Scope → (α → IO Unit) → (IO.Error → IO Unit) → (IO.Error → IO Unit) → IO Unit)
   /-- A raise, and its catch. A connection loop answers a failed handler rather than dying with it. -/
   | throwE (err : IO.Error)
   | tryE (body : VM α) (handler : IO.Error → VM α)
@@ -136,6 +226,9 @@ inductive VM (α : Type) where
   /-- **An abort scope**: an abort in the enclosed machine becomes the handler's to run, exactly as `tryE` does
   for raises. A request boundary uses it to turn cancellation into a tagged `Outcome`; nothing narrower does. -/
   | tryAbortE (body : VM α) (handler : IO.Error → VM α)
+  /-- A nested cancellation scope: create it (as a child when one is already active), publish it, run the
+  body, and exit it on every terminal path. -/
+  | scopeE (onScope : Scope → IO Unit) (body : VM α)
   | empty
 
 namespace VM
@@ -148,37 +241,70 @@ continuation too — so a raise is caught *wherever* it happens: synchronously, 
 `tryAbort` replaces, so a cancellation passes every ordinary catch on its way to the request boundary. The
 top-level entries pass `throw` for both, so a `VM` nobody scopes fails loudly where it resumes. `partial`
 because a connection loop has no bound. -/
-partial def runK (m : VM α) (kok : α → IO Unit) (kerr : IO.Error → IO Unit)
-    (kab : IO.Error → IO Unit) : IO Unit :=
+partial def runK (scope : Option Scope) (m : VM α) (kok : α → IO Unit) (kerr : IO.Error → IO Unit)
+    (kab : IO.Error → IO Unit) : IO Unit := do
+  match scope with
+  | some s =>
+      if ← Task.Cancel.isSet s.cancel then
+        if ← s.claimCancel then
+          kab (.userError "VM: the scope was cancelled")
+          return
+  | none => (Pure.pure () : IO Unit)
   match m with
   | .pure v => kok v
   | .recvE c kk => Io.recvRaw c 65536 (fun
-    | .ok d    => runK (kk d) kok kerr kab
+    | .ok d    => runK scope (kk d) kok kerr kab
     | .error e => kerr e)
   | .sendE c bs kk => Io.sendRaw c bs (fun
-    | .ok _    => runK kk kok kerr kab
+    | .ok _    => runK scope kk kok kerr kab
     | .error e => kerr e)
   | .sendAllE c cs kk => Io.sendAllRaw c cs (fun
-    | .ok _    => runK kk kok kerr kab
+    | .ok _    => runK scope kk kok kerr kab
     | .error e => kerr e)
   | .recvTimeoutE c cl d kk => Io.recvTimeoutRaw c cl.schedule d 65536 (fun
-    | none            => runK (kk none) kok kerr kab
-    | some (.ok d)    => runK (kk (some d)) kok kerr kab
+    | none            => runK scope (kk none) kok kerr kab
+    | some (.ok d)    => runK scope (kk (some d)) kok kerr kab
     | some (.error e) => kerr e)
   | .sleepE cl d kk => do
-    let cancel ← Task.Cancel.new
-    cl.scheduleCancel d cancel (runK kk kok kerr kab)
-      (kab (.userError "async: the sleep was cancelled"))
+    let cancel ← match scope with
+      | some s => (Pure.pure s.cancel : IO Task.Cancel)
+      | none   => Task.Cancel.new
+    let unregRef ← IO.mkRef ((Pure.pure () : IO Unit))
+    let unregister : IO Unit := do (← unregRef.get)
+    let fire : IO Unit := do
+      unregister
+      runK scope kk kok kerr kab
+    let onCancel : IO Unit := do
+      unregister
+      match scope with
+      | some s => if ← s.claimCancel then kab (.userError "VM: the sleep was cancelled by its scope")
+      | none   => kab (.userError "VM: the sleep was cancelled")
+    let retire ← cl.scheduleCancel d cancel fire onCancel
+    match scope with
+    | some s =>
+        unregRef.set (← s.addWait retire)
+        -- A cancel that took the wait list before this registration still owns the token.
+        if ← Task.Cancel.isSet cancel then retire
+    | none => (Pure.pure () : IO Unit)
   | .closeE c kk => do
     if (← Io.closeRaw c) then
-      runK kk kok kerr kab
+      runK scope kk kok kerr kab
     else
       kerr (.userError "Io.closeRaw: the loop refused a close submission")
-  | .ioLeaf act => act kok kerr kab
+  | .ioLeaf act => act scope kok kerr kab
   | .throwE e => kerr e
-  | .tryE b h => runK b kok (fun e => runK (h e) kok kerr kab) kab
+  | .tryE b h => runK scope b kok (fun e => runK scope (h e) kok kerr kab) kab
   | .abortE r => kab r
-  | .tryAbortE b h => runK b kok kerr (fun r => runK (h r) kok kerr kab)
+  | .tryAbortE b h => runK scope b kok kerr (fun r => runK scope (h r) kok kerr kab)
+  | .scopeE onScope body => do
+      let sc ← match scope with
+        | some p => Scope.child p
+        | none   => Scope.new
+      onScope sc
+      runK (some sc) body
+        (fun v => do sc.exit; kok v)
+        (fun e => do sc.exit; kerr e)
+        (fun r => do sc.exit; kab r)
   | .empty    => (Pure.pure () : IO Unit)
 
 /-- A default for the `partial` bind's unreachable fallback — never produced by a real machine. -/
@@ -194,11 +320,13 @@ protected partial def bind : VM α → (α → VM β) → VM β
   | .closeE c k, f => .closeE c (VM.bind k f)
   | .sleepE cl d k, f => .sleepE cl d (VM.bind k f)
   | .ioLeaf act, f =>
-    .ioLeaf (fun kok kerr kab => act (fun v => VM.runK (f v) kok kerr kab) kerr kab)
+    .ioLeaf (fun scope kok kerr kab =>
+      act scope (fun v => VM.runK scope (f v) kok kerr kab) kerr kab)
   | .throwE e, _ => .throwE e
   | .tryE b h, f => .tryE (VM.bind b f) (fun e => VM.bind (h e) f)
   | .abortE r, _ => .abortE r
   | .tryAbortE b h, f => .tryAbortE (VM.bind b f) (fun r => VM.bind (h r) f)
+  | .scopeE on body, f => .scopeE on (VM.bind body f)
   | .empty, _ => .empty
 
 instance : Monad VM where
@@ -217,7 +345,7 @@ error continuation, exactly as a `throwE` does. The catch surrounds the **lifted
 continuation then runs outside it, so a failure raised downstream — including an abort on its way to the
 request scope — is never reclassified as this leaf's ordinary error. -/
 instance : MonadLift IO VM where
-  monadLift act := .ioLeaf (fun kok kerr _ => do
+  monadLift act := .ioLeaf (fun _ kok kerr _ => do
     match ← liftStep act with
     | .ok v => kok v
     | .error e => kerr e)
@@ -245,7 +373,7 @@ is an abort rather than a raise the nearest `tryE` would catch. `act` receives t
 failure continuation; it is the only place the classification lives, so a `bind`'s later steps — including a
 client's `throwE` — run with the ordinary error channel and stay ordinary. -/
 def abortOnFailure (act : (α → IO Unit) → (IO.Error → IO Unit) → IO Unit) : VM α :=
-  .ioLeaf (fun kok _kerr kab => act kok kab)
+  .ioLeaf (fun _ kok _kerr kab => act kok kab)
 
 /-- **A read with a deadline as the transport's**: a raw read failure aborts at the read. The caller still
 decides what a deadline or an end of stream means — the streaming body reader aborts both. -/
@@ -272,6 +400,13 @@ def sendAllTransport (c : Conn) (chunks : Array ByteArray) : VM Unit :=
 it, an abort has no catch at all and the machine fails loudly where it resumes. -/
 def tryAbort (m : VM α) (handler : IO.Error → VM α) : VM α := .tryAbortE m handler
 
+/-- **A cancellation scope around `m`.** The scope is created when the node runs, published through
+`onScope`, and exited exactly once whether `m` returns, raises or aborts. A scope inside another is created as
+its child, so the parent's cancellation reaches it. -/
+def withScope (onScope : Scope → IO Unit) (m : VM α) : VM α := .scopeE onScope m
+
+
+
 /-- **The request scope**: run `m` and tag how it ended, so a driver distinguishes an ordinary error, which it
 may answer, from a transport abort, which it may only close. -/
 def requestScope (m : VM α) : VM (Outcome α) :=
@@ -295,17 +430,17 @@ def close (c : Conn) : VM Unit := .closeE c (.pure ())
 channel passes through the leaf untouched, so a leaf's failure is an ordinary raise unless a `transport` scope
 is what encloses it. -/
 def ioE (act : (α → IO Unit) → (IO.Error → IO Unit) → IO Unit) : VM α :=
-  .ioLeaf (fun kok kerr _ => act kok kerr)
+  .ioLeaf (fun _ kok kerr _ => act kok kerr)
 
 /-- **Run a connection loop** (fire-and-forget: the result is `Unit`; a raise nobody catches fails where the
 machine resumes, and so does an abort nobody scopes — both are `throw`s here rather than a silent close). -/
 def run (m : VM Unit) : IO Unit :=
-  runK m (fun _ => (Pure.pure () : IO Unit)) (fun e => throw e) (fun r => throw r)
+  runK none m (fun _ => (Pure.pure () : IO Unit)) (fun e => throw e) (fun r => throw r)
 
 /-- **Run a machine to a raw cell** (drive it, resolve the cell on completion; a raise nobody catches fails
 where the machine resumes, and an abort nobody scopes fails there too). -/
 def runToCell (m : VM α) (cell : RawCell α) : IO Unit :=
-  runK m (fun v => RawCell.resolve cell v) (fun e => throw e) (fun r => throw r)
+  runK none m (fun v => RawCell.resolve cell v) (fun e => throw e) (fun r => throw r)
 
 /-- **Spawn a machine and await its result** (run it to a fresh cell, park `resume` on it). This is the effect
 an `async` uses to await a sub-computation — a handler that itself suspends: `runToCell` starts the
@@ -320,6 +455,44 @@ def runAsync (m : VM α) (resume : α → IO Unit) : IO Unit :=
     let cell ← RawCell.new
     runToCell m cell
     RawCell.await cell resume
+
+/-- Run a machine under a scope and return its result, exiting the scope on every terminal path. An
+ordinary raise is re-raised after the cleanup; an abort no `tryAbort` handled is likewise re-raised. -/
+def runScoped (scope : Scope) (m : VM α) : IO α := do
+  let cell ← RawCell.new
+  runK (some scope) m
+    (fun v => do scope.exit; RawCell.resolve cell v)
+    (fun e => do scope.exit; throw e)
+    (fun r => do scope.exit; throw r)
+  let out ← IO.mkRef (none : Option α)
+  RawCell.await cell (fun v => out.set (some v))
+  match ← out.get with
+  | some v => return v
+  | none => throw (.userError "VM.runScoped: the scope exited without a value")
+
+/-- Create a scope, hand it to the caller, then run the machine under it. This is the entry a server uses
+to publish a request's scope for later cancellation without taking the scope away from the machine. -/
+def runScopedWith (onScope : Scope → IO Unit) (m : VM α) : IO α := do
+  let scope ← Scope.new
+  onScope scope
+  runScoped scope m
+
+/-- **Run a machine under a cancellation scope.** The scope's token is read at every interpreter step and its
+registered timer retirements are run by `cancelNow`; the terminal continuation — value, raise or abort — runs
+the scope's cleanup exactly once. Wrap the machine in `requestScope` when the caller wants cancellation and
+transport aborts as an `Outcome` rather than a throw. -/
+def runAsyncScoped (scope : Scope) (m : VM α) (resume : α → IO Unit) : IO Unit :=
+  match m with
+  | .pure v => do
+      scope.exit
+      resume v
+  | _ => do
+      let cell ← RawCell.new
+      runK (some scope) m
+        (fun v => do scope.exit; RawCell.resolve cell v)
+        (fun e => do scope.exit; throw e)
+        (fun r => do scope.exit; throw r)
+      RawCell.await cell resume
 
 end VM
 

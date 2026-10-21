@@ -46,7 +46,7 @@ structure Clock where
   schedule : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit
   /-- As `schedule`, with the continuation to run if the timer is retired without firing (a loop
   stop or a deadline): the sleeper is aborted rather than left parked. -/
-  scheduleCancel : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit → IO Unit
+  scheduleCancel : Std.Time.Millisecond.Offset → Task.Cancel → IO Unit → IO Unit → IO (IO Unit)
   /-- Whether a read's stall bound should be **swept** (the live clock: a slot the driver expires on its own
   timeout) or **armed** (a harness clock: an instant the driver advances to, retired exactly). -/
   swept : Bool
@@ -79,8 +79,10 @@ ties. -/
 structure HarnessState where
   /-- Virtual nanoseconds. -/
   now    : Nat := 0
-  /-- The pending timers, earliest first. -/
-  timers : List (Nat × IO Unit) := []
+  /-- The pending timers, earliest first: identity, instant, fire. -/
+  timers : List (Nat × Nat × IO Unit) := []
+  /-- The next timer identity. -/
+  nextId : Nat := 0
 deriving Inhabited
 
 /-- **A clock the harness drives.** Nothing registered with libuv: an instant is a number and a fire is a list
@@ -107,13 +109,29 @@ loop pump's park), a harness instant lives in this list, not in libuv's wheel, a
 it is the *driver* — parked on the executor's condition variable. `HarnessClock.clockWithWake` is the
 composition that supplies that wake; a caller using the bare `clock` arms instants that a driver already
 parked will not see. -/
-def HarnessClock.schedule (hc : HarnessClock) (instant : Nat) (fire : IO Unit) : BaseIO Unit :=
+def HarnessClock.scheduleId (hc : HarnessClock) (instant : Nat) (fire : IO Unit) : BaseIO Nat :=
   hc.state.atomically do
     let s ← get
-    let rec ins : List (Nat × IO Unit) → List (Nat × IO Unit)
-      | []              => [(instant, fire)]
-      | (t, f) :: rest  => if instant < t then (instant, fire) :: (t, f) :: rest else (t, f) :: ins rest
-    set { s with timers := ins s.timers }
+    let id := s.nextId
+    let rec ins : List (Nat × Nat × IO Unit) → List (Nat × Nat × IO Unit)
+      | []              => [(id, instant, fire)]
+      | (i, t, f) :: rest =>
+          if instant < t then (id, instant, fire) :: (i, t, f) :: rest else (i, t, f) :: ins rest
+    set { s with timers := ins s.timers, nextId := id + 1 }
+    return id
+
+def HarnessClock.schedule (hc : HarnessClock) (instant : Nat) (fire : IO Unit) : BaseIO Unit := do
+  let _ ← hc.scheduleId instant fire
+
+/-- Retire one harness timer by identity. A timer the driver has already taken is not here; its fire closure
+reads the token the caller set and runs `onCancel` itself. -/
+def HarnessClock.cancelTimer (hc : HarnessClock) (id : Nat) : IO Unit := do
+  let taken ← hc.state.atomically do
+    let s ← get
+    let (hit, rest) := s.timers.partition (fun (i, _, _) => i == id)
+    set { s with timers := rest }
+    return hit
+  for (_, _, fire) in taken do fire
 
 /-- **Advance to the earliest pending timer**: set the virtual instant to its `instant` and run its fire, outside
 the lock. `false` when nothing is pending — the driver then parks as the live one does. -/
@@ -122,7 +140,7 @@ def HarnessClock.advance (hc : HarnessClock) : IO Bool := do
     let s ← get
     match s.timers with
     | []                  => return none
-    | (instant, fire) :: rest  => set { s with now := instant, timers := rest }; return (some fire)
+    | (_, instant, fire) :: rest => set { s with now := instant, timers := rest }; return (some fire)
   match due with
   | none      => return false
   | some fire => fire; return true
@@ -155,8 +173,9 @@ def HarnessClock.clock (hc : HarnessClock) : Clock :=
       hc.schedule (now0 + d.val.toNat) (do unless ← Task.Cancel.isSet cancel do fire)
   , scheduleCancel := fun d cancel fire onCancel => do
       let now0 ← hc.now
-      hc.schedule (now0 + d.val.toNat) (do
+      let id ← hc.scheduleId (now0 + d.val.toNat) (do
         if ← Task.Cancel.isSet cancel then onCancel else fire)
+      return (hc.cancelTimer id : IO Unit)
   , swept := false }
 
 /-- **The harness clock, composed with the executor wake a virtual driver needs.**
@@ -174,8 +193,9 @@ def HarnessClock.clockWithWake (hc : HarnessClock) (push : Task.Item → BaseIO 
       base.schedule d cancel fire
       push (Task.Item.ofAction (pure ()))
     scheduleCancel := fun d cancel fire onCancel => do
-      base.scheduleCancel d cancel fire onCancel
-      push (Task.Item.ofAction (pure ())) }
+      let retire ← base.scheduleCancel d cancel fire onCancel
+      push (Task.Item.ofAction (pure ()))
+      return retire }
 
 /-- **Run a computation with a harness clock driving it.** The general driver with this clock's reading for the
 metered path and one advance per idle round for the pool-empty wait. -/
