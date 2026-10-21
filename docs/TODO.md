@@ -75,9 +75,13 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 
 ## P3 — compatibility and release
 
-- [ ] **Stock `Std.Http.Server.Handler` adapter in LeanIn.** `Routing.Compat` provides the
-  routing-side migration path; LeanIn has no stock-handler adapter of its own.
-- [ ] **Release the lifecycle work.** `v0.5.0` contains only the continue-policy hook; deadline,
-  scope and timer cancellation are untagged.
+- [ ] **Stock `Std.Http.Server.Handler` adapter in LeanIn.** Blocked on the stock API: the handler
+  needs a `Std.Http.Request Std.Http.Body.Stream`, but `Body.Stream`'s constructor is private and the
+  only public operations are `recv`/`close`; there is no public way to build one over our
+  `BodyReader`. `Routing.Compat` is no longer in this tree. Needs an upstream constructor or an
+  explicitly accepted dependency on stock internals.
+- [ ] **Release the lifecycle work.** The package version is now `0.6.0`; the deadline, scope,
+  timer cancellation, streaming bound and multi-carrier serving are in it. The annotated tag is
+  deliberately deferred until the branch is merged, so it cannot point at an unmerged commit.
 - [ ] **Performance record.** Re-run the routing and LeanIO pairs on a settled host with load
   average and a recorded commit; the current tables are provisional.
