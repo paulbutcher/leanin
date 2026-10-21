@@ -84,6 +84,59 @@ namespace Head
 def targetString? (h : Head) : Option String := Slice.toString? h.buf h.target
 /-- The request target as a `String` (empty if not valid UTF-8). -/
 def targetString (h : Head) : String := (h.targetString?).getD ""
+/-- A hex digit's value, for percent-decoding. -/
+private def hexVal (b : UInt8) : Option Nat :=
+  if 0x30 ≤ b && b ≤ 0x39 then some (b.toNat - 0x30)
+  else if 0x41 ≤ b && b ≤ 0x46 then some (b.toNat - 0x41 + 10)
+  else if 0x61 ≤ b && b ≤ 0x66 then some (b.toNat - 0x61 + 10)
+  else none
+
+/-- Percent-decode a slice into a string. `plusAsSpace` is for query components, where `+` is a space.
+Malformed `%HH` returns `none` rather than passing the bytes through. -/
+def decodePercent (buf : ByteArray) (s : Slice) (plusAsSpace : Bool) : Option String := Id.run do
+  let bs := s.toByteArray buf
+  let mut out := ByteArray.empty
+  let mut i := 0
+  let mut ok := true
+  while i < bs.size && ok do
+    let c := bs.get! i
+    if plusAsSpace && c == 0x2B then
+      out := out.push 0x20
+      i := i + 1
+    else if c == 0x25 then
+      if i + 2 < bs.size then
+        match hexVal (bs.get! (i + 1)), hexVal (bs.get! (i + 2)) with
+        | some hi, some lo =>
+            out := out.push (hi * 16 + lo).toUInt8
+            i := i + 3
+        | _, _ => ok := false
+      else
+        ok := false
+    else
+      out := out.push c
+      i := i + 1
+  if ok then String.fromUTF8? out else none
+
+/-- The first `?` in the request target, as an offset from the target's start. -/
+private def queryMark (buf : ByteArray) (s : Slice) : Option Nat := Id.run do
+  let mut i := s.start
+  let mut found : Option Nat := none
+  while i < s.stop && found.isNone do
+    if buf.get! i == 0x3F then found := some i
+    i := i + 1
+  found
+
+/-- The path part of the request target, before `?`, decoded. -/
+def path? (h : Head) : Option String :=
+  let stop := (queryMark h.buf h.target).getD h.target.stop
+  decodePercent h.buf { start := h.target.start, stop } false
+
+/-- The query part after the first `?`, decoded (`+` as space); `none` when the target has no query. -/
+def query? (h : Head) : Option String :=
+  match queryMark h.buf h.target with
+  | none => none
+  | some q => decodePercent h.buf { start := q + 1, stop := h.target.stop } true
+
 /-- The value view of the first header whose name matches `name` (ASCII case-insensitive). -/
 def headerSlice? (h : Head) (name : ByteArray) : Option Slice :=
   h.headers.findSome? fun (n, v) => if Slice.eqBytesCI h.buf n name then some v else none

@@ -57,6 +57,8 @@
   `nix develop -c bash tests/scope-cancel.sh` (a user cancel retires a parked sleep
   immediately, a child scope is cancelled with its parent, and cleanup runs exactly once).
   All assert elapsed time or counts, so a hang or a double cleanup fails rather than passes.
+- The H1 target views have a pure check: `nix develop -c bash tests/h1-target.sh`
+  (`H1.Head.path?`/`query?` decode percent escapes and reject a malformed one).
 - Put externally observable executor scenarios in
   `tests/*contract.md` and their executable checks in the
   adjacent shell fixture. Run an individual check with

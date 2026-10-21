@@ -35,9 +35,11 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 
 ## P1 — HTTP serving surface
 
-- [ ] **Decoded path/query at the H1 boundary.** `H1.Head` exposes `targetString`; consumers
-  re-parse and percent-decode with `Std.Http.RequestTarget.parse?` per request. Add slice-based
-  decoded path/query views, and use them from routing to remove the per-request parse.
+- [x] **Decoded path/query at the H1 boundary.** `H1.Head.path?` and `H1.Head.query?` split the
+  target at the first `?` and percent-decode it in place (`+` as space only in the query); a
+  malformed `%HH` returns `none`. Routing outside this repository can consume them instead of
+  re-parsing `targetString`.
+  - Evidence: `bash tests/h1-target.sh` checks `/a%20b?x=1+y&z=%2F` and a malformed escape.
 - [x] **One continue policy.** `Config.continuePolicy` is the single switch: `automatic` keeps the
   machine's safe default, while `application` clears `autoContinue` so a stream handler must call
   `sendContinue`. `Config.limits` derives the machine's view, so the two cannot disagree.

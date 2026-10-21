@@ -74,6 +74,9 @@ lean_exe asyncFailure where
   root := `LeanIn.Exe.AsyncFailure
   moreLinkArgs := netuvLinkArgs
 
+lean_exe h1Target where
+  root := `LeanIn.Exe.H1Target
+
 lean_exe scopeCancel where
   root := `LeanIn.Exe.ScopeCancel
   moreLinkArgs := netuvLinkArgs
