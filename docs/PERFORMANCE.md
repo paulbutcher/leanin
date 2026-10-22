@@ -1240,9 +1240,21 @@ request (temporary arms, one invocation, not kept) split its ~11 µs as: the hea
 validation and URI parsing — the cost of producing its types at all, which `Std.Http.Server`'s own parser pays
 too — and ~10 % is the UTF-8 conversion on our side.
 
-**At the socket** (`PAIRS=9 DURATION=5 nix develop -c nix shell nixpkgs#nodejs -c bash bench/stdpaired.sh 1 8 32`,
-measured on `db8be50` with the script's start fix below: `load.mjs`, keep-alive, depth 1, `/bench`, both arms
-started fresh per level and alternated within it; load average 0.25 before, 1.88 after):
+**At the socket, on the target x86_64 host** (`PAIRS=9 DURATION=5 nix develop -c nix shell nixpkgs#nodejs -c
+bash bench/stdpaired.sh 1 8 32`, measured on `38f7ccb`: `load.mjs`, keep-alive, depth 1, `/bench`, both arms
+started fresh per level and alternated within it; Intel Core Ultra 7 268V, 8 cores, server pinned to CPU 1 and
+client to CPU 2, load average 4.06 before and 8.24 after; shared host, so the absolute rates are lower than the
+aarch64 container's and only the paired ratios are comparable):
+
+| C | median std/native | IQR | median native | median std |
+|---|---|---|---|---|
+| 1 | **0.846** | 0.825–0.893 | 15 665 req/s | 13 295 req/s |
+| 8 | **0.804** | 0.769–0.831 | 28 171 req/s | 22 697 req/s |
+| 32 | **0.779** | 0.735–0.792 | 32 271 req/s | 24 305 req/s |
+
+**On the aarch64 container**, retained as a cross-platform shape rather than the target record
+(`PAIRS=9 DURATION=5 …`, measured on `db8be50` with the script's start fix below: same load shape, both arms
+started fresh per level and alternated within it; 18 cores, load average 0.25 before, 1.88 after):
 
 | C | median std/native | IQR | median native | median std |
 |---|---|---|---|---|
@@ -1262,9 +1274,10 @@ the `Date` and the response conversion. `load.mjs` sends two headers, so a brows
 the in-memory figures, roughly ten microseconds more per request.
 
 **Decision.** Keep the layer as an opt-in alongside the native path; **reject** making it the only public
-handler shape, which D24 left to this measurement. Code that needs the throughput keeps `StreamHandler`. The
-remaining cost is mostly inside `Std.Http`'s constructors; cutting it would mean building `Headers` without
-re-validating what LeanIn's parser has already accepted, which the public `Std` API does not offer.
+handler shape, which D24 left to this measurement. Both hosts agree on the direction: the layer retains roughly
+78–85 % of native throughput at the socket, and the remaining cost is mostly inside `Std.Http`'s constructors.
+Cutting it would mean building `Headers` without re-validating what LeanIn's parser has already accepted, which
+the public `Std` API does not offer.
 
 ## 5. ⚪ Rows that are about a pool, not about us
 
