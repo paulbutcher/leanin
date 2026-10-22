@@ -82,6 +82,9 @@ lean_exe compatProbe where
   root := `LeanIn.Exe.CompatProbe
   moreLinkArgs := netuvLinkArgs
 
+lean_exe vmScope where
+  root := `LeanIn.Exe.VMScope
+
 lean_exe h1Target where
   root := `LeanIn.Exe.H1Target
 

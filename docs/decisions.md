@@ -1268,7 +1268,8 @@ cost.
   not a valid token, a target `RequestTarget.parse?` refuses) answers `400` without running the handler.
 - **`onContinue`.** Asked for an HTTP/1.1 request with `Expect: 100-continue`. `true` sends `100 Continue`; `false`
   or a raise answers `417 Expectation Failed` without running the handler, and the connection closes unless the
-  request had no body to wait for. `serveConnStd` sets `continuePolicy := .application` so the decision is the
+  request had no body to wait for. `serveConnStd` requires `continuePolicy := .application` and raises when it is
+  not, so the decision is the
   layer's.
 - **`onFailure`.** A notification, called for an error the handler raises, a rejected head, and a transport abort.
   `Std`'s connection loop calls it for the first two as well as for transport errors, so the layer does too; a

@@ -91,7 +91,7 @@ def main (args : List String) : IO UInt32 := do
   let l ← Runtime.Listener.bind (Runtime.loopback port)
   let addr ← Runtime.Listener.sockName l
   let e ← Sched.Executor.new LeanIn.Task.Item 256 1
-  let cfg : Server.Config := { clock := Runtime.Clock.live hooks }
+  let cfg : Server.Config := { clock := Runtime.Clock.live hooks, continuePolicy := .application }
   record s!"listening|addr={addr}"
   let prog : LeanIn.Task.EAsync IO.Error Unit :=
     Runtime.serveForever hooks l (fun c => Server.serveConnStd cfg c handler)

@@ -207,8 +207,10 @@ end StdHandler
 
 /-- Serve a `StdHandler` on one connection, through the streaming driver. The continue decision is the
 handler's `onContinue`, so `cfg.continuePolicy` is overridden with `application`. -/
-def Server.serveConnStd (cfg : Server.Config) (c : Conn) (h : StdHandler) : Task.EAsync IO.Error Unit :=
-  Server.serveConnStream { cfg with continuePolicy := .application } c (h.toStream cfg.generateDate)
+def Server.serveConnStd (cfg : Server.Config) (c : Conn) (h : StdHandler) : Task.EAsync IO.Error Unit := do
+  unless cfg.continuePolicy == .application do
+    throw (.userError "Server.serveConnStd: Config.continuePolicy must be .application")
+  Server.serveConnStream cfg c (h.toStream cfg.generateDate)
 
 end LeanIn.Http
 end

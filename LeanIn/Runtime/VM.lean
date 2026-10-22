@@ -323,10 +323,22 @@ protected partial def bind : VM α → (α → VM β) → VM β
     .ioLeaf (fun scope kok kerr kab =>
       act scope (fun v => VM.runK scope (f v) kok kerr kab) kerr kab)
   | .throwE e, _ => .throwE e
-  | .tryE b h, f => .tryE (VM.bind b f) (fun e => VM.bind (h e) f)
+  | .tryE b h, f =>
+      .ioLeaf (fun scope kok kerr kab =>
+        runK scope b
+          (fun v => runK scope (f v) kok kerr kab)
+          (fun e => runK scope (h e) (fun v => runK scope (f v) kok kerr kab) kerr kab)
+          kab)
   | .abortE r, _ => .abortE r
-  | .tryAbortE b h, f => .tryAbortE (VM.bind b f) (fun r => VM.bind (h r) f)
-  | .scopeE on body, f => .scopeE on (VM.bind body f)
+  | .tryAbortE b h, f =>
+      .ioLeaf (fun scope kok kerr kab =>
+        runK scope b
+          (fun v => runK scope (f v) kok kerr kab)
+          kerr
+          (fun r => runK scope (h r) (fun v => runK scope (f v) kok kerr kab) kerr kab))
+  | .scopeE on body, f =>
+      .ioLeaf (fun scope kok kerr kab =>
+        runK scope (.scopeE on body) (fun v => runK scope (f v) kok kerr kab) kerr kab)
   | .empty, _ => .empty
 
 instance : Monad VM where
@@ -360,18 +372,17 @@ with `none` on either failure channel, and the original failure is then re-raise
 fails replaces the original failure, as `MonadFinally` specifies. -/
 instance : MonadFinally VM where
   tryFinally' body finalizer :=
-    VM.tryAbortE
-      (VM.tryE
-        (do
-          let v ← body
-          let b ← finalizer (some v)
-          return (v, b))
-        (fun e => do
+    VM.bind
+      (VM.tryAbortE
+        (VM.tryE body (fun e => do
           let _ ← finalizer none
           throw e))
-      (fun r => do
-        let _ ← finalizer none
-        .abortE r)
+        (fun r => do
+          let _ ← finalizer none
+          .abortE r))
+      (fun v => do
+        let b ← finalizer (some v)
+        return (v, b))
 
 /-- **Attempt**: run `m`, turning a raise into an `Except` value — *wherever* the raise happens, before or
 after a suspension: the interpreter carries the catch's stack in every effect's callback, so a handler that
