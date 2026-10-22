@@ -21,11 +21,12 @@ remain. The generic handler sketch was corrected: stock hooks run in `Async` whi
   `HEAD` content length, and skip a stream producer. SH7 checks that a declared length the producer under- or
   over-runs closes the connection and notifies `onFailure`. Trailers are explicitly unsupported: neither
   `ResponseBody` nor the native `ResponseWriter` has a trailer channel.
-- **Phase 4**: implemented on `lean-routing` `phase4-generic` (PR scidonia/lean-routing#1). `RequestM`,
-  `ResultM` and `StatelessHandlerM` parameterize the monad and request body; `Routing.Stock` serves the same route
-  source at `ContextAsync`/`Body.Stream`; shared header and matched-route tracing middleware are tested on
-  both. The response is still a buffered `Routing.Response`, and the session/multipart/static-file pilots are
-  not migrated.
+- **Phase 4**: implemented on `lean-routing` (PR scidonia/lean-routing#1, merged into `leanin-backend`).
+  `RequestM`, `ResultM` and `StatelessHandlerM` parameterize the monad and request body; `Routing.Stock` serves
+  the same route source at `ContextAsync`/`Body.Stream`. `Routing.Body` adds the request-read and response-body
+  capabilities, and `Routing.BodyHandlerM`/`BodyResultM` carry a `ResponseBody` result to both hosts.
+  Shared header, matched-route tracing, session and buffered static-file pilots are tested. Multipart and a
+  deferred/streamed static-file lifetime remain.
 - **Phase 5**: not started.
 
 ## Objective
