@@ -13,6 +13,8 @@ record on standard output, which `tests/std-handler-contract.sh` reads.
 
 - `/info` answers the method, the target, every `X-Multi` value and the `RemoteAddr` extension.
 - `/stream` answers two chunks through a streamed body.
+- `/stream-cleanup` streams 4 MiB with a recorded `finally`.
+- `/no-content` answers `204` with a body that must not be sent.
 - `/throw` raises.
 - `/refuse` is refused by `onContinue`.
 - anything else echoes the request body.
@@ -48,6 +50,8 @@ def onRequest (req : Std.Http.Request Server.BodyReader) :
     return { line := { status := .ok }, body := .stream none (fun send => do
       send "one\n".toUTF8
       send "two\n".toUTF8) }
+  else if target == "/no-content" then
+    return { line := { status := .noContent }, body := .bytes "not sent".toUTF8 }
   else if target == "/stream-cleanup" then
     return { line := { status := .ok }, body := .stream none (fun send => do
       try

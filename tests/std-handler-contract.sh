@@ -17,9 +17,9 @@ cd "$(dirname "$0")/.." || {
 
 scenario="${1:-}"
 case "$scenario" in
-SH1 | SH2 | SH3 | SH4 | SH5) ;;
+SH1 | SH2 | SH3 | SH4 | SH5 | SH6) ;;
 *)
-  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5" >&2
+  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5|SH6" >&2
   exit 2
   ;;
 esac
@@ -269,6 +269,56 @@ elif scenario == "SH5":
         setup_error(f"clean request after the disconnect answered {head!r}")
     if len(cleanups()) != 2:
         fail(f"cleanup ran {len(cleanups()) - 1} times for the disconnect: {cleanups()!r}")
+
+elif scenario == "SH6":
+    def no_body(s, rest, label):
+        if rest:
+            fail(f"{label}: body bytes after the head: {rest[:32]!r}")
+        s.settimeout(0.3)
+        try:
+            extra = s.recv(4096)
+        except socket.timeout:
+            extra = b""
+        if extra:
+            fail(f"{label}: body bytes after the head: {extra[:32]!r}")
+    s = connect()
+    s.sendall(b"HEAD /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"HEAD /info answered {head!r}")
+    length = header(head, "content-length")
+    if length is None or int(length) <= 0:
+        fail(f"HEAD /info content-length {length!r}")
+    no_body(s, rest, "HEAD /info")
+    s.close()
+    s = connect()
+    s.sendall(b"GET /no-content HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 204:
+        fail(f"/no-content answered {head!r}")
+    if header(head, "content-length") is not None:
+        fail(f"/no-content kept content-length: {head!r}")
+    no_body(s, rest, "/no-content")
+    s.close()
+    if records("cleanup"):
+        setup_error("cleanup records before the HEAD stream")
+    s = connect()
+    s.sendall(b"HEAD /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"HEAD /stream-cleanup answered {head!r}")
+    no_body(s, rest, "HEAD /stream-cleanup")
+    s.close()
+    if records("cleanup"):
+        fail(f"HEAD ran the stream producer: {records('cleanup')!r}")
+    head, body = exchange(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200 or not body.startswith(b"one\n"):
+        fail(f"control stream answered {head!r}")
+    end = time.monotonic() + 10.0
+    while time.monotonic() < end and len(records("cleanup")) < 1:
+        time.sleep(0.05)
+    if len(records("cleanup")) != 1:
+        fail(f"control stream cleanup records {records('cleanup')!r}")
 
 print(f"{scenario}: passed")
 PY

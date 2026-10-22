@@ -359,6 +359,10 @@ structure ResponseWriter where
 /-- A streaming request handler: the head, the body reader, and the response writer. -/
 abbrev StreamHandler := H1.Head → BodyReader → ResponseWriter → VM Unit
 
+/-- A status whose response cannot carry a body (RFC 9110 §6.4.1). -/
+def bodyForbidden (status : Nat) : Bool :=
+  status < 200 || status == 204 || status == 304
+
 namespace Stream
 
 def hexOf (n : Nat) : String :=
@@ -501,7 +505,7 @@ def bodyReader (head : H1.Head) (initial : ByteArray) (c : Conn) (clock : Clock)
   }
 
 /-- The writer for one response on `c`. Framing is chosen once, at `start`. -/
-def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO ResponseWriter := do
+def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) (bodyAllowed : Bool) : IO ResponseWriter := do
   let st ← IO.mkRef ((false, false, (none : Option Bool), (none : Option Nat)) :
     Bool × Bool × Option Bool × Option Nat)
   let set (f : Bool × Bool × Option Bool × Option Nat → Bool × Bool × Option Bool × Option Nat) : VM Unit := do
@@ -518,7 +522,8 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
       let declared := rh.headers.any (fun (n, _) => n.toLower == "content-length")
       let closeAsked := rh.headers.any (fun (n, v) =>
         n.toLower == "connection" && (v.splitOn ",").any (fun t => t.trimAscii.toString.toLower == "close"))
-      let chunked := !declared && version == .v11
+      let allowed := bodyAllowed && !bodyForbidden rh.status
+      let chunked := allowed && !declared && version == .v11
       let rh := { rh with headers := rh.headers.filter (fun (n, _) => n.toLower != "transfer-encoding") }
       let rh := if chunked then { rh with headers := rh.headers.push ("Transfer-Encoding", "chunked") } else rh
       let rh := if closeAsked then { rh with headers := rh.headers.push ("Connection", "close") } else rh
@@ -526,6 +531,10 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
       set (fun _ => (true, false, some chunked, some rh.status))
     write := fun bs => do
       let s ← (liftGet st)
+      let allowed := bodyAllowed && match s.2.2.2 with
+        | some status => !bodyForbidden status
+        | none => true
+      if !allowed then pure () else
       match s with
       | (false, _, _, _) => throw (.userError "Http: response body written before its head")
       | (_, true, _, _) => throw (.userError "Http: response body written after finish")
@@ -534,6 +543,12 @@ def responseWriter (c : Conn) (version : H1.Version) (keepAlive : Bool) : IO Res
       | (_, false, _, _) => VM.sendTransport c bs
     finish := do
       let s ← (liftGet st)
+      let allowed := bodyAllowed && match s.2.2.2 with
+        | some status => !bodyForbidden status
+        | none => true
+      if !allowed then
+        set (fun (a, _, b, c) => (a, true, b, c))
+      else
       match s with
       | (false, _, _, _) => pure ()
       | (_, true, _, _) => pure ()
@@ -609,7 +624,8 @@ async def driveStream (c : LeanIn.Runtime.Conn) (cfg : Config) (handler : Stream
     let answered : Outcome (Bool × ByteArray × (Bool × Bool × Bool)) :=
       await (LeanIn.Runtime.VM.runAsync (LeanIn.Runtime.VM.withScope (cfg.onScope head) (VM.requestScope (do
       let reader ← (monadLift (Stream.bodyReader head initial c cfg.clock cfg.stallTimeout cfg.h1.maxBody) : VM BodyReader)
-      let writer ← (monadLift (Stream.responseWriter c head.version machine.keepAlive) : VM ResponseWriter)
+      let writer ← (monadLift (Stream.responseWriter c head.version machine.keepAlive
+        (head.method != .head)) : VM ResponseWriter)
       let chunked := H1.chunked? head
       let declared := if chunked then 0 else (H1.contentLength? head.buf head.headers).getD 0
       if !chunked && declared > cfg.h1.maxBody then

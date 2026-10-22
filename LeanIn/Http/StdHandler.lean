@@ -142,20 +142,33 @@ def withDate (date : Bool) (rh : H1.ResponseHead) : VM H1.ResponseHead := do
   return rh
 
 /-- Write a stock response through LeanIn's writer, adding a `Date` when `date` is set and the handler gave
-none. -/
-def writeResponse (w : Server.ResponseWriter) (r : Std.Http.Response ResponseBody) (date : Bool := true) :
-    VM Unit := do
+none. A `HEAD` response or a status that forbids a body skips the producer and lets the writer suppress the
+bytes; a known stream length is still declared. -/
+def writeResponse (w : Server.ResponseWriter) (r : Std.Http.Response ResponseBody)
+    (date : Bool := true) (headOnly : Bool := false) : VM Unit := do
   let rh ← withDate date (responseHead r.line)
+  let forbidden := LeanIn.Http.Server.bodyForbidden r.line.status.toCode.toNat
+  let withoutLength (rh : H1.ResponseHead) : H1.ResponseHead :=
+    { rh with headers := rh.headers.filter (fun (n, _) => n.toLower != "content-length") }
   match r.body with
-  | .bytes data => Server.Stream.respond w rh data
+  | .bytes data =>
+    if forbidden then
+      w.start (withoutLength rh)
+      w.finish
+    else
+      Server.Stream.respond w rh data
   | .stream length? write =>
     let rh := match length? with
       | some n => if hasHeader rh "content-length" then rh
                   else { rh with headers := rh.headers.push ("Content-Length", toString n) }
       | none => rh
+    let rh := if forbidden then withoutLength rh else rh
     w.start rh
-    write w.write
-    w.finish
+    if headOnly || forbidden then
+      w.finish
+    else
+      write w.write
+      w.finish
 
 /-- A response the layer answers itself, without the handler. The connection is closed (`Connection: close`, and
 the unread body keeps the driver from reusing it) unless the body has already been read in full. -/
@@ -195,7 +208,7 @@ def toStream (h : StdHandler) (date : Bool := true) : Server.StreamHandler := fu
           else pure true
         if proceed then
           let response ← h.onRequest { line, body := reader, extensions := extensionsOf reader }
-          writeResponse w response date
+          writeResponse w response date (line.method == .head)
         else
           refuse reader w 417 "Expectation Failed" date
     catch e => do

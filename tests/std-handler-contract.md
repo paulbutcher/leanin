@@ -10,7 +10,7 @@ each request it runs (`ran|`), each continue decision it makes (`continue|`) and
 nix develop -c bash tests/std-handler-contract.sh SH1
 ```
 
-Substitute `SH2`–`SH5`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
+Substitute `SH2`–`SH6`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
 `stdEcho`, serves it on a port of its own (`STD_PORT`, default 8794), runs one scenario and stops it. Records are
 the handler's own annotations: a scenario can see what the handler ran and was told, and nothing the driver does
 that the handler is not shown.
@@ -108,3 +108,24 @@ byte; `Std.Http.Header.Value.ofString?` does not.
 **Then.** Step 1 answers `200`, its body starts `one\n`, and the count goes from 0 to 1. After step 2 the count
 is 2, exactly one more record. Step 3 answers `200` and the count stays 2: the disconnect ran the producer's
 `finally` once, and no retry ran it again.
+
+## SH6 — `HEAD` and a body-forbidden status send no body and do not run a stream producer
+
+**Actor.** A client, the `/info`, `/no-content` and `/stream-cleanup` routes, and the stream producer's
+`cleanup|` record.
+
+**Boundary.** The server's socket, and the `cleanup|` records.
+
+**Given.** A fresh server. The detector counts `cleanup|` records for `/stream-cleanup`.
+
+**When.** In order:
+
+1. The client sends `HEAD /info`.
+1. The client sends `GET /no-content`.
+1. The client sends `HEAD /stream-cleanup`.
+1. The affirmative control: the client sends `GET /stream-cleanup` and reads the complete body.
+
+**Then.** Step 1 answers `200` with a positive `Content-Length` and no body bytes. Step 2 answers `204`, carries
+no `Content-Length` and no body bytes. Step 3 answers `200` with no body bytes and leaves the cleanup count at 0:
+the producer was not run. Step 4 answers `200`, its body starts `one\n`, and the count becomes 1. No response
+in the scenario sends a chunk terminator after a suppressed body.
