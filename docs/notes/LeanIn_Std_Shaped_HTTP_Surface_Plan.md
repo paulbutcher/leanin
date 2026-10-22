@@ -23,8 +23,9 @@ remain. The generic handler sketch was corrected: stock hooks run in `Async` whi
   `ResponseBody` nor the native `ResponseWriter` has a trailer channel.
 - **Phase 4**: implemented on `lean-routing` `phase4-generic` (PR scidonia/lean-routing#1). `RequestM`,
   `ResultM` and `StatelessHandlerM` parameterize the monad and request body; `Routing.Stock` serves the same route
-  source at `ContextAsync`/`Body.Stream`; one header middleware is shared. The response is still a buffered
-  `Routing.Response`, and the session/tracing/multipart/static-file pilots are not migrated.
+  source at `ContextAsync`/`Body.Stream`; shared header and matched-route tracing middleware are tested on
+  both. The response is still a buffered `Routing.Response`, and the session/multipart/static-file pilots are
+  not migrated.
 - **Phase 5**: not started.
 
 ## Objective
