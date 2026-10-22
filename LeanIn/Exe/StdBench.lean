@@ -42,7 +42,7 @@ def main (args : List String) : IO UInt32 := do
   let addr ← Runtime.Listener.sockName l
   let e ← Sched.Executor.new LeanIn.Task.Item 256 1
   -- `maxMessages` past the default 100, as `server` does, so keep-alive is not closed mid-run.
-  let cfg : Server.Config := { h1 := { maxMessages := 1000000000 }, clock := Runtime.Clock.live hooks }
+  let cfg : Server.Config := { h1 := { maxMessages := 1000000000 }, clock := Runtime.Clock.live hooks, continuePolicy := .application }
   IO.println s!"stdBench {mode} listening on {addr}"
   let serve : Runtime.Conn → LeanIn.Task.EAsync IO.Error Unit :=
     if mode == "std" then fun c => Server.serveConnStd cfg c std
