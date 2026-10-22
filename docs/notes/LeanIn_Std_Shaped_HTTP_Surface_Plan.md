@@ -18,7 +18,8 @@ remain. The generic handler sketch was corrected: stock hooks run in `Async` whi
   settled `onFailure` contract; see D24 and `tests/std-handler-contract.md`.
 - **Phase 3**: partial — `ResponseBody.bytes`/`.stream` exist. SH5 checks producer cleanup exactly once after
   a complete stream and after a client disconnect. SH6 checks that `HEAD` and `204` suppress the body, keep the
-  `HEAD` content length, and skip a stream producer. Still open: declared-length mismatch and trailers.
+  `HEAD` content length, and skip a stream producer. SH7 checks that a declared length the producer under- or
+  over-runs closes the connection and notifies `onFailure`. Still open: trailers.
 - **Phase 4**: implemented on `lean-routing` `phase4-generic` (PR scidonia/lean-routing#1). `RequestM`,
   `ResultM` and `StatelessHandlerM` parameterize the monad and request body; `Routing.Stock` serves the same route
   source at `ContextAsync`/`Body.Stream`; one header middleware is shared. The response is still a buffered

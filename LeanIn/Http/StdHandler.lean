@@ -167,8 +167,23 @@ def writeResponse (w : Server.ResponseWriter) (r : Std.Http.Response ResponseBod
     if headOnly || forbidden then
       w.finish
     else
-      write w.write
-      w.finish
+      match length? with
+      | none =>
+        write w.write
+        w.finish
+      | some n =>
+        let sent ← (monadLift (IO.mkRef 0) : VM (IO.Ref Nat))
+        let checked (bs : ByteArray) : VM Unit := do
+          let already ← (monadLift (sent.get : IO Nat) : VM Nat)
+          if already + bs.size > n then
+            throw (.userError s!"Http.StdHandler: streamed body exceeds Content-Length {n}")
+          w.write bs
+          monadLift (sent.set (already + bs.size) : IO Unit)
+        write checked
+        let total ← (monadLift (sent.get : IO Nat) : VM Nat)
+        unless total == n do
+          throw (.userError s!"Http.StdHandler: streamed body ended after {total} of {n} bytes")
+        w.finish
 
 /-- A response the layer answers itself, without the handler. The connection is closed (`Connection: close`, and
 the unread body keeps the driver from reusing it) unless the body has already been read in full. -/

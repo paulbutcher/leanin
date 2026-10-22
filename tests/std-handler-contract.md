@@ -10,7 +10,7 @@ each request it runs (`ran|`), each continue decision it makes (`continue|`) and
 nix develop -c bash tests/std-handler-contract.sh SH1
 ```
 
-Substitute `SH2`–`SH6`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
+Substitute `SH2`–`SH7`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
 `stdEcho`, serves it on a port of its own (`STD_PORT`, default 8794), runs one scenario and stops it. Records are
 the handler's own annotations: a scenario can see what the handler ran and was told, and nothing the driver does
 that the handler is not shown.
@@ -129,3 +129,22 @@ is 2, exactly one more record. Step 3 answers `200` and the count stays 2: the d
 no `Content-Length` and no body bytes. Step 3 answers `200` with no body bytes and leaves the cleanup count at 0:
 the producer was not run. Step 4 answers `200`, its body starts `one\n`, and the count becomes 1. No response
 in the scenario sends a chunk terminator after a suppressed body.
+
+## SH7 — a declared stream length that does not match its producer fails the connection
+
+**Actor.** A client, and the `/stream-short`, `/stream-long` and `/info` routes.
+
+**Boundary.** The server's socket, and the `failure|` records.
+
+**Given.** A fresh server. The detector counts `failure|` records.
+
+**When.** In order:
+
+1. The client sends `GET /stream-short`; the producer declares `10` bytes and writes `abc`.
+1. The client sends `GET /stream-long`; the producer declares `3` bytes and writes `abcdef`.
+1. The client sends a clean `GET /info`.
+
+**Then.** Step 1 answers `200` with `Content-Length: 10`, sends exactly `abc`, then closes the connection. Step 2
+answers `200` with the declared length and sends no body bytes, because the first write exceeds the declaration;
+the connection closes. Both failures reach `onFailure`, so the count goes from 0 to 2. Step 3 answers `200` and
+the count stays 2. Neither mismatch is retried or followed by a chunk terminator.

@@ -17,9 +17,9 @@ cd "$(dirname "$0")/.." || {
 
 scenario="${1:-}"
 case "$scenario" in
-SH1 | SH2 | SH3 | SH4 | SH5 | SH6) ;;
+SH1 | SH2 | SH3 | SH4 | SH5 | SH6 | SH7) ;;
 *)
-  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5|SH6" >&2
+  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5|SH6|SH7" >&2
   exit 2
   ;;
 esac
@@ -319,6 +319,50 @@ elif scenario == "SH6":
         time.sleep(0.05)
     if len(records("cleanup")) != 1:
         fail(f"control stream cleanup records {records('cleanup')!r}")
+
+elif scenario == "SH7":
+    def read_to_eof(s, rest):
+        buf = rest
+        while True:
+            try:
+                d = s.recv(4096)
+            except socket.timeout:
+                fail("the connection stayed open after a length mismatch")
+            if not d:
+                return buf
+            buf += d
+    if records("failure"):
+        setup_error("failure records before the scenario started")
+    s = connect()
+    s.sendall(b"GET /stream-short HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"/stream-short head {head!r}")
+    if header(head, "content-length") != "10":
+        fail(f"/stream-short content-length {header(head, 'content-length')!r}")
+    body = read_to_eof(s, rest)
+    if body != b"abc":
+        fail(f"/stream-short sent {body!r}, expected the 3 bytes written")
+    s.close()
+    s = connect()
+    s.sendall(b"GET /stream-long HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"/stream-long head {head!r}")
+    body = read_to_eof(s, rest)
+    if body:
+        fail(f"/stream-long sent {body!r}, expected no bytes past the declared length")
+    s.close()
+    end = time.monotonic() + 5.0
+    while time.monotonic() < end and len(records("failure")) < 2:
+        time.sleep(0.05)
+    if len(records("failure")) != 2:
+        fail(f"failure records {records('failure')!r}, expected 2")
+    head, _ = exchange(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200:
+        setup_error(f"clean request after the mismatches answered {head!r}")
+    if len(records("failure")) != 2:
+        fail(f"a clean request added a failure: {records('failure')!r}")
 
 print(f"{scenario}: passed")
 PY

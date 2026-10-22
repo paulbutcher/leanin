@@ -66,7 +66,7 @@
   (a stock handler reads the buffered body, adds a header, and the adapter maps its response).
 - The `Std.Http`-shaped handler layer (`LeanIn/Http/StdHandler.lean`, D24) has socket scenarios in
   `tests/std-handler-contract.md`: `nix develop -c bash tests/std-handler-contract.sh SH1` (also
-  SH2–SH6), driven at the public `stdEcho` executable, with a unique port per run (`STD_PORT`). Its
+  SH2–SH7), driven at the public `stdEcho` executable, with a unique port per run (`STD_PORT`). Its
   date formatter has a pure check: `nix develop -c bash tests/std-date.sh`.
 - The generic handler contract is a compile-time witness for both hosts:
   `nix develop -c lake build LeanIn.Test.HandlerContract` (one middleware and one body helper, stock and
