@@ -4,7 +4,7 @@ Settled decisions and the evidence each rests on. Evidence anchors are in
 [`lean-scheduler.md`](lean-scheduler.md) (the current runtime), [`tokio-map.md`](tokio-map.md) (what
 we are taking), [`evidence.md`](evidence.md) (the claim-to-source register) and
 [`PERFORMANCE.md`](PERFORMANCE.md) (the measured rows the cost records cite). No decision is open: each
-entry states its own limits, and the ones D20, D21, D22 and D23 leave are named in them.
+entry states its own limits, and the ones D20, D21, D22, D23 and D24 leave are named in them.
 
 ______________________________________________________________________
 
@@ -1247,12 +1247,67 @@ reported a transport error" is **tested, not proved**: HC1 at the public socket
 (`tests/http-cancel-contract.md`), the focused VM controls in `LeanIn/Test/Control.lean`, and the callsite audit
 of `Stream.responseWriter`. It is not a discharge of P7 or P8 ([`proof-strategy.md`](proof-strategy.md) §2, §5).
 
+### D24 — `Std.Http`'s request, response and handler hooks are a layer on the streaming driver, not a second driver.
+
+**What it is.** [`LeanIn/Http/StdHandler.lean`](../LeanIn/Http/StdHandler.lean) defines `StdHandler`: a handler
+from `Std.Http.Request Server.BodyReader` to `VM (Std.Http.Response ResponseBody)`, with `Std.Http.Server.Handler`'s
+`onFailure` and `onContinue`. `StdHandler.toStream` converts one to a `StreamHandler`, and `Server.serveConnStd`
+serves it through `serveConnStream`. Libraries written against `Std.Http.Server`'s request and response types
+(routing, middleware, authentication, the Lambda host) then need only to be polymorphic over the monad and the body
+types to run on LeanIn ([scidonia/leanin#1](https://github.com/scidonia/leanin/issues/1)).
+
+**Why a layer.** The H1 machine and the native `StreamHandler`/`BodyReader`/`ResponseWriter` path stay as they are,
+so the stock `Headers` map and the parsed `RequestTarget` are built only for a handler that is a `StdHandler`. Whether
+this becomes the only public handler shape is a separate decision, to be taken on measurements of that per-request
+cost.
+
+**The contracts, each matched to `Std.Http.Server`.**
+
+- **Request.** `Request.Head` carries the method, version, `uri` and a validated `Headers`; `extensions` carries
+  `Std.Http.Server.RemoteAddr`, read from `BodyReader.peer`. A head `Std` rejects (a header name or value that is
+  not a valid token, a target `RequestTarget.parse?` refuses) answers `400` without running the handler.
+- **`onContinue`.** Asked for an HTTP/1.1 request with `Expect: 100-continue`. `true` sends `100 Continue`; `false`
+  or a raise answers `417 Expectation Failed` without running the handler, and the connection closes unless the
+  request had no body to wait for. `serveConnStd` requires `continuePolicy := .application` and raises when it is
+  not, so the decision is the
+  layer's.
+- **`onFailure`.** A notification, called for an error the handler raises, a rejected head, and a transport abort.
+  `Std`'s connection loop calls it for the first two as well as for transport errors, so the layer does too; a
+  handler then behaves the same on either host. The failure takes its usual course afterwards (a raise is the
+  driver's `500` when no response has started; an abort closes the connection), and an error `onFailure` raises
+  itself is discarded.
+- **Response.** `ResponseBody` is a LeanIn type: `bytes`, or `stream` with an optional length and a writer handed
+  a chunk sink. It is not a class and not a `Std.Http.Body` instance: the shared libraries own their body
+  abstraction and give this type an instance of it, and a `Std.Http.Body` would bring `Std.Async` into the serving
+  path.
+- **`Date`.** Added as an IMF-fixdate when the response has none, as `Std.Http.Server` does by default
+  (`Config.generateDate`, default `true`). It is formatted from `Std.Time.Timestamp.now` at most once a second,
+  with no time zone database.
+
+**Evidence.** `tests/std-handler-contract.md`: SH1 (head, repeated headers, `RemoteAddr`, `Date`), SH2 (`417`,
+close, handler not run), SH3 (`onFailure` once for a raise and once for a mid-body disconnect, never for a clean
+request) and SH4 (`400`, handler not run). All four were run against the conversion without these contracts first
+and failed on their own assertions; `tests/std-date.sh` checks the date formatter at fixed instants.
+
+**What it does not claim.** (i) **Not every `onFailure` site `Std` has.** A stall before a head arrives (`Std`
+answers `408`), a head the H1 machine itself rejects, and a send failure outside the request's scope are the
+driver's and are not reported; reporting them means a hook in `driveStream`. (ii) **`Compat.ofStock` is
+unchanged** and does not consult the stock handler's hooks: the buffered driver has sent any `100 Continue` and
+read the body before the handler runs. (iii) **The layer costs throughput**: about a microsecond per header, and
+the layer serves 81–89 % of the native keep-alive throughput on a two-header request
+([`PERFORMANCE.md`](PERFORMANCE.md)), so it stays an opt-in and is not the only public handler shape. (iv) The
+primitive register is unchanged except for one direct external operation in the HTTP layer,
+`Std.Time.Timestamp.now`, reached for the `Date` value; the module's only new import
+edge into `Std` is `Std.Http.Server` (for `RemoteAddr`), which `Compat` already had. (v) A trace test; it can
+falsify these contracts and cannot establish them for requests it does not send.
+
 ______________________________________________________________________
 
 ## Open
 
-No decision is open: D19's residual is closed by D22, and D23 is this register's last entry. The limits those
+No decision is open: D19's residual is closed by D22, and D24 is this register's last entry. The limits those
 records leave open — the uncarried cumulative head deadline, the trickling peer, `withTimeout`'s inert wheel
 entry when its computation wins and the skipped step it leaves queued when its deadline wins, the second
-measurement condition as D21 reads it, the harness clock's single-advancer convention as D22 reads it, and D23's
-request scope limited to peer I/O on the streaming path — are stated in their own entries rather than here.
+measurement condition as D21 reads it, the harness clock's single-advancer convention as D22 reads it, D23's
+request scope limited to peer I/O on the streaming path, and the `onFailure` sites D24 leaves to the driver — are
+stated in their own entries rather than here.

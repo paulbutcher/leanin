@@ -3,6 +3,7 @@ module
 public import Std.Http.Server
 public import LeanIn.Http.Server
 public import LeanIn.Http.H1
+public import LeanIn.Http.StdHandler
 
 public section
 /-!
@@ -15,52 +16,18 @@ is drained through the `Std.Http.Body` interface.
 This is a **compatibility** path, not the streaming path: the stock handler is run to completion with
 `Std.Async.Async.block` on the calling carrier, so it cannot interleave with other work while suspended. Use
 LeanIn's `StreamHandler` for serving code.
+
+The stock handler's `onContinue` and `onFailure` are **not** consulted. The buffered driver has sent any
+`100 Continue` and read the body before the handler runs, so a refusal could not be honoured here; code that
+needs `Std`'s continue and failure contract uses `StdHandler` and `Server.serveConnStd`.
 -/
 
 namespace LeanIn.Http.Compat
 
 open LeanIn.Http
 
-/-- H1's method to the stock method. An unclassified token goes through `Std.Http.Method.ofString?`. -/
-def methodToStock (h : H1.Head) : Except IO.Error Std.Http.Method :=
-  match h.method with
-  | .get => .ok .get
-  | .head => .ok .head
-  | .post => .ok .post
-  | .put => .ok .put
-  | .delete => .ok .delete
-  | .options => .ok .options
-  | .patch => .ok .patch
-  | .trace => .ok .trace
-  | .connect => .ok .connect
-  | .other =>
-      match Std.Http.Method.ofString? h.methodTokenString with
-      | some m => .ok m
-      | none => .error (.userError s!"Http.Compat: unknown method {h.methodTokenString}")
-
-def versionToStock (v : H1.Version) : Std.Http.Version :=
-  match v with | .v10 => .v10 | .v11 => .v11
-
-/-- The request head, with the header slices resolved to stock names and values. -/
-def headToStock (h : H1.Head) : Except IO.Error Std.Http.Request.Head := do
-  let method ← methodToStock h
-  let uri ← match Std.Http.RequestTarget.parse? h.targetString with
-    | some u => pure u
-    | none => throw (.userError s!"Http.Compat: invalid request target {h.targetString}")
-  let mut headers := Std.Http.Headers.empty
-  for (n, v) in h.headers do
-    let name ← match H1.Slice.toString? h.buf n with
-      | some s => pure s
-      | none => throw (.userError "Http.Compat: a header name is not UTF-8")
-    let value ← match H1.Slice.toString? h.buf v with
-      | some s => pure s
-      | none => throw (.userError "Http.Compat: a header value is not UTF-8")
-    let some stockName := Std.Http.Header.Name.ofString? name
-      | throw (.userError s!"Http.Compat: invalid header name {name}")
-    let some stockValue := Std.Http.Header.Value.ofString? value
-      | throw (.userError s!"Http.Compat: invalid header value {value}")
-    headers := headers.insert stockName stockValue
-  return { method, version := versionToStock h.version, uri, headers }
+/- The head conversion is shared with the `Std`-shaped handler layer, which owns it. -/
+export LeanIn.Http.StdHandler (methodToStock versionToStock headToStock)
 
 /-- A stock body stream over bytes LeanIn has already buffered. -/
 def bodyStream (body : ByteArray) : IO Std.Http.Body.Stream :=

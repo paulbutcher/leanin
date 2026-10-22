@@ -1213,6 +1213,72 @@ Reproduce: `bash pred-compare.sh` (run notes) interleaves the two servers at eac
 predecessor is a worktree at `5e608ba`, built with `nix develop -c lake build server`. The switch count is
 `voluntary_ctxt_switches` summed over `/proc/<pid>/task/*` divided by `completed`, as in the 7.98 row.
 
+### The `Std`-shaped handler layer (D24): what the stock types cost
+
+⚪ **Not an external comparison**: both arms are this runtime, through the same streaming driver; the pair prices
+the layer `StdHandler` adds on top of a native `StreamHandler`. Measured on the layer as committed in `9564a64`
+(the in-memory rows on the same code before it was rebased onto `main`), with the instruments `dispatchBench`,
+`stdBench` and `bench/stdpaired.sh` added alongside this entry, on 2026-10-22, on an
+aarch64 Linux container (18 cores, kernel 7.0.14-linuxkit), server pinned to CPU 1 and client to CPU 2, Node
+v24.21.0 from `nix shell nixpkgs#nodejs`.
+
+**In memory** (`nix develop -c lake build dispatchBench && ./.lake/build/bin/dispatchBench 200000`, three
+invocations, each alternating the arms twice; load average 0.92). `native` parses the head and builds the response
+head the writer encodes; `std` adds `headToStock`, the `Request` with its `RemoteAddr`, the stock `Response`, its
+conversion back and the cached `Date`; `head` is `std` stopped after `headToStock`. Ranges are over the six
+readings per arm:
+
+| request | native | head | std | std − native |
+|---|---|---|---|---|
+| `load.mjs`'s, two headers | 413–425 ns | 1 626–1 778 ns | 1 750–1 943 ns | ~1.35–1.5 µs |
+| browser-shaped, ten headers | 1 915–1 936 ns | 12 880–13 125 ns | 12 987–13 506 ns | ~11 µs |
+
+`headToStock` is nearly all of it, about a microsecond per header. A one-off decomposition of the browser
+request (temporary arms, one invocation, not kept) split its ~11 µs as: the header slices to `String`
+(`Slice.toString?`, ours) ~1.1 µs; `Std.Http.Header.Name.ofString?` ~3.5 µs; `Header.Value.ofString?` ~4.0 µs;
+`RequestTarget.parse?` ~2.1 µs; the map inserts and the rest ~0.4 µs. So ~85–90 % is `Std.Http`'s own
+validation and URI parsing — the cost of producing its types at all, which `Std.Http.Server`'s own parser pays
+too — and ~10 % is the UTF-8 conversion on our side.
+
+**At the socket, on the target x86_64 host** (`PAIRS=9 DURATION=5 nix develop -c nix shell nixpkgs#nodejs -c
+bash bench/stdpaired.sh 1 8 32`, measured on `38f7ccb`: `load.mjs`, keep-alive, depth 1, `/bench`, both arms
+started fresh per level and alternated within it; Intel Core Ultra 7 268V, 8 cores, server pinned to CPU 1 and
+client to CPU 2, load average 4.06 before and 8.24 after; shared host, so the absolute rates are lower than the
+aarch64 container's and only the paired ratios are comparable):
+
+| C | median std/native | IQR | median native | median std |
+|---|---|---|---|---|
+| 1 | **0.846** | 0.825–0.893 | 15 665 req/s | 13 295 req/s |
+| 8 | **0.804** | 0.769–0.831 | 28 171 req/s | 22 697 req/s |
+| 32 | **0.779** | 0.735–0.792 | 32 271 req/s | 24 305 req/s |
+
+**On the aarch64 container**, retained as a cross-platform shape rather than the target record
+(`PAIRS=9 DURATION=5 …`, measured on `db8be50` with the script's start fix below: same load shape, both arms
+started fresh per level and alternated within it; 18 cores, load average 0.25 before, 1.88 after):
+
+| C | median std/native | IQR | median native | median std |
+|---|---|---|---|---|
+| 1 | **0.886** | 0.880–0.893 | 37 559 req/s | 33 268 req/s |
+| 8 | **0.811** | 0.808–0.812 | 105 383 req/s | 85 479 req/s |
+| 32 | **0.827** | 0.825–0.828 | 117 890 req/s | 97 333 req/s |
+
+*Withdrawn*, superseded by the rows above: the first run of this table (0.891 / 0.817 / 0.822, IQR within
+0.811–0.892) stated both arms were fresh per level, and they were not. `stdpaired.sh` started each server through
+a backgrounded shell function, so `kill` reached the subshell and not the server; each later level's servers
+failed to bind, and the C=8 and C=32 rounds were served by the C=1 processes. The pairs were still the same two
+builds, alternated, which is why the rerun agrees to within 0.006; the script now starts the servers directly
+and refuses a port already in use.
+
+At C=32 that is ~1.79 µs more per request (8.48 → 10.27 µs), consistent with the in-memory two-header delta plus
+the `Date` and the response conversion. `load.mjs` sends two headers, so a browser's requests would pay more: on
+the in-memory figures, roughly ten microseconds more per request.
+
+**Decision.** Keep the layer as an opt-in alongside the native path; **reject** making it the only public
+handler shape, which D24 left to this measurement. Both hosts agree on the direction: the layer retains roughly
+78–85 % of native throughput at the socket, and the remaining cost is mostly inside `Std.Http`'s constructors.
+Cutting it would mean building `Headers` without re-validating what LeanIn's parser has already accepted, which
+the public `Std` API does not offer.
+
 ## 5. ⚪ Rows that are about a pool, not about us
 
 These appear in the same diagnostics — Lean's pool's starvation shape, W4's blocking pool beside it, and the

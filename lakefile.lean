@@ -82,6 +82,9 @@ lean_exe compatProbe where
   root := `LeanIn.Exe.CompatProbe
   moreLinkArgs := netuvLinkArgs
 
+lean_exe vmScope where
+  root := `LeanIn.Exe.VMScope
+
 lean_exe h1Target where
   root := `LeanIn.Exe.H1Target
 
@@ -105,4 +108,16 @@ lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 
 lean_exe streamEcho where
   root := `LeanIn.Exe.StreamEcho
+  moreLinkArgs := netuvLinkArgs
+
+lean_exe stdEcho where
+  root := `LeanIn.Exe.StdEcho
+  moreLinkArgs := netuvLinkArgs
+
+lean_exe dispatchBench where
+  root := `LeanIn.Exe.DispatchBench
+  moreLinkArgs := netuvLinkArgs
+
+lean_exe stdBench where
+  root := `LeanIn.Exe.StdBench
   moreLinkArgs := netuvLinkArgs

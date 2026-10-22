@@ -84,6 +84,23 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
     `StreamHandler` remains the streaming path.
   - Evidence: `bash tests/compat-handler.sh` (a stock echo handler reads the body, adds a header,
     and the adapter returns status 200, `body=hello`, `x-stock=yes`).
+- [x] **`Std.Http`-shaped handler layer** ([#1](https://github.com/scidonia/leanin/issues/1), D24).
+  `StdHandler` takes a `Std.Http.Request Server.BodyReader` and returns a `Std.Http.Response ResponseBody`
+  in `VM`; `Server.serveConnStd` serves it through the streaming driver, which is unchanged. The request
+  carries `RemoteAddr` in `extensions`, a refused `onContinue` answers `417` and closes without running
+  the handler, `onFailure` is notified of handler errors, rejected heads and transport aborts, a head `Std`
+  rejects answers `400`, and a `Date` is added when the response has none.
+  - Evidence: `bash tests/std-handler-contract.sh SH1` (also SH2–SH4) and `bash tests/std-date.sh`.
+- [x] **Measure the `Std`-shaped layer.** The stock head conversion costs about a microsecond per header,
+  mostly in `Std.Http`'s own validation, and the layer serves 81–89 % of the native keep-alive throughput
+  on a two-header request. It stays an opt-in; it does not become the only public handler shape (D24).
+  - Evidence: `docs/PERFORMANCE.md`, "The `Std`-shaped handler layer (D24)" (`dispatchBench`,
+    `bench/stdpaired.sh`).
+- [ ] **Driver-level `onFailure` sites.** A stall before the head (`Std` answers `408`) and a head the
+  H1 machine rejects are not reported to a `StdHandler`'s `onFailure`; that needs a hook in
+  `driveStream` (D24).
+- [ ] **`Compat.ofStock` and the stock hooks.** The buffered adapter does not consult `onContinue` or
+  `onFailure`; honouring a refusal means moving it to the streaming path (D24).
 - [x] **Release the lifecycle work.** `main` was fast-forwarded and **`v0.6.0`** tagged at
   `466a3a0`; the tag message names the deadline, scope, timer cancellation, streaming bound and
   multi-carrier serving. The package version is `0.6.0`.
