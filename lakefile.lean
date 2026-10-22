@@ -110,3 +110,11 @@ lean_exe streamEcho where
 lean_exe stdEcho where
   root := `LeanIn.Exe.StdEcho
   moreLinkArgs := netuvLinkArgs
+
+lean_exe dispatchBench where
+  root := `LeanIn.Exe.DispatchBench
+  moreLinkArgs := netuvLinkArgs
+
+lean_exe stdBench where
+  root := `LeanIn.Exe.StdBench
+  moreLinkArgs := netuvLinkArgs

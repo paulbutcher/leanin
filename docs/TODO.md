@@ -91,9 +91,11 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   the handler, `onFailure` is notified of handler errors, rejected heads and transport aborts, a head `Std`
   rejects answers `400`, and a `Date` is added when the response has none.
   - Evidence: `bash tests/std-handler-contract.sh SH1` (also SH2–SH4) and `bash tests/std-date.sh`.
-- [ ] **Measure the `Std`-shaped layer.** The per-request cost of the stock header map and target parse,
-  in-memory against the native dispatch and paired under `load.mjs`, before deciding whether the layer
-  becomes the only public handler shape (D24).
+- [x] **Measure the `Std`-shaped layer.** The stock head conversion costs about a microsecond per header,
+  mostly in `Std.Http`'s own validation, and the layer serves 82–89 % of the native keep-alive throughput
+  on a two-header request. It stays an opt-in; it does not become the only public handler shape (D24).
+  - Evidence: `docs/PERFORMANCE.md`, "The `Std`-shaped handler layer (D24)" (`dispatchBench`,
+    `bench/stdpaired.sh`).
 - [ ] **Driver-level `onFailure` sites.** A stall before the head (`Std` answers `408`) and a head the
   H1 machine rejects are not reported to a `StdHandler`'s `onFailure`; that needs a hook in
   `driveStream` (D24).

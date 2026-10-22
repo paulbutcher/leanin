@@ -1292,9 +1292,11 @@ and failed on their own assertions; `tests/std-date.sh` checks the date formatte
 answers `408`), a head the H1 machine itself rejects, and a send failure outside the request's scope are the
 driver's and are not reported; reporting them means a hook in `driveStream`. (ii) **`Compat.ofStock` is
 unchanged** and does not consult the stock handler's hooks: the buffered driver has sent any `100 Continue` and
-read the body before the handler runs. (iii) **No performance record yet**: the per-request cost of the header map
-and target parse has not been measured. (iv) The primitive register is unchanged except for one direct external
-operation in the HTTP layer, `Std.Time.Timestamp.now`, reached for the `Date` value; the module's only new import
+read the body before the handler runs. (iii) **The layer costs throughput**: about a microsecond per header, and
+the layer serves 82–89 % of the native keep-alive throughput on a two-header request
+([`PERFORMANCE.md`](PERFORMANCE.md)), so it stays an opt-in and is not the only public handler shape. (iv) The
+primitive register is unchanged except for one direct external operation in the HTTP layer,
+`Std.Time.Timestamp.now`, reached for the `Date` value; the module's only new import
 edge into `Std` is `Std.Http.Server` (for `RemoteAddr`), which `Compat` already had. (v) A trace test; it can
 falsify these contracts and cannot establish them for requests it does not send.
 
