@@ -66,6 +66,9 @@
   (a stock handler reads the buffered body, adds a header, and the adapter maps its response).
 - The `Std.Http`-shaped handler layer (`LeanIn/Http/StdHandler.lean`, D24) has socket scenarios in
   `tests/std-handler-contract.md`: `nix develop -c bash tests/std-handler-contract.sh
+- The generic handler contract is a compile-time witness for both hosts:
+  `nix develop -c lake build LeanIn.Test.HandlerContract` (one middleware and one body helper, stock and
+  LeanIn instantiations).
 - VM catch/finalizer semantics have a focused check:
   `nix develop -c bash tests/vm-scope.sh` (lexical catch scope; finalizer exactly once on
   success, ordinary error, abort, and finalizer failure).

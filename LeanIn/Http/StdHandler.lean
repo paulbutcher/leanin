@@ -2,6 +2,7 @@ module
 
 public import Std.Http.Server
 public import LeanIn.Http.Server
+public import LeanIn.Http.Contract
 public import LeanIn.Http.H1
 
 public section
@@ -40,10 +41,11 @@ raises itself is discarded.
 `onContinue` is asked when an HTTP/1.1 request carries `Expect: 100-continue`. `true` sends `100 Continue` and
 runs the handler; `false` (or a raise) answers `417 Expectation Failed` without running it, and the connection
 closes unless the request had no body to wait for. -/
-structure StdHandler where
-  onRequest : Std.Http.Request Server.BodyReader → VM (Std.Http.Response ResponseBody)
-  onFailure : IO.Error → VM Unit := fun _ => pure ()
-  onContinue : Std.Http.Request.Head → VM Bool := fun _ => pure true
+abbrev StdHandler := HandlerM VM VM Server.BodyReader ResponseBody
+
+/-- The native request body's `readAll`, as the shared body capability. -/
+instance : BodyInput VM Server.BodyReader where
+  readAll := Server.BodyReader.readAll
 
 namespace StdHandler
 
