@@ -123,8 +123,10 @@ A result-bearing call needs no push of its own: `name args` is a `Task.EAsync`, 
 
 ## The complete server
 
-`LeanIn/Exe/Hello.lean` is a bind/serve/handler server whose serving path is three machines: a connection
-machine, a spawn per connection, and an accept loop that recurses. Build and run it:
+`LeanIn/Exe/Hello.lean` is a bind/serve/handler server whose serving path is a set of machines: a connection
+machine, an accept loop that spawns one per connection, and two child machines used to build each answer. It
+covers the shapes a server actually uses: a read with a deadline, a spawn-and-select race, a timer, keep-alive
+recursion, and a close whose refusal is reported. Build and run it:
 
 ```bash
 nix develop -c lake build hello
@@ -140,6 +142,103 @@ The last command prints `HTTP/1.1 200 OK` with a five-byte body, `hello`. The sc
 ```bash
 nix develop -c bash tests/executor-contract.sh SC27
 ```
+
+### A request with a deadline
+
+`readRequest` races the read against a stated instant. The result distinguishes a stalled read (`none`), an
+end of stream (`some (.ok none)`), bytes, and a transport failure. The failure is **closed before it is
+raised**, so the connection has one cleanup owner:
+
+```lean
+async def readRequest (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock) :
+    Option ByteArray := do
+  let rt := await (LeanIn.Runtime.Io.recvTimeoutRaw c clock.schedule 5000 65536)
+  match rt with
+  | none => return none
+  | some (.ok none) => return none
+  | some (.ok (some bs)) => return some bs
+  | some (.error e) =>
+      let closed := await (LeanIn.Runtime.Io.closeRaw c)
+      if closed then throw e else throw (IO.userError s!"{e}; and the loop refused the close")
+```
+
+The deadline is a clock effect, not a stock sleep: a harness clock advances it and a live clock arms a wheel
+entry. `clock.schedule` is the same function the read uses, so a test can move the deadline without changing the
+machine.
+
+### Spawn, select, and a timer
+
+The body comes from two child machines at different delays; the parent selects the first completion. This is
+`spawn` plus `selectRaw`, with a timer as the thing that makes the race meaningful:
+
+```lean
+async def helloAfter (c : LeanIn.Runtime.Conn) (clock : LeanIn.Runtime.Clock)
+    (d : Std.Time.Millisecond.Offset) (payload : ByteArray) : ByteArray := do
+  await (LeanIn.Runtime.Io.sleepRaw clock.schedule d)
+  return payload
+
+async def helloBody (c : LeanIn.Runtime.Conn) (push : LeanIn.Task.Item → BaseIO Unit)
+    (clock : LeanIn.Runtime.Clock) : ByteArray := do
+  let hFast : LeanIn.Runtime.RawCell (Except IO.Error ByteArray) :=
+    await (helloAfter.spawn push c clock 1 "hello".toUTF8)
+  let hSlow : LeanIn.Runtime.RawCell (Except IO.Error ByteArray) :=
+    await (helloAfter.spawn push c clock 25 "slow".toUTF8)
+  let winner : Nat × Except IO.Error ByteArray := await (LeanIn.Runtime.selectRaw hFast hSlow)
+  match winner.2 with
+  | .ok body => return body
+  | .error e => throw e
+```
+
+Two details matter. `spawn` returns a `RawCell`; `selectRaw` waits on two cells of the same type and returns
+the winning index and value. The loser is **not cancelled**: its timer still fires and its cell resolves, but
+no one awaits it. That is the intended shape for a race with no side effects. `helloConn` then joins the
+body-building machine with `await (helloBody.run c push clock)`, writes the response, and closes.
+
+### Keep-alive is just recursion
+
+`helloKeep` reads, answers, and `recurse`s with the connection carried forward. No loop variable and no
+call-stack growth: the compiler re-enters the same state with the current fields.
+
+```lean
+async def helloKeep (c : LeanIn.Runtime.Conn) (push : LeanIn.Task.Item → BaseIO Unit)
+    (clock : LeanIn.Runtime.Clock) : Unit := do
+  let req : Option ByteArray := await (readRequest.run c clock)
+  match req with
+  | none =>
+      let closed := await (LeanIn.Runtime.Io.closeRaw c)
+      if closed then return () else throw (IO.userError "helloKeep: the loop refused the close")
+  | some _ =>
+      let body := await (helloBody.run c push clock)
+      await (LeanIn.Runtime.Io.sendAllRaw c #[response body false])
+      recurse
+```
+
+The accept loop chooses between this and the close-after-one machine; both are spawned per connection with
+`helloKeep.spawn`/`helloConn.spawn`, and the handle is deliberately discarded so one connection's failure stays
+at that connection.
+
+### Which primitive for which job
+
+| job | primitive in this page |
+|---|---|
+| fan out and join a specific child | `Foo.spawn push c …` then `RawCell.await h` |
+| take the first of two completions | `VM.selectRaw h0 h1` |
+| bound a read | `Io.recvTimeoutRaw c clock.schedule d size` |
+| wait a stated interval | `Io.sleepRaw clock.schedule d` |
+| keep a connection alive | `recurse` with the connection carried |
+| run a background child | `Foo.spawn` and discard the handle |
+| close and report a refusal | `Io.closeRaw c`, then `throw` if `false` |
+| answer a request | `Io.sendAllRaw c #[head, body]` |
+
+Join and select are both ordinary awaits: `RawCell.await h` parks on one handle, while `selectRaw` parks on
+two and returns the winner's index and value. A discarded spawn handle is a background task; there is no
+supervision unless the loop awaits it.
+
+### What the example does not do
+
+It does not supervise the spawned connection handles, and it has no graceful-stop path: the accept loop ends
+only when `acceptRaw` can no longer complete. The shipped `Http.Server` adds request scopes, a drain deadline
+and multi-carrier serving; the compiled example stays small enough to read.
 
 ## Cleanup ownership
 
@@ -189,8 +288,9 @@ nix develop -c bash tests/async-diagnostics.sh
   already sent stand — instead of sitting parked on a read whose peer is gone (D23). That is not arbitrary
   cancellation — a handler parked on a leaf nothing falsifies still never returns, and no child computation is
   cancelled.
-- The single-carrier driver runs the accept loop, the connection's effects and its resumes on one thread; a
-  multi-carrier entry is not wired in the shipped executables.
+- The `hello` example is single-carrier: the accept loop, the connection's effects and its resumes run on one
+  thread. The shipped `Http.Server` supports `workers=N` through the multi-carrier entry; the compiled example
+  deliberately stays single-carrier.
 - A spawned handler's outcome is not supervised by the example's loop (the handle is discarded): each
   connection's failure is handled at that connection's own boundary — an unbound send discards its failure result and does not
   end the path (the loop still closes the failed connection) — and reaches no other connection. A loop that must observe its children awaits their handles; a child that can
