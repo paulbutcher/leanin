@@ -355,6 +355,24 @@ instance : MonadExcept IO.Error VM where
   throw err := .throwE err
   tryCatch body handler := .tryE body handler
 
+/-- `finally` over both ordinary errors and aborts: the finalizer runs with the value on success and
+with `none` on either failure channel, and the original failure is then re-raised. A finalizer that
+fails replaces the original failure, as `MonadFinally` specifies. -/
+instance : MonadFinally VM where
+  tryFinally' body finalizer :=
+    VM.tryAbortE
+      (VM.tryE
+        (do
+          let v ← body
+          let b ← finalizer (some v)
+          return (v, b))
+        (fun e => do
+          let _ ← finalizer none
+          throw e))
+      (fun r => do
+        let _ ← finalizer none
+        .abortE r)
+
 /-- **Attempt**: run `m`, turning a raise into an `Except` value — *wherever* the raise happens, before or
 after a suspension: the interpreter carries the catch's stack in every effect's callback, so a handler that
 reads a backend and then fails is caught exactly as one that fails at once. An abort is not a raise and is not
