@@ -40,11 +40,27 @@ stop_servers() {
   std_pid=""
 }
 trap stop_servers EXIT
+port_taken() { ss -ltn 2>/dev/null | grep -q ":$1 "; }
+# Started directly rather than through `pin`: a backgrounded shell function is a subshell, so `$!` would be that
+# subshell and `kill` would leave the server running — holding its port, so the next level's server would fail
+# to bind while the stale one answered the health check below.
+serve_pinned() { # <cpu> <cmd...>; sets started_pid
+  local cpu="$1"
+  shift
+  if [ -n "$cpu" ]; then taskset -c "$cpu" "$@" & else "$@" & fi
+  started_pid=$!
+}
 start_servers() {
-  pin "$SERVER_CPU" ./.lake/build/bin/stdBench "$native_port" native >/tmp/stdpaired_native.log 2>&1 &
-  native_pid=$!
-  pin "$SERVER_CPU" ./.lake/build/bin/stdBench "$std_port" std >/tmp/stdpaired_std.log 2>&1 &
-  std_pid=$!
+  for p in "$native_port" "$std_port"; do
+    if port_taken "$p"; then
+      echo "stdpaired: port ${p} is already in use; a stale server would be measured" >&2
+      exit 1
+    fi
+  done
+  serve_pinned "$SERVER_CPU" ./.lake/build/bin/stdBench "$native_port" native >/tmp/stdpaired_native.log 2>&1
+  native_pid=$started_pid
+  serve_pinned "$SERVER_CPU" ./.lake/build/bin/stdBench "$std_port" std >/tmp/stdpaired_std.log 2>&1
+  std_pid=$started_pid
   sleep 2
   for p in "$native_port" "$std_port"; do
     if [ -z "$(curl -s -m 3 "http://127.0.0.1:${p}/bench" | head -1)" ]; then

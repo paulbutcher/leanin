@@ -92,7 +92,7 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
   rejects answers `400`, and a `Date` is added when the response has none.
   - Evidence: `bash tests/std-handler-contract.sh SH1` (also SH2–SH4) and `bash tests/std-date.sh`.
 - [x] **Measure the `Std`-shaped layer.** The stock head conversion costs about a microsecond per header,
-  mostly in `Std.Http`'s own validation, and the layer serves 82–89 % of the native keep-alive throughput
+  mostly in `Std.Http`'s own validation, and the layer serves 81–89 % of the native keep-alive throughput
   on a two-header request. It stays an opt-in; it does not become the only public handler shape (D24).
   - Evidence: `docs/PERFORMANCE.md`, "The `Std`-shaped handler layer (D24)" (`dispatchBench`,
     `bench/stdpaired.sh`).

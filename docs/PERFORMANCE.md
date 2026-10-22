@@ -1216,8 +1216,9 @@ predecessor is a worktree at `5e608ba`, built with `nix develop -c lake build se
 ### The `Std`-shaped handler layer (D24): what the stock types cost
 
 ⚪ **Not an external comparison**: both arms are this runtime, through the same streaming driver; the pair prices
-the layer `StdHandler` adds on top of a native `StreamHandler`. Measured on `996e8fa` (the layer), with the
-instruments `dispatchBench`, `stdBench` and `bench/stdpaired.sh` added alongside this entry, on 2026-10-22, on an
+the layer `StdHandler` adds on top of a native `StreamHandler`. Measured on the layer as committed in `9564a64`
+(the in-memory rows on the same code before it was rebased onto `main`), with the instruments `dispatchBench`,
+`stdBench` and `bench/stdpaired.sh` added alongside this entry, on 2026-10-22, on an
 aarch64 Linux container (18 cores, kernel 7.0.14-linuxkit), server pinned to CPU 1 and client to CPU 2, Node
 v24.21.0 from `nix shell nixpkgs#nodejs`.
 
@@ -1239,17 +1240,24 @@ request (temporary arms, one invocation, not kept) split its ~11 µs as: the hea
 validation and URI parsing — the cost of producing its types at all, which `Std.Http.Server`'s own parser pays
 too — and ~10 % is the UTF-8 conversion on our side.
 
-**At the socket** (`PAIRS=9 DURATION=5 nix develop -c nix shell nixpkgs#nodejs -c bash bench/stdpaired.sh 1 8 32`:
-`load.mjs`, keep-alive, depth 1, `/bench`, both arms fresh per level and alternated within it; load average 0.67
-before, 1.92 after):
+**At the socket** (`PAIRS=9 DURATION=5 nix develop -c nix shell nixpkgs#nodejs -c bash bench/stdpaired.sh 1 8 32`,
+measured on `db8be50` with the script's start fix below: `load.mjs`, keep-alive, depth 1, `/bench`, both arms
+started fresh per level and alternated within it; load average 0.25 before, 1.88 after):
 
 | C | median std/native | IQR | median native | median std |
 |---|---|---|---|---|
-| 1 | **0.891** | 0.888–0.892 | 37 421 req/s | 33 373 req/s |
-| 8 | **0.817** | 0.811–0.820 | 104 131 req/s | 84 968 req/s |
-| 32 | **0.822** | 0.816–0.823 | 116 442 req/s | 95 837 req/s |
+| 1 | **0.886** | 0.880–0.893 | 37 559 req/s | 33 268 req/s |
+| 8 | **0.811** | 0.808–0.812 | 105 383 req/s | 85 479 req/s |
+| 32 | **0.827** | 0.825–0.828 | 117 890 req/s | 97 333 req/s |
 
-At C=32 that is ~1.85 µs more per request (8.59 → 10.43 µs), consistent with the in-memory two-header delta plus
+*Withdrawn*, superseded by the rows above: the first run of this table (0.891 / 0.817 / 0.822, IQR within
+0.811–0.892) stated both arms were fresh per level, and they were not. `stdpaired.sh` started each server through
+a backgrounded shell function, so `kill` reached the subshell and not the server; each later level's servers
+failed to bind, and the C=8 and C=32 rounds were served by the C=1 processes. The pairs were still the same two
+builds, alternated, which is why the rerun agrees to within 0.006; the script now starts the servers directly
+and refuses a port already in use.
+
+At C=32 that is ~1.79 µs more per request (8.48 → 10.27 µs), consistent with the in-memory two-header delta plus
 the `Date` and the response conversion. `load.mjs` sends two headers, so a browser's requests would pay more: on
 the in-memory figures, roughly ten microseconds more per request.
 

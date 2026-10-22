@@ -1293,7 +1293,7 @@ answers `408`), a head the H1 machine itself rejects, and a send failure outside
 driver's and are not reported; reporting them means a hook in `driveStream`. (ii) **`Compat.ofStock` is
 unchanged** and does not consult the stock handler's hooks: the buffered driver has sent any `100 Continue` and
 read the body before the handler runs. (iii) **The layer costs throughput**: about a microsecond per header, and
-the layer serves 82–89 % of the native keep-alive throughput on a two-header request
+the layer serves 81–89 % of the native keep-alive throughput on a two-header request
 ([`PERFORMANCE.md`](PERFORMANCE.md)), so it stays an opt-in and is not the only public handler shape. (iv) The
 primitive register is unchanged except for one direct external operation in the HTTP layer,
 `Std.Time.Timestamp.now`, reached for the `Date` value; the module's only new import
