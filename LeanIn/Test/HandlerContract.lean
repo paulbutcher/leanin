@@ -29,6 +29,12 @@ def leanin (body : Std.Http.Response ResponseBody) : StdHandler :=
 def stock (body : Std.Http.Body.Any) : Stock.Handler :=
   withContractHeader { onRequest := fun _ => pure { body } }
 
+/-- A pure run of the same middleware, so the header it inserts is observed rather than only type-checked. -/
+def sample : HandlerM Id Id Unit Unit :=
+  withContractHeader { onRequest := fun _ => pure { body := () } }
+
+#guard (sample.onRequest default).line.headers.contains (Std.Http.Header.Name.ofString! "x-contract")
+
 /-- One body helper, read through the LeanIn reader. -/
 def leaninBody (request : Std.Http.Request Server.BodyReader) : VM ByteArray :=
   readAllBody request.body
