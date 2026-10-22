@@ -82,6 +82,9 @@ structure Config where
   scope and cancel the request (for a shutdown deadline or an application decision); the request's timers are
   retired and its cleanup runs exactly once. -/
   onScope      : H1.Head → Runtime.Scope → IO Unit := fun _ _ => pure ()
+  /-- Whether `serveConnStd` adds a `Date` header to a response that has none, as `Std.Http.Server` does by
+  default. The native handlers write their own heads and are not affected. -/
+  generateDate : Bool := true
 
 /-- The protocol limits this server actually uses. The continue decision is the explicit policy's, not a
 second field in `h1`; the nested `autoContinue` is kept for users of the pure machine. -/

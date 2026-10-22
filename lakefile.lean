@@ -106,3 +106,7 @@ lean_exe h1bench where root := `LeanIn.Exe.H1Bench
 lean_exe streamEcho where
   root := `LeanIn.Exe.StreamEcho
   moreLinkArgs := netuvLinkArgs
+
+lean_exe stdEcho where
+  root := `LeanIn.Exe.StdEcho
+  moreLinkArgs := netuvLinkArgs
