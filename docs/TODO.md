@@ -62,7 +62,7 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [x] **Correct the H1 documentation.** The module doc now states the implemented framing,
   continue handling and limits.
 
-## P2 — socket backend
+## P2 — socket backend (not planned; retained as experiment notes)
 
 - [ ] **io_uring correctness under load.** The direct-ring loop passed functional scenarios but
   produced zero-throughput rounds and process exits at C=8/32. Find the race/lifetime bug before
@@ -84,8 +84,8 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
     `StreamHandler` remains the streaming path.
   - Evidence: `bash tests/compat-handler.sh` (a stock echo handler reads the body, adds a header,
     and the adapter returns status 200, `body=hello`, `x-stock=yes`).
-- [ ] **Release the lifecycle work.** The package version is now `0.6.0`; the deadline, scope,
-  timer cancellation, streaming bound and multi-carrier serving are in it. The annotated tag is
-  deliberately deferred until the branch is merged, so it cannot point at an unmerged commit.
+- [x] **Release the lifecycle work.** `main` was fast-forwarded and **`v0.6.0`** tagged at
+  `466a3a0`; the tag message names the deadline, scope, timer cancellation, streaming bound and
+  multi-carrier serving. The package version is `0.6.0`.
 - [ ] **Performance record.** Re-run the routing and LeanIO pairs on a settled host with load
   average and a recorded commit; the current tables are provisional.
