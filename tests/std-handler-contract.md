@@ -10,7 +10,7 @@ each request it runs (`ran|`), each continue decision it makes (`continue|`) and
 nix develop -c bash tests/std-handler-contract.sh SH1
 ```
 
-Substitute `SH2`, `SH3` or `SH4`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
+Substitute `SH2`–`SH7`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
 `stdEcho`, serves it on a port of its own (`STD_PORT`, default 8794), runs one scenario and stops it. Records are
 the handler's own annotations: a scenario can see what the handler ran and was told, and nothing the driver does
 that the handler is not shown.
@@ -87,3 +87,64 @@ with `X-Bad: ab` answers `200`, and the detector finds `target=/info?case=good`.
 byte; `Std.Http.Header.Value.ofString?` does not.
 
 **Then.** The status is `400`, and the detector finds no `ran|` record with `target=/info?case=bad`.
+
+## SH5 — a streamed response's producer cleanup runs once on completion and once on disconnect
+
+**Actor.** A client reading `/stream-cleanup`, and the producer's `finally`, which prints
+`cleanup|target=/stream-cleanup`.
+
+**Boundary.** The server's socket, and the `cleanup|` records.
+
+**Given.** A fresh server. The detector counts `cleanup|` records for that target.
+
+**When.** In order:
+
+1. The client sends `GET /stream-cleanup` and reads the complete chunked body. Its affirmative control is the
+   `one\n` prefix and the producer's single cleanup record.
+1. A second client sends `GET /stream-cleanup`, reads the response head and at least the first body bytes, then
+   closes the socket before the producer's remaining 4 MiB can be sent.
+1. A clean `GET /info` runs after the disconnect.
+
+**Then.** Step 1 answers `200`, its body starts `one\n`, and the count goes from 0 to 1. After step 2 the count
+is 2, exactly one more record. Step 3 answers `200` and the count stays 2: the disconnect ran the producer's
+`finally` once, and no retry ran it again.
+
+## SH6 — `HEAD` and a body-forbidden status send no body and do not run a stream producer
+
+**Actor.** A client, the `/info`, `/no-content` and `/stream-cleanup` routes, and the stream producer's
+`cleanup|` record.
+
+**Boundary.** The server's socket, and the `cleanup|` records.
+
+**Given.** A fresh server. The detector counts `cleanup|` records for `/stream-cleanup`.
+
+**When.** In order:
+
+1. The client sends `HEAD /info`.
+1. The client sends `GET /no-content`.
+1. The client sends `HEAD /stream-cleanup`.
+1. The affirmative control: the client sends `GET /stream-cleanup` and reads the complete body.
+
+**Then.** Step 1 answers `200` with a positive `Content-Length` and no body bytes. Step 2 answers `204`, carries
+no `Content-Length` and no body bytes. Step 3 answers `200` with no body bytes and leaves the cleanup count at 0:
+the producer was not run. Step 4 answers `200`, its body starts `one\n`, and the count becomes 1. No response
+in the scenario sends a chunk terminator after a suppressed body.
+
+## SH7 — a declared stream length that does not match its producer fails the connection
+
+**Actor.** A client, and the `/stream-short`, `/stream-long` and `/info` routes.
+
+**Boundary.** The server's socket, and the `failure|` records.
+
+**Given.** A fresh server. The detector counts `failure|` records.
+
+**When.** In order:
+
+1. The client sends `GET /stream-short`; the producer declares `10` bytes and writes `abc`.
+1. The client sends `GET /stream-long`; the producer declares `3` bytes and writes `abcdef`.
+1. The client sends a clean `GET /info`.
+
+**Then.** Step 1 answers `200` with `Content-Length: 10`, sends exactly `abc`, then closes the connection. Step 2
+answers `200` with the declared length and sends no body bytes, because the first write exceeds the declaration;
+the connection closes. Both failures reach `onFailure`, so the count goes from 0 to 2. Step 3 answers `200` and
+the count stays 2. Neither mismatch is retried or followed by a chunk terminator.

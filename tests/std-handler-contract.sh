@@ -17,9 +17,9 @@ cd "$(dirname "$0")/.." || {
 
 scenario="${1:-}"
 case "$scenario" in
-SH1 | SH2 | SH3 | SH4) ;;
+SH1 | SH2 | SH3 | SH4 | SH5 | SH6 | SH7) ;;
 *)
-  echo "setup error: usage: $0 SH1|SH2|SH3|SH4" >&2
+  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5|SH6|SH7" >&2
   exit 2
   ;;
 esac
@@ -235,6 +235,134 @@ elif scenario == "SH4":
         fail(f"status {status(head)}, expected 400 Bad Request")
     if ran("/info?case=bad"):
         fail("the handler ran for a head Std rejects")
+
+elif scenario == "SH5":
+    def cleanups():
+        return records("cleanup")
+    def wait_count(n, bound=10.0):
+        end = time.monotonic() + bound
+        while time.monotonic() < end and len(cleanups()) < n:
+            time.sleep(0.05)
+        return len(cleanups())
+    if cleanups():
+        setup_error("cleanup records before the scenario started")
+    head, body = exchange(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200 or not body.startswith(b"one\n"):
+        fail(f"clean stream answered {head!r} with body prefix {body[:16]!r}")
+    if wait_count(1) != 1:
+        fail(f"after a complete stream, {len(cleanups())} cleanup records, expected 1")
+    s = connect()
+    s.sendall(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"disconnect stream head {head!r}")
+    if not rest:
+        try:
+            rest = s.recv(4096)
+        except socket.timeout:
+            rest = b""
+    s.close()
+    if wait_count(2) != 2:
+        fail(f"after a client disconnect, {len(cleanups())} cleanup records, expected 2")
+    head, _ = exchange(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200:
+        setup_error(f"clean request after the disconnect answered {head!r}")
+    if len(cleanups()) != 2:
+        fail(f"cleanup ran {len(cleanups()) - 1} times for the disconnect: {cleanups()!r}")
+
+elif scenario == "SH6":
+    def no_body(s, rest, label):
+        if rest:
+            fail(f"{label}: body bytes after the head: {rest[:32]!r}")
+        s.settimeout(0.3)
+        try:
+            extra = s.recv(4096)
+        except socket.timeout:
+            extra = b""
+        if extra:
+            fail(f"{label}: body bytes after the head: {extra[:32]!r}")
+    s = connect()
+    s.sendall(b"HEAD /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"HEAD /info answered {head!r}")
+    length = header(head, "content-length")
+    if length is None or int(length) <= 0:
+        fail(f"HEAD /info content-length {length!r}")
+    no_body(s, rest, "HEAD /info")
+    s.close()
+    s = connect()
+    s.sendall(b"GET /no-content HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 204:
+        fail(f"/no-content answered {head!r}")
+    if header(head, "content-length") is not None:
+        fail(f"/no-content kept content-length: {head!r}")
+    no_body(s, rest, "/no-content")
+    s.close()
+    if records("cleanup"):
+        setup_error("cleanup records before the HEAD stream")
+    s = connect()
+    s.sendall(b"HEAD /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"HEAD /stream-cleanup answered {head!r}")
+    no_body(s, rest, "HEAD /stream-cleanup")
+    s.close()
+    if records("cleanup"):
+        fail(f"HEAD ran the stream producer: {records('cleanup')!r}")
+    head, body = exchange(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200 or not body.startswith(b"one\n"):
+        fail(f"control stream answered {head!r}")
+    end = time.monotonic() + 10.0
+    while time.monotonic() < end and len(records("cleanup")) < 1:
+        time.sleep(0.05)
+    if len(records("cleanup")) != 1:
+        fail(f"control stream cleanup records {records('cleanup')!r}")
+
+elif scenario == "SH7":
+    def read_to_eof(s, rest):
+        buf = rest
+        while True:
+            try:
+                d = s.recv(4096)
+            except socket.timeout:
+                fail("the connection stayed open after a length mismatch")
+            if not d:
+                return buf
+            buf += d
+    if records("failure"):
+        setup_error("failure records before the scenario started")
+    s = connect()
+    s.sendall(b"GET /stream-short HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"/stream-short head {head!r}")
+    if header(head, "content-length") != "10":
+        fail(f"/stream-short content-length {header(head, 'content-length')!r}")
+    body = read_to_eof(s, rest)
+    if body != b"abc":
+        fail(f"/stream-short sent {body!r}, expected the 3 bytes written")
+    s.close()
+    s = connect()
+    s.sendall(b"GET /stream-long HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"/stream-long head {head!r}")
+    body = read_to_eof(s, rest)
+    if body:
+        fail(f"/stream-long sent {body!r}, expected no bytes past the declared length")
+    s.close()
+    end = time.monotonic() + 5.0
+    while time.monotonic() < end and len(records("failure")) < 2:
+        time.sleep(0.05)
+    if len(records("failure")) != 2:
+        fail(f"failure records {records('failure')!r}, expected 2")
+    head, _ = exchange(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200:
+        setup_error(f"clean request after the mismatches answered {head!r}")
+    if len(records("failure")) != 2:
+        fail(f"a clean request added a failure: {records('failure')!r}")
 
 print(f"{scenario}: passed")
 PY

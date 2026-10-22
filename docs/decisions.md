@@ -1279,7 +1279,9 @@ cost.
 - **Response.** `ResponseBody` is a LeanIn type: `bytes`, or `stream` with an optional length and a writer handed
   a chunk sink. It is not a class and not a `Std.Http.Body` instance: the shared libraries own their body
   abstraction and give this type an instance of it, and a `Std.Http.Body` would bring `Std.Async` into the serving
-  path.
+  path. A declared length is enforced: a producer that writes past it, or finishes short of it, fails the
+  connection rather than emitting a malformed body. Trailers are not supported: neither `ResponseBody` nor the
+  native `ResponseWriter` has a trailer channel, so a handler that needs them must not claim chunked trailers.
 - **`Date`.** Added as an IMF-fixdate when the response has none, as `Std.Http.Server` does by default
   (`Config.generateDate`, default `true`). It is formatted from `Std.Time.Timestamp.now` at most once a second,
   with no time zone database.

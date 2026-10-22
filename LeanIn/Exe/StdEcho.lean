@@ -13,6 +13,9 @@ record on standard output, which `tests/std-handler-contract.sh` reads.
 
 - `/info` answers the method, the target, every `X-Multi` value and the `RemoteAddr` extension.
 - `/stream` answers two chunks through a streamed body.
+- `/stream-cleanup` streams 4 MiB with a recorded `finally`.
+- `/no-content` answers `204` with a body that must not be sent.
+- `/stream-short` and `/stream-long` declare a length their producer does not satisfy.
 - `/throw` raises.
 - `/refuse` is refused by `onContinue`.
 - anything else echoes the request body.
@@ -48,6 +51,21 @@ def onRequest (req : Std.Http.Request Server.BodyReader) :
     return { line := { status := .ok }, body := .stream none (fun send => do
       send "one\n".toUTF8
       send "two\n".toUTF8) }
+  else if target == "/stream-short" then
+    return { line := { status := .ok }, body := .stream (some 10) (fun send => send "abc".toUTF8) }
+  else if target == "/stream-long" then
+    return { line := { status := .ok }, body := .stream (some 3) (fun send => send "abcdef".toUTF8) }
+  else if target == "/no-content" then
+    return { line := { status := .noContent }, body := .bytes "not sent".toUTF8 }
+  else if target == "/stream-cleanup" then
+    return { line := { status := .ok }, body := .stream none (fun send => do
+      try
+        send "one\n".toUTF8
+        let chunk := ByteArray.mk (Array.replicate 65536 0x61)
+        for _ in List.range 64 do
+          send chunk
+      finally
+        monadLift (record "cleanup|target=/stream-cleanup") ) }
   else
     let body ← req.body.readAll
     return { line := { status := .ok }, body := .bytes body }
