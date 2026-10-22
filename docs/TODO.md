@@ -87,5 +87,7 @@ serving, then what the ports exposed as ergonomics or performance, then backend 
 - [x] **Release the lifecycle work.** `main` was fast-forwarded and **`v0.6.0`** tagged at
   `466a3a0`; the tag message names the deadline, scope, timer cancellation, streaming bound and
   multi-carrier serving. The package version is `0.6.0`.
-- [ ] **Performance record.** Re-run the routing and LeanIO pairs on a settled host with load
-  average and a recorded commit; the current tables are provisional.
+- [ ] **Performance record.** Re-run a paired benchmark on a settled host with load average and a
+  recorded commit; the current tables are provisional. The original routing/LeanIO pairing target
+  moved out with LeanIO, so the target must be restated (Node vs `server`, and the multi-carrier
+  arm) before the run.
