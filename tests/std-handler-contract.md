@@ -10,7 +10,7 @@ each request it runs (`ran|`), each continue decision it makes (`continue|`) and
 nix develop -c bash tests/std-handler-contract.sh SH1
 ```
 
-Substitute `SH2`, `SH3` or `SH4`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
+Substitute `SH2`–`SH5`. The fixture is `tests/std-handler-contract.sh`. Each invocation builds
 `stdEcho`, serves it on a port of its own (`STD_PORT`, default 8794), runs one scenario and stops it. Records are
 the handler's own annotations: a scenario can see what the handler ran and was told, and nothing the driver does
 that the handler is not shown.
@@ -87,3 +87,24 @@ with `X-Bad: ab` answers `200`, and the detector finds `target=/info?case=good`.
 byte; `Std.Http.Header.Value.ofString?` does not.
 
 **Then.** The status is `400`, and the detector finds no `ran|` record with `target=/info?case=bad`.
+
+## SH5 — a streamed response's producer cleanup runs once on completion and once on disconnect
+
+**Actor.** A client reading `/stream-cleanup`, and the producer's `finally`, which prints
+`cleanup|target=/stream-cleanup`.
+
+**Boundary.** The server's socket, and the `cleanup|` records.
+
+**Given.** A fresh server. The detector counts `cleanup|` records for that target.
+
+**When.** In order:
+
+1. The client sends `GET /stream-cleanup` and reads the complete chunked body. Its affirmative control is the
+   `one\n` prefix and the producer's single cleanup record.
+1. A second client sends `GET /stream-cleanup`, reads the response head and at least the first body bytes, then
+   closes the socket before the producer's remaining 4 MiB can be sent.
+1. A clean `GET /info` runs after the disconnect.
+
+**Then.** Step 1 answers `200`, its body starts `one\n`, and the count goes from 0 to 1. After step 2 the count
+is 2, exactly one more record. Step 3 answers `200` and the count stays 2: the disconnect ran the producer's
+`finally` once, and no retry ran it again.

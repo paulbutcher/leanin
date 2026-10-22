@@ -65,16 +65,15 @@
 - The stock-handler adapter has a pure check: `nix develop -c bash tests/compat-handler.sh`
   (a stock handler reads the buffered body, adds a header, and the adapter maps its response).
 - The `Std.Http`-shaped handler layer (`LeanIn/Http/StdHandler.lean`, D24) has socket scenarios in
-  `tests/std-handler-contract.md`: `nix develop -c bash tests/std-handler-contract.sh
+  `tests/std-handler-contract.md`: `nix develop -c bash tests/std-handler-contract.sh SH1` (also
+  SH2–SH5), driven at the public `stdEcho` executable, with a unique port per run (`STD_PORT`). Its
+  date formatter has a pure check: `nix develop -c bash tests/std-date.sh`.
 - The generic handler contract is a compile-time witness for both hosts:
   `nix develop -c lake build LeanIn.Test.HandlerContract` (one middleware and one body helper, stock and
   LeanIn instantiations).
 - VM catch/finalizer semantics have a focused check:
   `nix develop -c bash tests/vm-scope.sh` (lexical catch scope; finalizer exactly once on
   success, ordinary error, abort, and finalizer failure).
- SH1` (also SH2–SH4),
-  driven at the public `stdEcho` executable, with a unique port per run (`STD_PORT`). Its date formatter
-  has a pure check: `nix develop -c bash tests/std-date.sh`.
 - The H1 target views have a pure check: `nix develop -c bash tests/h1-target.sh`
   (`H1.Head.path?`/`query?` decode percent escapes and reject a malformed one).
 - Put externally observable executor scenarios in

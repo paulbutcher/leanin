@@ -17,9 +17,9 @@ cd "$(dirname "$0")/.." || {
 
 scenario="${1:-}"
 case "$scenario" in
-SH1 | SH2 | SH3 | SH4) ;;
+SH1 | SH2 | SH3 | SH4 | SH5) ;;
 *)
-  echo "setup error: usage: $0 SH1|SH2|SH3|SH4" >&2
+  echo "setup error: usage: $0 SH1|SH2|SH3|SH4|SH5" >&2
   exit 2
   ;;
 esac
@@ -235,6 +235,40 @@ elif scenario == "SH4":
         fail(f"status {status(head)}, expected 400 Bad Request")
     if ran("/info?case=bad"):
         fail("the handler ran for a head Std rejects")
+
+elif scenario == "SH5":
+    def cleanups():
+        return records("cleanup")
+    def wait_count(n, bound=10.0):
+        end = time.monotonic() + bound
+        while time.monotonic() < end and len(cleanups()) < n:
+            time.sleep(0.05)
+        return len(cleanups())
+    if cleanups():
+        setup_error("cleanup records before the scenario started")
+    head, body = exchange(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200 or not body.startswith(b"one\n"):
+        fail(f"clean stream answered {head!r} with body prefix {body[:16]!r}")
+    if wait_count(1) != 1:
+        fail(f"after a complete stream, {len(cleanups())} cleanup records, expected 1")
+    s = connect()
+    s.sendall(b"GET /stream-cleanup HTTP/1.1\r\nHost: x\r\n\r\n")
+    head, rest = recv_head(s)
+    if head is None or status(head) != 200:
+        fail(f"disconnect stream head {head!r}")
+    if not rest:
+        try:
+            rest = s.recv(4096)
+        except socket.timeout:
+            rest = b""
+    s.close()
+    if wait_count(2) != 2:
+        fail(f"after a client disconnect, {len(cleanups())} cleanup records, expected 2")
+    head, _ = exchange(b"GET /info HTTP/1.1\r\nHost: x\r\n\r\n")
+    if head is None or status(head) != 200:
+        setup_error(f"clean request after the disconnect answered {head!r}")
+    if len(cleanups()) != 2:
+        fail(f"cleanup ran {len(cleanups()) - 1} times for the disconnect: {cleanups()!r}")
 
 print(f"{scenario}: passed")
 PY

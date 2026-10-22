@@ -48,6 +48,15 @@ def onRequest (req : Std.Http.Request Server.BodyReader) :
     return { line := { status := .ok }, body := .stream none (fun send => do
       send "one\n".toUTF8
       send "two\n".toUTF8) }
+  else if target == "/stream-cleanup" then
+    return { line := { status := .ok }, body := .stream none (fun send => do
+      try
+        send "one\n".toUTF8
+        let chunk := ByteArray.mk (Array.replicate 65536 0x61)
+        for _ in List.range 64 do
+          send chunk
+      finally
+        monadLift (record "cleanup|target=/stream-cleanup") ) }
   else
     let body ← req.body.readAll
     return { line := { status := .ok }, body := .bytes body }
