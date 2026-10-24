@@ -367,6 +367,12 @@ instance : MonadExcept IO.Error VM where
   throw err := .throwE err
   tryCatch body handler := .tryE body handler
 
+/-- The `MonadExceptOf` form, which transformer instances such as `ReaderT` are stated over. `VM`'s
+`MonadExcept` instance supplies the same two operations. -/
+instance : MonadExceptOf IO.Error VM where
+  throw err := .throwE err
+  tryCatch body handler := .tryE body handler
+
 /-- `finally` over both ordinary errors and aborts: the finalizer runs with the value on success and
 with `none` on either failure channel, and the original failure is then re-raised. A finalizer that
 fails replaces the original failure, as `MonadFinally` specifies. -/
