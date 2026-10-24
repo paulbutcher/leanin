@@ -69,11 +69,11 @@ when the loop is gone or its submission queue is full, in which case no completi
 
 /-- Write one buffer on connection `idx`, copying it into memory the write request owns. 1 submitted, 0 refused.
 -/
-@[extern "np_uv_write"] opaque npUvWrite (idx : UInt32) (bytes : ByteArray) : IO UInt32
+@[extern "np_uv_write"] opaque npUvWrite (idx : UInt32) (bytes : @& ByteArray) : IO UInt32
 
 /-- Write every buffer of `chunks` on connection `idx` as **one** write, in order: the shim copies them into one
 block so the peer reads one segment. 1 submitted, 0 refused. -/
-@[extern "np_uv_writev"] opaque npUvWritev (idx : UInt32) (chunks : Array ByteArray) : IO UInt32
+@[extern "np_uv_writev"] opaque npUvWritev (idx : UInt32) (chunks : @& Array ByteArray) : IO UInt32
 
 /-- Shut down connection `idx`'s write side, then close its handle on that completion. 1 submitted, 0 refused. -/
 @[extern "np_uv_shutdown"] opaque npUvShutdown (idx : UInt32) : IO UInt32
